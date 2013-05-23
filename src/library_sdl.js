@@ -35,18 +35,17 @@ var LibrarySDL = {
     mixerFormat: 0x8010, // AUDIO_S16LSB
     mixerNumChannels: 2,
     mixerChunkSize: 1024,
+    channelMinimumNumber: 0,
 
     GL: false, // Set to true if we call SDL_SetVideoMode with SDL_OPENGL, and if so, we do not create 2D canvases&contexts for blitting
                // Note that images loaded before SDL_SetVideoMode will not get this optimization
 
     keyboardState: null,
-    shiftKey: false,
-    ctrlKey: false,
-    altKey: false,
+    keyboardMap: {},
+
+    textInput: false,
 
     startTime: null,
-    mouseX: 0,
-    mouseY: 0,
     buttonState: 0,
     DOMButtons: [0, 0, 0],
 
@@ -172,6 +171,11 @@ var LibrarySDL = {
         ['i32', 'sym'],
         ['i16', 'mod'],
         ['i32', 'unicode']
+      ]),
+      TextInputEvent: Runtime.generateStructInfo([
+        ['i32', 'type'],
+        ['i32', 'windowID'],
+        ['b256', 'text'],
       ]),
       MouseMotionEvent: Runtime.generateStructInfo([
         ['i32', 'type'],
@@ -373,7 +377,7 @@ var LibrarySDL = {
             }
           }
           // fall through
-        case 'keydown': case 'keyup': case 'mousedown': case 'mouseup': case 'DOMMouseScroll': case 'mousewheel':
+        case 'keydown': case 'keyup': case 'keypress': case 'mousedown': case 'mouseup': case 'DOMMouseScroll': case 'mousewheel':
           if (event.type == 'DOMMouseScroll' || event.type == 'mousewheel') {
             var button = (event.type == 'DOMMouseScroll' ? event.detail : -event.wheelDelta) > 0 ? 4 : 3;
             var event2 = {
@@ -397,11 +401,11 @@ var LibrarySDL = {
             SDL.DOMButtons[event.button] = 0;
           }
 
-          SDL.events.push(event);
-          if (SDL.events.length >= 10000) {
-            Module.printErr('SDL event queue full, dropping earliest event');
-            SDL.events.shift();
+          if (event.type == 'keypress' && !SDL.textInput) {
+            break;
           }
+
+          SDL.events.push(event);
           break;
         case 'mouseout':
           // Un-press all pressed mouse buttons, because we might miss the release outside of the canvas
@@ -417,6 +421,17 @@ var LibrarySDL = {
             }
           }
           break;
+        case 'blur':
+        case 'visibilitychange': {
+          // Un-press all pressed keys: TODO
+          for (var code in SDL.keyboardMap) {
+            SDL.events.push({
+              type: 'keyup',
+              keyCode: SDL.keyboardMap[code]
+            });
+          }
+          break;
+        }
         case 'unload':
           if (Browser.mainLoop.runner) {
             SDL.events.push(event);
@@ -427,6 +442,10 @@ var LibrarySDL = {
         case 'resize':
           SDL.events.push(event);
           break;
+      }
+      if (SDL.events.length >= 10000) {
+        Module.printErr('SDL event queue full, dropping events');
+        SDL.events = SDL.events.slice(0, 10000);
       }
       return false;
     },
@@ -464,16 +483,23 @@ var LibrarySDL = {
           {{{ makeSetValue('ptr', 'SDL.structs.KeyboardEvent.keysym + SDL.structs.keysym.mod', '0', 'i32') }}}
           {{{ makeSetValue('ptr', 'SDL.structs.KeyboardEvent.keysym + SDL.structs.keysym.unicode', 'key', 'i32') }}}
 
-          {{{ makeSetValue('SDL.keyboardState', 'SDL.keyCodes[event.keyCode] || event.keyCode', 'event.type == "keydown"', 'i8') }}};
-
-          if (event.keyCode == 16) { //shift
-            SDL.shiftKey = event.type == "keydown";
-          } else if (event.keyCode == 17) { //control
-            SDL.ctrlKey = event.type == "keydown";
-          } else if (event.keyCode == 18) { //alt
-            SDL.altKey = event.type == "keydown";
+          var code = SDL.keyCodes[event.keyCode] || event.keyCode;
+          {{{ makeSetValue('SDL.keyboardState', 'code', 'down', 'i8') }}};
+          if (down) {
+            SDL.keyboardMap[code] = event.keyCode; // save the DOM input, which we can use to unpress it during blur
+          } else {
+            delete SDL.keyboardMap[code];
           }
 
+          break;
+        }
+        case 'keypress': {
+          {{{ makeSetValue('ptr', 'SDL.structs.TextInputEvent.type', 'SDL.DOMEventToSDLEvent[event.type]', 'i32') }}}
+          // Not filling in windowID for now
+          var cStr = intArrayFromString(String.fromCharCode(event.charCode));
+          for (var i = 0; i < cStr.length; ++i) {
+            {{{ makeSetValue('ptr', 'SDL.structs.TextInputEvent.text + i', 'cStr[i]', 'i8') }}};
+          }
           break;
         }
         case 'mousedown': case 'mouseup':
@@ -487,44 +513,22 @@ var LibrarySDL = {
           }
           // fall through
         case 'mousemove': {
-          if (Browser.pointerLock) {
-            // When the pointer is locked, calculate the coordinates
-            // based on the movement of the mouse.
-            // Workaround for Firefox bug 764498
-            if (event.type != 'mousemove' &&
-                ('mozMovementX' in event)) {
-              var movementX = 0, movementY = 0;
-            } else {
-              var movementX = Browser.getMovementX(event);
-              var movementY = Browser.getMovementY(event);
-            }
-            var x = SDL.mouseX + movementX;
-            var y = SDL.mouseY + movementY;
-          } else {
-            // Otherwise, calculate the movement based on the changes
-            // in the coordinates.
-            var x = event.pageX - Module["canvas"].offsetLeft;
-            var y = event.pageY - Module["canvas"].offsetTop;
-            var movementX = x - SDL.mouseX;
-            var movementY = y - SDL.mouseY;
-          }
+          Browser.calculateMouseEvent(event);
           if (event.type != 'mousemove') {
             var down = event.type === 'mousedown';
             {{{ makeSetValue('ptr', 'SDL.structs.MouseButtonEvent.type', 'SDL.DOMEventToSDLEvent[event.type]', 'i32') }}};
             {{{ makeSetValue('ptr', 'SDL.structs.MouseButtonEvent.button', 'event.button+1', 'i8') }}}; // DOM buttons are 0-2, SDL 1-3
             {{{ makeSetValue('ptr', 'SDL.structs.MouseButtonEvent.state', 'down ? 1 : 0', 'i8') }}};
-            {{{ makeSetValue('ptr', 'SDL.structs.MouseButtonEvent.x', 'x', 'i32') }}};
-            {{{ makeSetValue('ptr', 'SDL.structs.MouseButtonEvent.y', 'y', 'i32') }}};
+            {{{ makeSetValue('ptr', 'SDL.structs.MouseButtonEvent.x', 'Browser.mouseX', 'i32') }}};
+            {{{ makeSetValue('ptr', 'SDL.structs.MouseButtonEvent.y', 'Browser.mouseY', 'i32') }}};
           } else {
             {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.type', 'SDL.DOMEventToSDLEvent[event.type]', 'i32') }}};
             {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.state', 'SDL.buttonState', 'i8') }}};
-            {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.x', 'x', 'i32') }}};
-            {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.y', 'y', 'i32') }}};
-            {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.xrel', 'movementX', 'i32') }}};
-            {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.yrel', 'movementY', 'i32') }}};
+            {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.x', 'Browser.mouseX', 'i32') }}};
+            {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.y', 'Browser.mouseY', 'i32') }}};
+            {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.xrel', 'Browser.mouseMovementX', 'i32') }}};
+            {{{ makeSetValue('ptr', 'SDL.structs.MouseMotionEvent.yrel', 'Browser.mouseMovementY', 'i32') }}};
           }
-          SDL.mouseX = x;
-          SDL.mouseY = y;
           break;
         }
         case 'unload': {
@@ -543,9 +547,11 @@ var LibrarySDL = {
 
     estimateTextWidth: function(fontData, text) {
       var h = fontData.size;
-      var fontString = h + 'px sans-serif';
-      // TODO: use temp context, not screen's, to avoid affecting its performance?
-      var tempCtx = SDL.surfaces[SDL.screen].ctx;
+      var fontString = h + 'px ' + fontData.name;
+      var tempCtx = SDL.ttfContext;
+#if ASSERTIONS
+      assert(tempCtx, 'TTF_Init must have been called');
+#endif
       tempCtx.save();
       tempCtx.font = fontString;
       var ret = tempCtx.measureText(text).width | 0;
@@ -607,15 +613,20 @@ var LibrarySDL = {
   SDL_Init: function(what) {
     SDL.startTime = Date.now();
     // capture all key events. we just keep down and up, but also capture press to prevent default actions
-    document.onkeydown = SDL.receiveEvent;
-    document.onkeyup = SDL.receiveEvent;
-    document.onkeypress = SDL.receiveEvent;
+    if (!Module['doNotCaptureKeyboard']) {
+      document.onkeydown = SDL.receiveEvent;
+      document.onkeyup = SDL.receiveEvent;
+      document.onkeypress = SDL.receiveEvent;
+      document.onblur = SDL.receiveEvent;
+      document.addEventListener("visibilitychange", SDL.receiveEvent);
+    }
     window.onunload = SDL.receiveEvent;
-    SDL.keyboardState = _malloc(0x10000);
+    SDL.keyboardState = _malloc(0x10000); // Our SDL needs 512, but 64K is safe for older SDLs
     _memset(SDL.keyboardState, 0, 0x10000);
     // Initialize this structure carefully for closure
     SDL.DOMEventToSDLEvent['keydown'] = 0x300 /* SDL_KEYDOWN */;
     SDL.DOMEventToSDLEvent['keyup'] = 0x301 /* SDL_KEYUP */;
+    SDL.DOMEventToSDLEvent['keypress'] = 0x303 /* SDL_TEXTINPUT */;
     SDL.DOMEventToSDLEvent['mousedown'] = 0x401 /* SDL_MOUSEBUTTONDOWN */;
     SDL.DOMEventToSDLEvent['mouseup'] = 0x402 /* SDL_MOUSEBUTTONUP */;
     SDL.DOMEventToSDLEvent['mousemove'] = 0x400 /* SDL_MOUSEMOTION */;
@@ -638,8 +649,8 @@ var LibrarySDL = {
     {{{ makeSetValue('ret+Runtime.QUANTUM_SIZE*0', '0', '0', 'i32') }}} // TODO
     {{{ makeSetValue('ret+Runtime.QUANTUM_SIZE*1', '0', '0', 'i32') }}} // TODO
     {{{ makeSetValue('ret+Runtime.QUANTUM_SIZE*2', '0', '0', 'void*') }}}
-    {{{ makeSetValue('ret+Runtime.QUANTUM_SIZE*3', '0', 'SDL.defaults.width', 'i32') }}}
-    {{{ makeSetValue('ret+Runtime.QUANTUM_SIZE*4', '0', 'SDL.defaults.height', 'i32') }}}
+    {{{ makeSetValue('ret+Runtime.QUANTUM_SIZE*3', '0', 'Module["canvas"].width', 'i32') }}}
+    {{{ makeSetValue('ret+Runtime.QUANTUM_SIZE*4', '0', 'Module["canvas"].height', 'i32') }}}
     return ret;
   },
 
@@ -875,28 +886,48 @@ var LibrarySDL = {
 
   SDL_GetModState: function() {
     // TODO: numlock, capslock, etc.
-    return (SDL.shiftKey ? 0x0001 | 0x0002 : 0) | // KMOD_LSHIFT & KMOD_RSHIFT
-           (SDL.ctrlKey ? 0x0040 | 0x0080 : 0) | // KMOD_LCTRL & KMOD_RCTRL
-           (SDL.altKey ? 0x0100 | 0x0200 : 0); // KMOD_LALT & KMOD_RALT
+    return (SDL.keyboardState[16] ? 0x0001 | 0x0002 : 0) | // KMOD_LSHIFT & KMOD_RSHIFT
+           (SDL.keyboardState[17] ? 0x0040 | 0x0080 : 0) | // KMOD_LCTRL & KMOD_RCTRL
+           (SDL.keyboardState[18] ? 0x0100 | 0x0200 : 0); // KMOD_LALT & KMOD_RALT
   },
 
   SDL_GetMouseState: function(x, y) {
-    if (x) {{{ makeSetValue('x', '0', 'SDL.mouseX', 'i32') }}};
-    if (y) {{{ makeSetValue('y', '0', 'SDL.mouseY', 'i32') }}};
+    if (x) {{{ makeSetValue('x', '0', 'Browser.mouseX', 'i32') }}};
+    if (y) {{{ makeSetValue('y', '0', 'Browser.mouseY', 'i32') }}};
     return SDL.buttonState;
   },
 
   SDL_WarpMouse: function(x, y) {
     return; // TODO: implement this in a non-buggy way. Need to keep relative mouse movements correct after calling this
+    var rect = Module["canvas"].getBoundingClientRect();
     SDL.events.push({
       type: 'mousemove',
-      pageX: x + Module['canvas'].offsetLeft,
-      pageY: y + Module['canvas'].offsetTop
+      pageX: x + (window.scrollX + rect.left),
+      pageY: y + (window.scrollY + rect.top)
     });
   },
 
   SDL_ShowCursor: function(toggle) {
-    // TODO
+    switch (toggle) {
+      case 0: // SDL_DISABLE
+        if (Browser.isFullScreen) { // only try to lock the pointer when in full screen mode
+          Module['canvas'].requestPointerLock();
+          return 0;
+        } else { // else return SDL_ENABLE to indicate the failure
+          return 1;
+        }
+        break;
+      case 1: // SDL_ENABLE
+        Module['canvas'].exitPointerLock();
+        return 1;
+        break;
+      case -1: // SDL_QUERY
+        return !Browser.pointerLock;
+        break;
+      default:
+        console.log( "SDL_ShowCursor called with unknown toggle parameter value: " + toggle + "." );
+        break;
+    }
   },
 
   SDL_GetError: function() {
@@ -978,6 +1009,19 @@ var LibrarySDL = {
     return ret;
   },
 
+  rotozoomSurface: function(src, angle, zoom, smooth) {
+    var srcData = SDL.surfaces[src];
+    var w = srcData.width * zoom;
+    var h = srcData.height * zoom;
+    var diagonal = Math.ceil(Math.sqrt(Math.pow(w, 2) + Math.pow(h, 2)));
+    var ret = SDL.makeSurface(diagonal, diagonal, srcData.flags, false, 'rotozoomSurface');
+    var dstData = SDL.surfaces[ret];
+    dstData.ctx.translate(diagonal / 2, diagonal / 2);
+    dstData.ctx.rotate(angle * Math.PI / 180);
+    dstData.ctx.drawImage(srcData.canvas, -w / 2, -h / 2, w, h);
+    return ret;
+  },
+
   SDL_SetAlpha: function(surf, flag, alpha) {
     SDL.surfaces[surf].alpha = alpha;
   },
@@ -1052,6 +1096,15 @@ var LibrarySDL = {
   },
 
   SDL_WM_GrabInput: function() {},
+  
+  SDL_WM_ToggleFullScreen: function(surf) {
+    if (Browser.isFullScreen) {
+      Module['canvas'].cancelFullScreen();
+      return 1;
+    } else {
+      return 0;
+    }
+  },
 
   // SDL_Image
 
@@ -1077,7 +1130,9 @@ var LibrarySDL = {
     }
     var surf = SDL.makeSurface(raw.width, raw.height, 0, false, 'load:' + filename);
     var surfData = SDL.surfaces[surf];
+    surfData.ctx.globalCompositeOperation = "copy";
     surfData.ctx.drawImage(raw, 0, 0, raw.width, raw.height, 0, 0, raw.width, raw.height);
+    surfData.ctx.globalCompositeOperation = "source-over";
     // XXX SDL does not specify that loaded images must have available pixel data, in fact
     //     there are cases where you just want to blit them, so you just need the hardware
     //     accelerated version. However, code everywhere seems to assume that the pixels
@@ -1142,7 +1197,7 @@ var LibrarySDL = {
 
   SDL_PauseAudio: function(pauseOn) {
     if (SDL.audio.paused !== pauseOn) {
-      SDL.audio.timer = pauseOn ? SDL.audio.timer && clearInterval(SDL.audio.timer) : setInterval(SDL.audio.caller, 1/35);
+      SDL.audio.timer = pauseOn ? SDL.audio.timer && clearInterval(SDL.audio.timer) : Browser.safeSetInterval(SDL.audio.caller, 1/35);
     }
     SDL.audio.paused = pauseOn;
   },
@@ -1171,10 +1226,20 @@ var LibrarySDL = {
   SDL_CondWait: function() {},
   SDL_DestroyCond: function() {},
 
-  SDL_StartTextInput: function() {}, // TODO
-  SDL_StopTextInput: function() {}, // TODO
+  SDL_StartTextInput: function() {
+    SDL.textInput = true;
+  },
+  SDL_StopTextInput: function() {
+    SDL.textInput = false;
+  },
 
   // SDL Mixer
+
+  Mix_Init: function(flags) {
+    if (!flags) return 0;
+    return 8; /* MIX_INIT_OGG */
+  },
+  Mix_Quit: function(){},
 
   Mix_OpenAudio: function(frequency, format, channels, chunksize) {
     SDL.allocateChannels(32);
@@ -1254,7 +1319,9 @@ var LibrarySDL = {
   Mix_FreeChunk: function(id) {
     SDL.audios[id] = null;
   },
-
+  Mix_ReserveChannels: function(num) {
+    SDL.channelMinimumNumber = num;
+  },
   Mix_PlayChannel: function(channel, id, loops) {
     // TODO: handle loops
 
@@ -1267,8 +1334,8 @@ var LibrarySDL = {
     // If the user asks us to allocate a channel automatically, get the first
     // free one.
     if (channel == -1) {
-      channel = 0;
-      for (var i = 0; i < SDL.numChannels; i++) {
+      channel = SDL.channelMinimumNumber;
+      for (var i = SDL.channelMinimumNumber; i < SDL.numChannels; i++) {
         if (!SDL.channels[i].audio) {
           channel = i;
           break;
@@ -1280,6 +1347,11 @@ var LibrarySDL = {
     // the browser has already preloaded the audio file.
     var channelInfo = SDL.channels[channel];
     channelInfo.audio = audio = audio.cloneNode(true);
+    audio.numChannels = info.audio.numChannels;
+    audio.frequency = info.audio.frequency;
+
+    // TODO: handle N loops. Behavior matches Mix_PlayMusic
+    audio.loop = loops != 0; 
     if (SDL.channelFinished) {
       audio['onended'] = function() { // TODO: cache these
         Runtime.getFuncWrapper(SDL.channelFinished, 'vi')(channel);
@@ -1338,6 +1410,7 @@ var LibrarySDL = {
       audio.play();
     }
     audio.volume = channelInfo.volume;
+    audio.paused = false;
     return channel;
   },
   Mix_PlayChannelTimed: 'Mix_PlayChannel', // XXX ignore Timing
@@ -1380,7 +1453,7 @@ var LibrarySDL = {
     loops = Math.max(loops, 1);
     var audio = SDL.audios[id].audio;
     if (!audio) return 0;
-    audio.loop = loops != 1; // TODO: handle N loops for finite N
+    audio.loop = loops != 0; // TODO: handle N loops for finite N
     if (SDL.audios[id].buffer) {
       audio["mozWriteAudio"](SDL.audios[id].buffer);
     } else {
@@ -1426,13 +1499,78 @@ var LibrarySDL = {
     return (SDL.music.audio && !SDL.music.audio.paused) ? 1 : 0;
   },
 
+  // http://www.libsdl.org/projects/SDL_mixer/docs/SDL_mixer_38.html#SEC38
+  // "Note: Does not check if the channel has been paused."
+  Mix_Playing: function(channel) {
+    if (channel === -1) {
+      var count = 0;
+      for (var i = 0; i < SDL.channels.length; i++) {
+        count += _Mix_Playing(i);
+      }
+      return count;
+    }
+    var info = SDL.channels[channel];
+    if (info && info.audio && !info.audio.paused) {
+      return 1;
+    }
+    return 0;
+  },
+  
+  Mix_Pause: function(channel) {
+    if (channel === -1) {
+      for (var i = 0; i<SDL.channels.length;i++) {
+        _Mix_Pause(i);
+      }
+      return;
+    }
+    var info = SDL.channels[channel];
+    if (info && info.audio) {
+      info.audio.pause();
+      info.audio.paused = true;
+    }
+  },
+  
+  // http://www.libsdl.org/projects/SDL_mixer/docs/SDL_mixer_39.html#SEC39
+  Mix_Paused: function(channel) {
+    if (channel === -1) {
+      var pausedCount = 0;
+      for (var i = 0; i<SDL.channels.length;i++) {
+        pausedCount += _Mix_Paused(i);
+      }
+      return pausedCount;
+    }
+    var info = SDL.channels[channel];
+    if (info && info.audio && info.audio.paused) {
+      return 1;
+    }
+    return 0;
+  },
+
   Mix_PausedMusic: function() {
     return (SDL.music.audio && SDL.music.audio.paused) ? 1 : 0;
   },
 
+  // http://www.libsdl.org/projects/SDL_mixer/docs/SDL_mixer_33.html#SEC33
+  Mix_Resume: function(channel) {
+    if (channel === -1) {
+      for (var i = 0; i<SDL.channels.length;i++) {
+        _Mix_Resume(i);
+      }
+      return;
+    }
+    var info = SDL.channels[channel];
+    if (info && info.audio) {
+      info.audio.play();
+    }
+  },
+
   // SDL TTF
 
-  TTF_Init: function() { return 0 },
+  TTF_Init: function() {
+    var canvas = document.createElement('canvas');
+    SDL.ttfContext = canvas.getContext('2d');
+    return 0;
+  },
 
   TTF_OpenFont: function(filename, size) {
     filename = FS.standardizePath(Pointer_stringify(filename));
@@ -1455,7 +1593,7 @@ var LibrarySDL = {
     var w = SDL.estimateTextWidth(fontData, text);
     var h = fontData.size;
     var color = SDL.loadColorToCSSRGB(color); // XXX alpha breaks fonts?
-    var fontString = h + 'px sans-serif';
+    var fontString = h + 'px ' + fontData.name;
     var surf = SDL.makeSurface(w, h, 0, false, 'text:' + text); // bogus numbers..
     var surfData = SDL.surfaces[surf];
     surfData.ctx.save();
@@ -1541,6 +1679,60 @@ var LibrarySDL = {
   },
 
   SDL_GL_SwapBuffers: function() {},
+
+  // SDL 2
+
+  SDL_GL_ExtensionSupported: function(extension) {
+    return Module.ctx.getExtension(extension) | 0;
+  },
+
+  SDL_DestroyWindow: function(window) {},
+
+  SDL_DestroyRenderer: function(renderer) {},
+
+  SDL_GetWindowFlags: function(x, y) {
+    if (Browser.isFullScreen) {
+       return 1;
+    }
+
+    return 0;
+  },
+
+  SDL_GL_SwapWindow: function(window) {},
+
+  SDL_GL_MakeCurrent: function(window, context) {},
+
+  SDL_GL_DeleteContext: function(context) {},
+
+  SDL_GL_SetSwapInterval: function(state) {},
+
+  SDL_SetWindowTitle: function(window, title) {
+    if (title) document.title = Pointer_stringify(title);
+  },
+
+  SDL_GetWindowSize: function(window, width, height){
+    var w = Module['canvas'].width;
+    var h = Module['canvas'].height;
+    if (width) {{{ makeSetValue('width', '0', 'w', 'i32') }}};
+    if (height) {{{ makeSetValue('height', '0', 'h', 'i32') }}};
+  },
+
+  SDL_LogSetOutputFunction: function(callback, userdata) {},
+
+  SDL_SetWindowFullscreen: function(window, fullscreen) {
+    if (Browser.isFullScreen) {
+      Module['canvas'].cancelFullScreen();
+      return 1;
+    } else {
+      return 0;
+    }
+  },
+
+  SDL_GetWindowFlags: function() {},
+
+  SDL_ClearError: function() {},
+
+  SDL_getenv: 'getenv',
 
   // TODO
 

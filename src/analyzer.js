@@ -9,7 +9,6 @@ var VAR_NATIVIZED = 'nativized';
 var VAR_EMULATED = 'emulated';
 
 var ENTRY_IDENT = toNiceIdent('%0');
-var ENTRY_IDENT_IDS = set(0, 1); // XXX
 
 function recomputeLines(func) {
   func.lines = func.labels.map(function(label) { return label.lines }).reduce(concatenator, []);
@@ -18,8 +17,10 @@ function recomputeLines(func) {
 // Handy sets
 
 var BRANCH_INVOKE = set('branch', 'invoke');
+var LABEL_ENDERS = set('branch', 'return', 'switch');
 var SIDE_EFFECT_CAUSERS = set('call', 'invoke', 'atomic');
 var UNUNFOLDABLE = set('value', 'structvalue', 'type', 'phiparam');
+var I64_DOUBLE_FLIP = { i64: 'double', double: 'i64' };
 
 // Analyzer
 
@@ -88,7 +89,7 @@ function analyzer(data, sidePass) {
           // Internal line
           if (!currLabelFinished) {
             item.functions.slice(-1)[0].labels.slice(-1)[0].lines.push(subItem); // If this line fails, perhaps missing a label?
-            if (subItem.intertype === 'branch') {
+            if (subItem.intertype in LABEL_ENDERS) {
               currLabelFinished = true;
             }
           } else {
@@ -99,7 +100,86 @@ function analyzer(data, sidePass) {
         }
       }
       delete item.items;
+      this.forwardItem(item, 'CastAway');
+    }
+  });
+
+  // CastAway - try to remove bitcasts of double<-->i64, which LLVM sometimes generates unnecessarily
+  // (load a double, convert to i64, use as i64).
+  // We optimize this by checking if there are such bitcasts. If so we create a shadow
+  // variable that is of the other type, and use that in the relevant places. (As SSA, this is valid, and
+  // variable elimination later will remove the double load if it is no longer needed.)
+  //
+  // Note that aside from being an optimization, this is needed for correctness in some cases: If code
+  // assumes it can bitcast a double to an i64 and back and forth without loss, that may be violated
+  // due to NaN canonicalization.
+  substrate.addActor('CastAway', {
+    processItem: function(item) {
       this.forwardItem(item, 'Legalizer');
+      if (USE_TYPED_ARRAYS != 2) return;
+
+      item.functions.forEach(function(func) {
+        var has = false;
+        func.labels.forEach(function(label) {
+          var lines = label.lines;
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (line.intertype == 'bitcast' && line.type in I64_DOUBLE_FLIP) {
+              has = true;
+            }
+          }
+        });
+        if (!has) return;
+        // there are i64<-->double bitcasts, create shadows for everything
+        var shadowed = {};
+        func.labels.forEach(function(label) {
+          var lines = label.lines;
+          var i = 0;
+          while (i < lines.length) {
+          var lines = label.lines;
+            var line = lines[i];
+            if (line.intertype == 'load' && line.type in I64_DOUBLE_FLIP) {
+              if (line.pointer.intertype != 'value') { i++; continue } // TODO
+              shadowed[line.assignTo] = 1;
+              var shadow = line.assignTo + '$$SHADOW';
+              var flip = I64_DOUBLE_FLIP[line.type];
+              lines.splice(i + 1, 0, { // if necessary this element will be legalized in the next phase
+                tokens: null,
+                indent: 2,
+                lineNum: line.lineNum + 0.5,
+                assignTo: shadow,
+                intertype: 'load',
+                pointerType: flip + '*',
+                type: flip,
+                valueType: flip,
+                pointer: {
+                 intertype: 'value',
+                 ident: line.pointer.ident,
+                 type: flip + '*'
+                },
+                align: line.align,
+                ident: line.ident
+              });
+              // note: no need to update func.lines, it is generated in a later pass
+              i++;
+            }
+            i++;
+          }
+        });
+        // use shadows where possible
+        func.labels.forEach(function(label) {
+          var lines = label.lines;
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            if (line.intertype == 'bitcast' && line.type in I64_DOUBLE_FLIP && line.ident in shadowed) {
+              var shadow = line.ident + '$$SHADOW';
+              line.params[0].ident = shadow;
+              line.params[0].type = line.type;
+              line.type2 = line.type;
+            }
+          }
+        });
+      });
     }
   });
 
@@ -121,8 +201,13 @@ function analyzer(data, sidePass) {
       // Legalization
       if (USE_TYPED_ARRAYS == 2) {
         function getLegalVars(base, bits, allowLegal) {
-          if (allowLegal && bits <= 32) return [{ ident: base, bits: bits }];
+          bits = bits || 32; // things like pointers are all i32, but show up as 0 bits from getBits
+          if (allowLegal && bits <= 32) return [{ ident: base + ('i' + bits in Runtime.INT_TYPES ? '' : '$0'), bits: bits }];
           if (isNumber(base)) return getLegalLiterals(base, bits);
+          if (base[0] == '{') {
+            warnOnce('seeing source of illegal data ' + base + ', likely an inline struct - assuming zeroinit');
+            return getLegalLiterals('0', bits);
+          }
           var ret = new Array(Math.ceil(bits/32));
           var i = 0;
           if (base == 'zeroinitializer' || base == 'undef') base = 0;
@@ -169,12 +254,15 @@ function analyzer(data, sidePass) {
           var factor = (next - prev)/(4*toAdd.length+3);
           for (var k = 0; k < toAdd.length; k++) {
             toAdd[k].lineNum = prev + ((k+1)*factor);
+            assert(k == 0 || toAdd[k].lineNum > toAdd[k-1].lineNum);
           }
         }
         function removeAndAdd(lines, i, toAdd) {
           var item = lines[i];
           interpLines(lines, i, toAdd);
           Array.prototype.splice.apply(lines, [i, 1].concat(toAdd));
+          if (i > 0) assert(lines[i].lineNum > lines[i-1].lineNum);
+          if (i + toAdd.length < lines.length) assert(lines[i + toAdd.length - 1].lineNum < lines[i + toAdd.length].lineNum);
           return toAdd.length;
         }
         function legalizeFunctionParameters(params) {
@@ -223,12 +311,16 @@ function analyzer(data, sidePass) {
                   for (var i = 0; i < item.params.length; i++) {
                     if (item.params[i].type == 'i64') item.params[i].type = 'i32';
                   }
+                } else if (item.intertype == 'inttoptr') {
+                  var input = item.params[0];
+                  if (input.type == 'i64') input.type = 'i32'; // inttoptr can only care about 32 bits anyhow since pointers are 32-bit
                 }
                 if (isIllegalType(item.valueType) || isIllegalType(item.type)) {
                   isIllegal = true;
-                }
-                if ((item.intertype == 'load' || item.intertype == 'store') && isStructType(item.valueType)) {
+                } else if ((item.intertype == 'load' || item.intertype == 'store') && isStructType(item.valueType)) {
                   isIllegal = true; // storing an entire structure is illegal
+                } else if (item.intertype == 'mathop' && item.op == 'trunc' && isIllegalType(item.params[1].ident)) { // trunc stores target value in second ident
+                  isIllegal = true;
                 }
               });
               if (!isIllegal) {
@@ -285,7 +377,7 @@ function analyzer(data, sidePass) {
                   var elements = getLegalParams([item.value], bits)[0];
                   var j = 0;
                   elements.forEach(function(element) {
-                    var tempVar = '$st$' + i + '$' + j;
+                    var tempVar = '$st$' + (tempId++) + '$' + j;
                     toAdd.push({
                       intertype: 'getelementptr',
                       assignTo: tempVar,
@@ -315,12 +407,14 @@ function analyzer(data, sidePass) {
                 }
                 // call, return: Return the first 32 bits, the rest are in temp
                 case 'call': {
-                  bits = getBits(value.type);
-                  var elements = getLegalVars(item.assignTo, bits);
                   var toAdd = [value];
                   // legalize parameters
                   legalizeFunctionParameters(value.params);
-                  if (value.assignTo && isIllegalType(item.type)) {
+                  // legalize return value, if any
+                  var returnType = getReturnType(item.type);
+                  if (value.assignTo && isIllegalType(returnType)) {
+                    bits = getBits(returnType);
+                    var elements = getLegalVars(item.assignTo, bits);
                     // legalize return value
                     value.assignTo = elements[0].ident;
                     for (var j = 1; j < elements.length; j++) {
@@ -396,7 +490,7 @@ function analyzer(data, sidePass) {
                   var j = 0;
                   var toAdd = [];
                   elements.forEach(function(element) {
-                    var tempVar = '$st$' + i + '$' + j;
+                    var tempVar = '$ld$' + (tempId++) + '$' + j;
                     toAdd.push({
                       intertype: 'getelementptr',
                       assignTo: tempVar,
@@ -458,6 +552,23 @@ function analyzer(data, sidePass) {
                 case 'switch': {
                   i++;
                   continue; // special case, handled in makeComparison
+                }
+                case 'va_arg': {
+                  assert(value.type == 'i64');
+                  assert(value.value.type == 'i32*', value.value.type);
+                  i += removeAndAdd(label.lines, i, range(2).map(function(x) {
+                    return {
+                      intertype: 'va_arg',
+                      assignTo: value.assignTo + '$' + x,
+                      type: 'i32',
+                      value: {
+                        intertype: 'value',
+                        ident: value.value.ident, // We read twice from the same i32* var, incrementing // + '$' + x,
+                        type: 'i32*'
+                      }
+                    };
+                  }));
+                  continue;
                 }
                 case 'extractvalue': { // XXX we assume 32-bit alignment in extractvalue/insertvalue,
                                        // but in theory they can run on packed structs too (see use getStructuralTypePartBits)
@@ -643,23 +754,20 @@ function analyzer(data, sidePass) {
                     default: throw 'Invalid mathop for legalization: ' + [value.op, item.lineNum, dump(item)];
                   }
                   // Do the legalization
-                  var sourceElements;
-                  if (sourceBits <= 32) {
-                    // The input is a legal type
-                    sourceElements = [{ ident: value.params[0].ident, bits: sourceBits }];
-                  } else {
-                    sourceElements = getLegalVars(value.params[0].ident, sourceBits);
-                  }
+                  var sourceElements = getLegalVars(value.params[0].ident, sourceBits, true);
                   if (!isNumber(shifts)) {
                     // We can't statically legalize this, do the operation at runtime TODO: optimize
                     assert(sourceBits == 64, 'TODO: handle nonconstant shifts on != 64 bits');
+                    assert(PRECISE_I64_MATH, 'Must have precise i64 math for non-constant 64-bit shifts');
+                    Types.preciseI64MathUsed = 1;
                     value.intertype = 'value';
-                    value.ident = 'Runtime' + (ASM_JS ? '_' : '.') + 'bitshift64(' + 
-                        asmCoercion(sourceElements[0].ident, 'i32') + ',' +
-                        asmCoercion(sourceElements[1].ident, 'i32') + ',' +
-                        Runtime['BITSHIFT64_' + value.op.toUpperCase()] + ',' +
-                        asmCoercion(value.params[1].ident + '$0', 'i32') + ');' +
-                      'var ' + value.assignTo + '$0 = ' + makeGetTempDouble(0, 'i32') + ', ' + value.assignTo + '$1 = ' + makeGetTempDouble(1, 'i32') + ';';
+                    value.ident = 'var ' + value.assignTo + '$0 = ' +
+                        asmCoercion('_bitshift64' + value.op[0].toUpperCase() + value.op.substr(1) + '(' + 
+                          asmCoercion(sourceElements[0].ident, 'i32') + ',' +
+                          asmCoercion(sourceElements[1].ident, 'i32') + ',' +
+                          asmCoercion(value.params[1].ident + '$0', 'i32') + ')', 'i32'
+                        ) + ';' +
+                        'var ' + value.assignTo + '$1 = tempRet0;';
                     value.assignTo = null;
                     i++;
                     continue;
@@ -681,9 +789,9 @@ function analyzer(data, sidePass) {
                       params: [(signed && j + whole > sourceElements.length) ? signedKeepAlive : null],
                       type: 'i32',
                     };
-                    if (j == 0 && isUnsignedOp(value.op) && sourceBits < 32) {
+                    if (j == 0 && sourceBits < 32) {
                       // zext sign correction
-                      result.ident = makeSignOp(result.ident, 'i' + sourceBits, 'un', 1, 1);
+                      result.ident = makeSignOp(result.ident, 'i' + sourceBits, isUnsignedOp(value.op) ? 'un' : 're', 1, 1);
                     }
                     if (fraction != 0) {
                       var other = {
@@ -953,6 +1061,7 @@ function analyzer(data, sidePass) {
         // Function parameters
         func.params.forEach(function(param) {
           if (param.intertype !== 'varargs') {
+            if (func.variables[param.ident]) warn('cannot have duplicate variable names: ' + param.ident); // toNiceIdent collisions?
             func.variables[param.ident] = {
               ident: param.ident,
               type: param.type,
@@ -966,6 +1075,7 @@ function analyzer(data, sidePass) {
         // Normal variables
         func.lines.forEach(function(item, i) {
           if (item.assignTo) {
+            if (func.variables[item.assignTo]) warn('cannot have duplicate variable names: ' + item.assignTo); // toNiceIdent collisions?
             var variable = func.variables[item.assignTo] = {
               ident: item.assignTo,
               type: item.type,
@@ -975,6 +1085,9 @@ function analyzer(data, sidePass) {
             };
             if (variable.origin === 'alloca') {
               variable.allocatedNum = item.allocatedNum;
+            }
+            if (variable.origin === 'call') {
+              variable.type = getReturnType(variable.type);
             }
           }
         });
@@ -1320,14 +1433,14 @@ function analyzer(data, sidePass) {
         func.labelsDict = {};
         func.labelIds = {};
         func.labelIdsInverse = {};
-        func.labelIds[toNiceIdent('%0')] = 0;
+        func.labelIds[toNiceIdent('%0')] = 1;
         func.labelIdsInverse[0] = toNiceIdent('%0');
-        func.labelIds[toNiceIdent('%1')] = 1;
-        func.labelIdsInverse[1] = toNiceIdent('%1');
         func.labelIdCounter = 2;
         func.labels.forEach(function(label) {
-          func.labelIds[label.ident] = func.labelIdCounter++;
-          func.labelIdsInverse[func.labelIdCounter-1] = label.ident;
+          if (!(label.ident in func.labelIds)) {
+            func.labelIds[label.ident] = func.labelIdCounter++;
+            func.labelIdsInverse[func.labelIdCounter-1] = label.ident;
+          }
         });
 
         // Minify label ids to numeric ids.
@@ -1362,16 +1475,12 @@ function analyzer(data, sidePass) {
           }
         });
 
-        // The entry might not have an explicit label, and there is no consistent naming convention for it - it can be %0 or %1
-        // So we need to handle that in a special way here.
         function getActualLabelId(labelId) {
           if (func.labelsDict[labelId]) return labelId;
-          if (labelId in ENTRY_IDENT_IDS) {
-            labelId = func.labelIds[ENTRY_IDENT];
-            assert(func.labelsDict[labelId]);
-            return labelId;
-          }
-          return null;
+          // If not present, it must be a surprisingly-named entry (or undefined behavior, in which case, still ok to use the entry)
+          labelId = func.labelIds[ENTRY_IDENT];
+          assert(func.labelsDict[labelId]);
+          return labelId;
         }
 
         // Basic longjmp support, see library.js setjmp/longjmp
@@ -1381,22 +1490,23 @@ function analyzer(data, sidePass) {
           var label = func.labels[i];
           for (var j = 0; j < label.lines.length; j++) {
             var line = label.lines[j];
-            if (line.intertype == 'call' && line.ident == setjmp) {
+            if ((line.intertype == 'call' || line.intertype == 'invoke') && line.ident == setjmp) {
               // Add a new label
-              var oldIdent = label.ident;
-              var newIdent = func.labelIdCounter++;
+              var oldLabel = label.ident;
+              var newLabel = func.labelIdCounter++;
               if (!func.setjmpTable) func.setjmpTable = [];
-              func.setjmpTable.push([oldIdent, newIdent, line.assignTo]);
+              func.setjmpTable.push({ oldLabel: oldLabel, newLabel: newLabel, assignTo: line.assignTo });
               func.labels.splice(i+1, 0, {
                 intertype: 'label',
-                ident: newIdent,
+                ident: newLabel,
                 lineNum: label.lineNum + 0.5,
                 lines: label.lines.slice(j+1)
               });
+              func.labelsDict[newLabel] = func.labels[i+1];
               label.lines = label.lines.slice(0, j+1);
               label.lines.push({
                 intertype: 'branch',
-                label: toNiceIdent(newIdent),
+                label: toNiceIdent(newLabel),
                 lineNum: line.lineNum + 0.01, // XXX legalizing might confuse this
               });
               // Correct phis
@@ -1405,8 +1515,8 @@ function analyzer(data, sidePass) {
                   if (phi.intertype == 'phi') {
                     for (var i = 0; i < phi.params.length; i++) {
                       var sourceLabelId = getActualLabelId(phi.params[i].label);
-                      if (sourceLabelId == oldIdent) {
-                        phi.params[i].label = newIdent;
+                      if (sourceLabelId == oldLabel) {
+                        phi.params[i].label = newLabel;
                       }
                     }
                   }
@@ -1483,7 +1593,7 @@ function analyzer(data, sidePass) {
             calcAllocatedSize(item.allocatedType)*item.allocatedNum: 0;
           if (USE_TYPED_ARRAYS === 2) {
             // We need to keep the stack aligned
-            item.allocatedSize = Runtime.forceAlign(item.allocatedSize, QUANTUM_SIZE);
+            item.allocatedSize = Runtime.forceAlign(item.allocatedSize, Runtime.STACK_ALIGN);
           }
         }
         var index = 0;
@@ -1567,7 +1677,7 @@ function analyzer(data, sidePass) {
       }
       item.functions.forEach(function(func) {
         dprint('relooping', "// relooping function: " + func.ident);
-        func.block = makeBlock(func.labels, [toNiceIdent(func.labels[0].ident)], func.labelsDict, func.forceEmulated);
+        func.block = makeBlock(func.labels, [func.labels[0].ident], func.labelsDict, func.forceEmulated);
       });
 
       return finish();

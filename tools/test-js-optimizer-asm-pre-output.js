@@ -4,6 +4,10 @@ function a() {
   f(347);
   f(351);
   f(8);
+  HEAP[1024] = 5;
+  HEAP[1024] = 5;
+  whee(12, 13);
+  whee(12, 13);
 }
 function b($this, $__n) {
   $this = $this | 0;
@@ -48,5 +52,45 @@ function b($this, $__n) {
   }
   HEAP8[$38 + $40 & 16777215] = 0;
   return;
+}
+function rett() {
+  if (f()) {
+    g();
+    return 5;
+  }
+  return 0;
+}
+function ret2t() {
+  if (f()) {
+    g();
+    return;
+  }
+}
+function retf() {
+  if (f()) {
+    g();
+    return +h();
+  }
+  return +0;
+}
+function i32_8() {
+  if ((HEAP8[$4 & 16777215] | 0) == 0) {
+    print(5);
+  }
+  if ((HEAP8[$5 & 16777215] | 0) == 0) {
+    print(5);
+  }
+  if ((HEAP8[$6 & 16777215] | 0) == 0) {
+    print(5);
+  }
+  if ((HEAP8[$7 & 16777215] | 0) == 0) {
+    print(5);
+  }
+  if (HEAPU8[$8 & 16777215] << 24 >> 16 == 0) {
+    print(5);
+  }
+  if (HEAPU8[$9 & 16777215] << 16 >> 16 == 0) {
+    print(5);
+  }
 }
 

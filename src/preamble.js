@@ -6,6 +6,15 @@
 
 {{RUNTIME}}
 
+#if ASM_JS
+#if RESERVED_FUNCTION_POINTERS
+function jsCall() {
+  var args = Array.prototype.slice.call(arguments);
+  return Runtime.functionPointers[args[0]].apply(null, args.slice(1));
+}
+#endif
+#endif
+
 #if BENCHMARK
 Module.realPrint = Module.print;
 Module.print = Module.printErr = function(){};
@@ -26,17 +35,17 @@ function SAFE_HEAP_CLEAR(dest) {
 var SAFE_HEAP_ERRORS = 0;
 var ACCEPTABLE_SAFE_HEAP_ERRORS = 0;
 
-function SAFE_HEAP_ACCESS(dest, type, store, ignore) {
-  //if (dest === A_NUMBER) Module.print ([dest, type, store] + ' ' + new Error().stack); // Something like this may be useful, in debugging
+function SAFE_HEAP_ACCESS(dest, type, store, ignore, storeValue) {
+  //if (dest === A_NUMBER) Module.print ([dest, type, store, ignore, storeValue] + ' ' + new Error().stack); // Something like this may be useful, in debugging
 
-  assert(dest >= STACK_ROOT, 'segmentation fault: null pointer, or below normal memory');
+  assert(dest > 0, 'segmentation fault');
 
 #if USE_TYPED_ARRAYS
   // When using typed arrays, reads over the top of TOTAL_MEMORY will fail silently, so we must
   // correct that by growing TOTAL_MEMORY as needed. Without typed arrays, memory is a normal
   // JS array so it will work (potentially slowly, depending on the engine).
-  assert(ignore || dest < STATICTOP);
-  assert(ignore || STATICTOP <= TOTAL_MEMORY);
+  assert(ignore || dest < Math.max(DYNAMICTOP, STATICTOP));
+  assert(ignore || DYNAMICTOP <= TOTAL_MEMORY);
 #endif
 
 #if USE_TYPED_ARRAYS == 2
@@ -88,7 +97,7 @@ function SAFE_HEAP_STORE(dest, value, type, ignore) {
   }
   //if (!ignore && (value === Infinity || value === -Infinity || isNaN(value))) throw [value, typeof value, new Error().stack];
 
-  SAFE_HEAP_ACCESS(dest, type, true, ignore);
+  SAFE_HEAP_ACCESS(dest, type, true, ignore, value);
   if (dest in HEAP_WATCHED) {
     Module.print((new Error()).stack);
     throw "Bad store!" + dest;
@@ -150,51 +159,24 @@ function SAFE_HEAP_COPY_HISTORY(dest, src) {
 //==========================================
 #endif
 
-var CorrectionsMonitor = {
-#if PGO
-  MAX_ALLOWED: Infinity,
-#else
-  MAX_ALLOWED: 0, // XXX
+#if CHECK_HEAP_ALIGN
+//========================================
+// Debugging tools - alignment check
+//========================================
+function CHECK_ALIGN_8(addr) {
+  assert((addr & 7) == 0, "address must be 8-byte aligned, is " + addr + "!");
+  return addr;
+}
+function CHECK_ALIGN_4(addr) {
+  assert((addr & 3) == 0, "address must be 4-byte aligned, is " + addr + "!");
+  return addr;
+}
+function CHECK_ALIGN_2(addr) {
+  assert((addr & 1) == 0, "address must be 2-byte aligned!");
+  return addr;
+}
 #endif
-  corrections: 0,
-  sigs: {},
 
-  note: function(type, succeed, sig) {
-    if (!succeed) {
-      this.corrections++;
-      if (this.corrections >= this.MAX_ALLOWED) abort('\n\nToo many corrections!');
-    }
-#if PGO
-    if (!sig)
-      sig = (new Error().stack).toString().split('\n')[2].split(':').slice(-1)[0]; // Spidermonkey-specific FIXME
-    sig = type + '|' + sig;
-    if (!this.sigs[sig]) {
-      //Module.print('Correction: ' + sig);
-      this.sigs[sig] = [0, 0]; // fail, succeed
-    }
-    this.sigs[sig][succeed ? 1 : 0]++;
-#endif
-  },
-
-  print: function() {
-#if PGO
-    var items = [];
-    for (var sig in this.sigs) {
-      items.push({
-        sig: sig,
-        fails: this.sigs[sig][0],
-        succeeds: this.sigs[sig][1],
-        total: this.sigs[sig][0] + this.sigs[sig][1]
-      });
-    }
-    items.sort(function(x, y) { return y.total - x.total; });
-    for (var i = 0; i < items.length; i++) {
-      var item = items[i];
-      Module.print(item.sig + ' : ' + item.total + ' hits, %' + (Math.ceil(100*item.fails/item.total)) + ' failures');
-    }
-#endif
-  }
-};
 
 #if CHECK_OVERFLOWS
 //========================================
@@ -207,24 +189,20 @@ function CHECK_OVERFLOW(value, bits, ignore, sig) {
   // For signedness issue here, see settings.js, CHECK_SIGNED_OVERFLOWS
 #if CHECK_SIGNED_OVERFLOWS
   if (value === Infinity || value === -Infinity || value >= twopbits1 || value < -twopbits1) {
-    CorrectionsMonitor.note('SignedOverflow', 0, sig);
-    if (value === Infinity || value === -Infinity || Math.abs(value) >= twopbits) CorrectionsMonitor.note('Overflow');
+    throw 'SignedOverflow';
+    if (value === Infinity || value === -Infinity || Math.abs(value) >= twopbits) throw 'Overflow';
+  }
 #else
   if (value === Infinity || value === -Infinity || Math.abs(value) >= twopbits) {
-    CorrectionsMonitor.note('Overflow', 0, sig);
+    throw 'Overflow';
+  }
 #endif
 #if CORRECT_OVERFLOWS
-    // Fail on >32 bits - we warned at compile time
-    if (bits <= 32) {
-      value = value & (twopbits - 1);
-    }
-#endif
-  } else {
-#if CHECK_SIGNED_OVERFLOWS
-    CorrectionsMonitor.note('SignedOverflow', 1, sig);
-#endif
-    CorrectionsMonitor.note('Overflow', 1, sig);
+  // Fail on >32 bits - we warned at compile time
+  if (bits <= 32) {
+    value = value & (twopbits - 1);
   }
+#endif
   return value;
 }
 #endif
@@ -243,48 +221,17 @@ var INDENT = '';
 var START_TIME = Date.now();
 #endif
 
-#if PROFILE
-var PROFILING = 0;
-var PROFILING_ROOT = { time: 0, children: {}, calls: 0 };
-var PROFILING_NODE;
-
-function startProfiling() {
-  PROFILING_NODE = PROFILING_ROOT;
-  PROFILING = 1;
-}
-Module['startProfiling'] = startProfiling;
-
-function stopProfiling() {
-  PROFILING = 0;
-  assert(PROFILING_NODE === PROFILING_ROOT, 'Must have popped all the profiling call stack');
-}
-Module['stopProfiling'] = stopProfiling;
-
-function printProfiling() {
-  function dumpData(name_, node, indent) {
-    Module.print(indent + ('________' + node.time).substr(-8) + ': ' + name_ + ' (' + node.calls + ')');
-    var children = [];
-    for (var child in node.children) {
-      children.push(node.children[child]);
-      children[children.length-1].name_ = child;
-    }
-    children.sort(function(x, y) { return y.time - x.time });
-    children.forEach(function(child) { dumpData(child.name_, child, indent + '  ') });
-  }
-  dumpData('root', PROFILING_ROOT, ' ');
-}
-Module['printProfiling'] = printProfiling;
-#endif
-
 //========================================
 // Runtime essentials
 //========================================
 
 var __THREW__ = 0; // Used in checking for thrown exceptions.
+#if ASM_JS == 0
 var setjmpId = 1; // Used in setjmp/longjmp
 var setjmpLabels = {};
+#endif
 
-var ABORT = false;
+var ABORT = false; // whether we are quitting the application. no code should run after this. set in exit() and abort()
 
 var undef = 0;
 // tempInt is used for 32-bit signed values or smaller. tempBigInt is used
@@ -334,11 +281,9 @@ Module["ccall"] = ccall;
 // Returns the C function with a specified identifier (for C++, you need to do manual name mangling)
 function getCFunc(ident) {
   try {
-    var func = eval('_' + ident);
+    var func = globalScope['Module']['_' + ident]; // closure exported function
+    if (!func) func = eval('_' + ident); // explicit lookup
   } catch(e) {
-    try {
-      func = globalScope['Module']['_' + ident]; // closure exported function
-    } catch(e) {}
   }
   assert(func, 'Cannot call unknown function ' + ident + ' (perhaps LLVM optimizations or closure removed it?)');
   return func;
@@ -472,19 +417,13 @@ Module['getValue'] = getValue;
 var ALLOC_NORMAL = 0; // Tries to use _malloc()
 var ALLOC_STACK = 1; // Lives for the duration of the current function call
 var ALLOC_STATIC = 2; // Cannot be freed
-var ALLOC_NONE = 3; // Do not allocate
+var ALLOC_DYNAMIC = 3; // Cannot be freed except through sbrk
+var ALLOC_NONE = 4; // Do not allocate
 Module['ALLOC_NORMAL'] = ALLOC_NORMAL;
 Module['ALLOC_STACK'] = ALLOC_STACK;
 Module['ALLOC_STATIC'] = ALLOC_STATIC;
+Module['ALLOC_DYNAMIC'] = ALLOC_DYNAMIC;
 Module['ALLOC_NONE'] = ALLOC_NONE;
-
-// Simple unoptimized memset - necessary during startup
-var _memset = function(ptr, value, num) {
-  var stop = ptr + num;
-  while (ptr < stop) {
-    {{{ makeSetValue('ptr++', 0, 'value', 'i8', null, true) }}};
-  }
-}
 
 // allocate(): This is for internal use. You can use it yourself as well, but the interface
 //             is a little tricky (see docs right below). The reason is that it is optimized
@@ -515,22 +454,37 @@ function allocate(slab, types, allocator, ptr) {
   if (allocator == ALLOC_NONE) {
     ret = ptr;
   } else {
-    ret = [_malloc, Runtime.stackAlloc, Runtime.staticAlloc][allocator === undefined ? ALLOC_STATIC : allocator](Math.max(size, singleType ? 1 : types.length));
+    ret = [_malloc, Runtime.stackAlloc, Runtime.staticAlloc, Runtime.dynamicAlloc][allocator === undefined ? ALLOC_STATIC : allocator](Math.max(size, singleType ? 1 : types.length));
   }
 
   if (zeroinit) {
-    _memset(ret, 0, size);
+    var ptr = ret, stop;
+#if USE_TYPED_ARRAYS == 2
+    assert((ret & 3) == 0);
+    stop = ret + (size & ~3);
+    for (; ptr < stop; ptr += 4) {
+      {{{ makeSetValue('ptr', '0', '0', 'i32', null, true) }}};
+    }
+#endif
+    stop = ret + size;
+    while (ptr < stop) {
+      {{{ makeSetValue('ptr++', '0', '0', 'i8', null, true) }}};
+    }
     return ret;
   }
 
 #if USE_TYPED_ARRAYS == 2
   if (singleType === 'i8') {
-    HEAPU8.set(new Uint8Array(slab), ret);
+    if (slab.subarray || slab.slice) {
+      HEAPU8.set(slab, ret);
+    } else {
+      HEAPU8.set(new Uint8Array(slab), ret);
+    }
     return ret;
   }
 #endif
 
-  var i = 0, type;
+  var i = 0, type, typeSize, previousType;
   while (i < size) {
     var curr = slab[i];
 
@@ -552,7 +506,13 @@ function allocate(slab, types, allocator, ptr) {
 #endif
 
     setValue(ret+i, curr, type);
-    i += Runtime.getNativeTypeSize(type);
+
+    // no need to look up size unless type changes, so cache it
+    if (previousType !== type) {
+      typeSize = Runtime.getNativeTypeSize(type);
+      previousType = type;
+    }
+    i += typeSize;
   }
 
   return ret;
@@ -560,33 +520,46 @@ function allocate(slab, types, allocator, ptr) {
 Module['allocate'] = allocate;
 
 function Pointer_stringify(ptr, /* optional */ length) {
-  var utf8 = new Runtime.UTF8Processor();
-  var nullTerminated = typeof(length) == "undefined";
-  var ret = "";
-  var i = 0;
+  // Find the length, and check for UTF while doing so
+  var hasUtf = false;
   var t;
+  var i = 0;
   while (1) {
+    t = {{{ makeGetValue('ptr', 'i', 'i8', 0, 1) }}};
+    if (t >= 128) hasUtf = true;
+    else if (t == 0 && !length) break;
+    i++;
+    if (length && i == length) break;
+  }
+  if (!length) length = i;
+
+  var ret = '';
+
+#if USE_TYPED_ARRAYS == 2
+  if (!hasUtf) {
+    var MAX_CHUNK = 1024; // split up into chunks, because .apply on a huge string can overflow the stack
+    var curr;
+    while (length > 0) {
+      curr = String.fromCharCode.apply(String, HEAPU8.subarray(ptr, ptr + Math.min(length, MAX_CHUNK)));
+      ret = ret ? ret + curr : curr;
+      ptr += MAX_CHUNK;
+      length -= MAX_CHUNK;
+    }
+    return ret;
+  }
+#endif
+
+  var utf8 = new Runtime.UTF8Processor();
+  for (i = 0; i < length; i++) {
 #if ASSERTIONS
-  assert(i < TOTAL_MEMORY);
+    assert(ptr + i < TOTAL_MEMORY);
 #endif
     t = {{{ makeGetValue('ptr', 'i', 'i8', 0, 1) }}};
-    if (nullTerminated && t == 0) break;
     ret += utf8.processCChar(t);
-    i += 1;
-    if (!nullTerminated && i == length) break;
   }
   return ret;
 }
 Module['Pointer_stringify'] = Pointer_stringify;
-
-function Array_stringify(array) {
-  var ret = "";
-  for (var i = 0; i < array.length; i++) {
-    ret += String.fromCharCode(array[i]);
-  }
-  return ret;
-}
-Module['Array_stringify'] = Array_stringify;
 
 // Memory management
 
@@ -606,26 +579,29 @@ var FHEAP;
 var HEAP8, HEAPU8, HEAP16, HEAPU16, HEAP32, HEAPU32, HEAPF32, HEAPF64;
 #endif
 
-var STACK_ROOT, STACKTOP, STACK_MAX;
-var STATICTOP;
+var STATIC_BASE = 0, STATICTOP = 0, staticSealed = false; // static area
+var STACK_BASE = 0, STACKTOP = 0, STACK_MAX = 0; // stack area
+var DYNAMIC_BASE = 0, DYNAMICTOP = 0; // dynamic area handled by sbrk
+
 #if USE_TYPED_ARRAYS
 function enlargeMemory() {
 #if ALLOW_MEMORY_GROWTH == 0
 #if ASM_JS == 0
   abort('Cannot enlarge memory arrays. Either (1) compile with -s TOTAL_MEMORY=X with X higher than the current value, (2) compile with ALLOW_MEMORY_GROWTH which adjusts the size at runtime but prevents some optimizations, or (3) set Module.TOTAL_MEMORY before the program runs.');
 #else
-  abort('Cannot enlarge memory arrays in asm.js. Compile with -s TOTAL_MEMORY=X with X higher than the current value.');
+  abort('Cannot enlarge memory arrays in asm.js. Either (1) compile with -s TOTAL_MEMORY=X with X higher than the current value, or (2) set Module.TOTAL_MEMORY before the program runs.');
 #endif
 #else
-  // TOTAL_MEMORY is the current size of the actual array, and STATICTOP is the new top.
+  // TOTAL_MEMORY is the current size of the actual array, and DYNAMICTOP is the new top.
 #if ASSERTIONS
-  Module.printErr('Warning: Enlarging memory arrays, this is not fast, and ALLOW_MEMORY_GROWTH is not fully tested with all optimizations on! ' + [STATICTOP, TOTAL_MEMORY]); // We perform safe elimination instead of elimination in this mode, but if you see this error, try to disable it and other optimizations entirely
-  assert(STATICTOP >= TOTAL_MEMORY);
+  Module.printErr('Warning: Enlarging memory arrays, this is not fast, and ALLOW_MEMORY_GROWTH is not fully tested with all optimizations on! ' + [DYNAMICTOP, TOTAL_MEMORY]); // We perform safe elimination instead of elimination in this mode, but if you see this error, try to disable it and other optimizations entirely
+  assert(DYNAMICTOP >= TOTAL_MEMORY);
   assert(TOTAL_MEMORY > 4); // So the loop below will not be infinite
 #endif
-  while (TOTAL_MEMORY <= STATICTOP) { // Simple heuristic. Override enlargeMemory() if your program has something more optimal for it
+  while (TOTAL_MEMORY <= DYNAMICTOP) { // Simple heuristic. Override enlargeMemory() if your program has something more optimal for it
     TOTAL_MEMORY = alignMemoryPage(2*TOTAL_MEMORY);
   }
+  assert(TOTAL_MEMORY <= Math.pow(2, 30)); // 2^30==1GB is a practical maximum - 2^31 is already close to possible negative numbers etc.
 #if USE_TYPED_ARRAYS == 1
   var oldIHEAP = IHEAP;
   Module['HEAP'] = Module['IHEAP'] = HEAP = IHEAP = new Int32Array(TOTAL_MEMORY);
@@ -655,47 +631,43 @@ function enlargeMemory() {
 #endif
 
 var TOTAL_STACK = Module['TOTAL_STACK'] || {{{ TOTAL_STACK }}};
-#if ASM_JS == 0
 var TOTAL_MEMORY = Module['TOTAL_MEMORY'] || {{{ TOTAL_MEMORY }}};
-#else
-var TOTAL_MEMORY = {{{ TOTAL_MEMORY }}}; // in asm, we hardcode the mask, so cannot adjust memory at runtime
-#endif
 var FAST_MEMORY = Module['FAST_MEMORY'] || {{{ FAST_MEMORY }}};
 
 // Initialize the runtime's memory
 #if USE_TYPED_ARRAYS
 // check for full engine support (use string 'subarray' to avoid closure compiler confusion)
-  assert(!!Int32Array && !!Float64Array && !!(new Int32Array(1)['subarray']) && !!(new Int32Array(1)['set']),
-         'Cannot fallback to non-typed array case: Code is too specialized');
+assert(!!Int32Array && !!Float64Array && !!(new Int32Array(1)['subarray']) && !!(new Int32Array(1)['set']),
+       'Cannot fallback to non-typed array case: Code is too specialized');
 
 #if USE_TYPED_ARRAYS == 1
-  HEAP = IHEAP = new Int32Array(TOTAL_MEMORY);
-  IHEAPU = new Uint32Array(IHEAP.buffer);
+HEAP = IHEAP = new Int32Array(TOTAL_MEMORY);
+IHEAPU = new Uint32Array(IHEAP.buffer);
 #if USE_FHEAP
-  FHEAP = new Float64Array(TOTAL_MEMORY);
+FHEAP = new Float64Array(TOTAL_MEMORY);
 #endif
 #endif
 #if USE_TYPED_ARRAYS == 2
-  var buffer = new ArrayBuffer(TOTAL_MEMORY);
-  HEAP8 = new Int8Array(buffer);
-  HEAP16 = new Int16Array(buffer);
-  HEAP32 = new Int32Array(buffer);
-  HEAPU8 = new Uint8Array(buffer);
-  HEAPU16 = new Uint16Array(buffer);
-  HEAPU32 = new Uint32Array(buffer);
-  HEAPF32 = new Float32Array(buffer);
-  HEAPF64 = new Float64Array(buffer);
+var buffer = new ArrayBuffer(TOTAL_MEMORY);
+HEAP8 = new Int8Array(buffer);
+HEAP16 = new Int16Array(buffer);
+HEAP32 = new Int32Array(buffer);
+HEAPU8 = new Uint8Array(buffer);
+HEAPU16 = new Uint16Array(buffer);
+HEAPU32 = new Uint32Array(buffer);
+HEAPF32 = new Float32Array(buffer);
+HEAPF64 = new Float64Array(buffer);
 
-  // Endianness check (note: assumes compiler arch was little-endian)
-  HEAP32[0] = 255;
-  assert(HEAPU8[0] === 255 && HEAPU8[3] === 0, 'Typed arrays 2 must be run on a little-endian system');
+// Endianness check (note: assumes compiler arch was little-endian)
+HEAP32[0] = 255;
+assert(HEAPU8[0] === 255 && HEAPU8[3] === 0, 'Typed arrays 2 must be run on a little-endian system');
 #endif
 #else
-  // Make sure that our HEAP is implemented as a flat array.
-  HEAP = []; // Hinting at the size with |new Array(TOTAL_MEMORY)| should help in theory but makes v8 much slower
-  for (var i = 0; i < FAST_MEMORY; i++) {
-    HEAP[i] = 0; // XXX We do *not* use {{| makeSetValue(0, 'i', 0, 'null') |}} here, since this is done just to optimize runtime speed
-  }
+// Make sure that our HEAP is implemented as a flat array.
+HEAP = []; // Hinting at the size with |new Array(TOTAL_MEMORY)| should help in theory but makes v8 much slower
+for (var i = 0; i < FAST_MEMORY; i++) {
+  HEAP[i] = 0; // XXX We do *not* use {{| makeSetValue(0, 'i', 0, 'null') |}} here, since this is done just to optimize runtime speed
+}
 #endif
 
 Module['HEAP'] = HEAP;
@@ -716,38 +688,13 @@ Module['HEAPF32'] = HEAPF32;
 Module['HEAPF64'] = HEAPF64;
 #endif
 
-STACK_ROOT = STACKTOP = Runtime.alignMemory(1);
-STACK_MAX = TOTAL_STACK; // we lose a little stack here, but TOTAL_STACK is nice and round so use that as the max
-
-#if USE_TYPED_ARRAYS == 2
-var tempDoublePtr = Runtime.alignMemory(allocate(12, 'i8', ALLOC_STACK), 8);
-assert(tempDoublePtr % 8 == 0);
-function copyTempFloat(ptr) { // functions, because inlining this code is increases code size too much
-  HEAP8[tempDoublePtr] = HEAP8[ptr];
-  HEAP8[tempDoublePtr+1] = HEAP8[ptr+1];
-  HEAP8[tempDoublePtr+2] = HEAP8[ptr+2];
-  HEAP8[tempDoublePtr+3] = HEAP8[ptr+3];
-}
-function copyTempDouble(ptr) {
-  HEAP8[tempDoublePtr] = HEAP8[ptr];
-  HEAP8[tempDoublePtr+1] = HEAP8[ptr+1];
-  HEAP8[tempDoublePtr+2] = HEAP8[ptr+2];
-  HEAP8[tempDoublePtr+3] = HEAP8[ptr+3];
-  HEAP8[tempDoublePtr+4] = HEAP8[ptr+4];
-  HEAP8[tempDoublePtr+5] = HEAP8[ptr+5];
-  HEAP8[tempDoublePtr+6] = HEAP8[ptr+6];
-  HEAP8[tempDoublePtr+7] = HEAP8[ptr+7];
-}
-#endif
-
-STATICTOP = STACK_MAX;
-assert(STATICTOP < TOTAL_MEMORY); // Stack must fit in TOTAL_MEMORY; allocations from here on may enlarge TOTAL_MEMORY
-
-var nullString = allocate(intArrayFromString('(null)'), 'i8', ALLOC_STACK);
-
 function callRuntimeCallbacks(callbacks) {
   while(callbacks.length > 0) {
     var callback = callbacks.shift();
+    if (typeof callback == 'function') {
+      callback();
+      continue;
+    }
     var func = callback.func;
     if (typeof func === 'number') {
       if (callback.arg === undefined) {
@@ -765,7 +712,11 @@ var __ATINIT__ = []; // functions called during startup
 var __ATMAIN__ = []; // functions called when main() is to be run
 var __ATEXIT__ = []; // functions called during shutdown
 
-function initRuntime() {
+var runtimeInitialized = false;
+
+function ensureInitRuntime() {
+  if (runtimeInitialized) return;
+  runtimeInitialized = true;
   callRuntimeCallbacks(__ATINIT__);
 }
 function preMain() {
@@ -773,9 +724,6 @@ function preMain() {
 }
 function exitRuntime() {
   callRuntimeCallbacks(__ATEXIT__);
-
-  // Print summary of correction activity
-  CorrectionsMonitor.print();
 }
 
 // Tools
@@ -832,6 +780,20 @@ Module['writeArrayToMemory'] = writeArrayToMemory;
 {{{ unSign }}}
 {{{ reSign }}}
 
+#if PRECISE_I32_MUL
+if (!Math['imul']) Math['imul'] = function(a, b) {
+  var ah  = a >>> 16;
+  var al = a & 0xffff;
+  var bh  = b >>> 16;
+  var bl = b & 0xffff;
+  return (al*bl + ((ah*bl + al*bh) << 16))|0;
+};
+#else
+Math['imul'] = function(a, b) {
+  return (a*b)|0; // fast but imprecise
+};
+#endif
+
 // A counter of dependencies for calling run(). If we need to
 // do asynchronous work before running, increment this and
 // decrement it. Incrementing must happen in a place like
@@ -841,7 +803,7 @@ Module['writeArrayToMemory'] = writeArrayToMemory;
 // the dependencies are met.
 var runDependencies = 0;
 var runDependencyTracking = {};
-var calledRun = false;
+var calledInit = false, calledRun = false;
 var runDependencyWatcher = null;
 function addRunDependency(id) {
   runDependencies++;
@@ -851,6 +813,7 @@ function addRunDependency(id) {
   if (id) {
     assert(!runDependencyTracking[id]);
     runDependencyTracking[id] = 1;
+#if ASSERTIONS
     if (runDependencyWatcher === null && typeof setInterval !== 'undefined') {
       // Check for missing dependencies every few seconds
       runDependencyWatcher = setInterval(function() {
@@ -865,8 +828,9 @@ function addRunDependency(id) {
         if (shown) {
           Module.printErr('(end of list)');
         }
-      }, 6000);
+      }, 10000);
     }
+#endif
   } else {
     Module.printErr('warning: run dependency added without ID');
   }
@@ -896,6 +860,56 @@ Module['removeRunDependency'] = removeRunDependency;
 
 Module["preloadedImages"] = {}; // maps url to image data
 Module["preloadedAudios"] = {}; // maps url to audio data
+
+function addPreRun(func) {
+  if (!Module['preRun']) Module['preRun'] = [];
+  else if (typeof Module['preRun'] == 'function') Module['preRun'] = [Module['preRun']];
+  Module['preRun'].push(func);
+}
+
+#if PGO
+var PGOMonitor = {
+  called: {},
+  dump: function() {
+    var dead = [];
+    for (var i = 0; i < this.allGenerated.length; i++) {
+      var func = this.allGenerated[i];
+      if (!this.called[func]) dead.push(func);
+    }
+    Module.print('-s DEAD_FUNCTIONS=\'' + JSON.stringify(dead) + '\'\n');
+  }
+};
+__ATEXIT__.push({ func: function() { PGOMonitor.dump() } });
+addPreRun(function() { addRunDependency('pgo') });
+#endif
+
+var awaitingMemoryInitializer = false;
+
+function loadMemoryInitializer(filename) {
+  function applyData(data) {
+#if USE_TYPED_ARRAYS == 2
+    HEAPU8.set(data, STATIC_BASE);
+#else
+    allocate(data, 'i8', ALLOC_NONE, STATIC_BASE);
+#endif
+    runPostSets();
+  }
+
+  // always do this asynchronously, to keep shell and web as similar as possible
+  addPreRun(function() {
+    if (ENVIRONMENT_IS_NODE || ENVIRONMENT_IS_SHELL) {
+      applyData(Module['readBinary'](filename));
+    } else {
+      Browser.asyncLoad(filename, function(data) {
+        applyData(data);
+      }, function(data) {
+        throw 'could not load memory initializer ' + filename;
+      });
+    }
+  });
+
+  awaitingMemoryInitializer = false;
+}
 
 // === Body ===
 

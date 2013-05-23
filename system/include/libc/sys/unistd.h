@@ -14,7 +14,7 @@ extern "C" {
 
 extern char **environ;
 
-void	_EXFUN(_exit, (int __status )); /* _ATTRIBUTE ((noreturn))); */
+void	_EXFUN(_exit, (int __status ) _ATTRIBUTE(noreturn));
 
 int	_EXFUN(access,(const char *__path, int __amode ));
 unsigned  _EXFUN(alarm, (unsigned __secs ));
@@ -153,8 +153,8 @@ int     _EXFUN(seteuid, (uid_t __uid ));
 #endif
 int     _EXFUN(setgid, (gid_t __gid ));
 #endif
-#if defined(__CYGWIN__)
-int	_EXFUN(setgroups, (int ngroups, const gid_t *grouplist ));
+#if defined(EMSCRIPTEN) || defined(__CYGWIN__)
+int	_EXFUN(setgroups, (int ngroups, const gid_t *gidset));
 #endif
 int     _EXFUN(setpgid, (pid_t __pid, pid_t __pgid ));
 int     _EXFUN(setpgrp, (void ));

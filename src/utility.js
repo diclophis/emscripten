@@ -85,6 +85,13 @@ function warnOnce(a, msg) {
   }
 }
 
+var abortExecution = false;
+
+function error(msg) {
+  abortExecution = true;
+  printErr('Error: ' + msg);
+}
+
 function dedup(items, ident) {
   var seen = {};
   if (ident) {
@@ -266,6 +273,15 @@ function set() {
   return ret;
 }
 var unset = keys;
+
+function numberedSet() {
+  var args = typeof arguments[0] === 'object' ? arguments[0] : arguments;
+  var ret = {};
+  for (var i = 0; i < args.length; i++) {
+    ret[args[i]] = i;
+  }
+  return ret;
+}
 
 function setSub(x, y) {
   var ret = set(keys(x));

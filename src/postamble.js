@@ -1,21 +1,28 @@
 
 // === Auto-generated postamble setup entry stuff ===
 
-Module.callMain = function callMain(args) {
+Module['callMain'] = function callMain(args) {
+  assert(runDependencies == 0, 'cannot call main when async dependencies remain! (listen on __ATMAIN__)');
+  assert(!Module['preRun'] || Module['preRun'].length == 0, 'cannot call main when preRun functions remain to be called');
+
+  args = args || [];
+
+  ensureInitRuntime();
+
   var argc = args.length+1;
   function pad() {
     for (var i = 0; i < {{{ QUANTUM_SIZE }}}-1; i++) {
       argv.push(0);
     }
   }
-  var argv = [allocate(intArrayFromString("/bin/this.program"), 'i8', ALLOC_STATIC) ];
+  var argv = [allocate(intArrayFromString("/bin/this.program"), 'i8', ALLOC_NORMAL) ];
   pad();
   for (var i = 0; i < argc-1; i = i + 1) {
-    argv.push(allocate(intArrayFromString(args[i]), 'i8', ALLOC_STATIC));
+    argv.push(allocate(intArrayFromString(args[i]), 'i8', ALLOC_NORMAL));
     pad();
   }
   argv.push(0);
-  argv = allocate(argv, 'i32', ALLOC_STATIC);
+  argv = allocate(argv, 'i32', ALLOC_NORMAL);
 
 #if BENCHMARK
   var start = Date.now();
@@ -23,18 +30,21 @@ Module.callMain = function callMain(args) {
 
   var ret;
 
-#if CATCH_EXIT_CODE
   var initialStackTop = STACKTOP;
   try {
     ret = Module['_main'](argc, argv, 0);
   }
-  catch(e) { if (e.name == "ExitStatus") return e.status; throw e; }
-  finally {
+  catch(e) {
+    if (e.name == 'ExitStatus') {
+      return e.status;
+    } else if (e == 'SimulateInfiniteLoop') {
+      Module['noExitRuntime'] = true;
+    } else {
+      throw e;
+    }
+  } finally {
     STACKTOP = initialStackTop;
   }
-#else
-  ret = Module['_main'](argc, argv, 0);
-#endif
 
 #if BENCHMARK
   Module.realPrint('main() took ' + (Date.now() - start) + ' milliseconds');
@@ -67,11 +77,14 @@ function run(args) {
   }
 
   function doRun() {
+    ensureInitRuntime();
+
+    preMain();
+
     var ret = 0;
     calledRun = true;
-    if (Module['_main']) {
-      preMain();
-      ret = Module.callMain(args);
+    if (Module['_main'] && shouldRunNow) {
+      ret = Module['callMain'](args);
       if (!Module['noExitRuntime']) {
         exitRuntime();
       }
@@ -91,7 +104,7 @@ function run(args) {
       setTimeout(function() {
         Module['setStatus']('');
       }, 1);
-      doRun();
+      if (!ABORT) doRun();
     }, 1);
     return 0;
   } else {
@@ -109,8 +122,7 @@ if (Module['preInit']) {
   }
 }
 
-initRuntime();
-
+// shouldRunNow refers to calling main(), not run().
 #if INVOKE_RUN
 var shouldRunNow = true;
 #else
@@ -120,12 +132,7 @@ if (Module['noInitialRun']) {
   shouldRunNow = false;
 }
 
-if (shouldRunNow) {
-  var ret = run();
-#if CATCH_EXIT_CODE
-  Module.print('Exit Status: ' + ret);
-#endif
-}
+run();
 
 // {{POST_RUN_ADDITIONS}}
 

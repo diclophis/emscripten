@@ -3,7 +3,7 @@
 // Utilities for browser environments
 
 mergeInto(LibraryManager.library, {
-  $Browser__postset: 'Module["requestFullScreen"] = function() { Browser.requestFullScreen() };\n' + // exports
+  $Browser__postset: 'Module["requestFullScreen"] = function(lockPointer, resizeCanvas) { Browser.requestFullScreen(lockPointer, resizeCanvas) };\n' + // exports
                      'Module["requestAnimationFrame"] = function(func) { Browser.requestAnimationFrame(func) };\n' +
                      'Module["pauseMainLoop"] = function() { Browser.mainLoop.pause() };\n' +
                      'Module["resumeMainLoop"] = function() { Browser.mainLoop.resume() };\n',
@@ -40,13 +40,14 @@ mergeInto(LibraryManager.library, {
         }
       }
     },
+    isFullScreen: false,
     pointerLock: false,
     moduleContextCreatedCallbacks: [],
     workers: [],
 
-    ensureObjects: function() {
-      if (Browser.ensured) return;
-      Browser.ensured = true;
+    init: function() {
+      if (Browser.initted) return;
+      Browser.initted = true;
       try {
         new Blob();
         Browser.hasBlobConstructor = true;
@@ -68,20 +69,20 @@ mergeInto(LibraryManager.library, {
       function getMimetype(name) {
         return {
           'jpg': 'image/jpeg',
+          'jpeg': 'image/jpeg',
           'png': 'image/png',
           'bmp': 'image/bmp',
           'ogg': 'audio/ogg',
           'wav': 'audio/wav',
           'mp3': 'audio/mpeg'
-        }[name.substr(-3)];
-        return ret;
+        }[name.substr(name.lastIndexOf('.')+1)];
       }
 
       if (!Module["preloadPlugins"]) Module["preloadPlugins"] = [];
 
       var imagePlugin = {};
       imagePlugin['canHandle'] = function(name) {
-        return name.substr(-4) in { '.jpg': 1, '.png': 1, '.bmp': 1 };
+        return !Module.noImageDecoding && /\.(jpg|jpeg|png|bmp)$/.exec(name);
       };
       imagePlugin['handle'] = function(byteArray, name, onload, onerror) {
         var b = null;
@@ -123,7 +124,7 @@ mergeInto(LibraryManager.library, {
 
       var audioPlugin = {};
       audioPlugin['canHandle'] = function(name) {
-        return name.substr(-4) in { '.ogg': 1, '.wav': 1, '.mp3': 1 };
+        return !Module.noAudioDecoding && name.substr(-4) in { '.ogg': 1, '.wav': 1, '.mp3': 1 };
       };
       audioPlugin['handle'] = function(byteArray, name, onload, onerror) {
         var done = false;
@@ -183,7 +184,7 @@ mergeInto(LibraryManager.library, {
           };
           audio.src = url;
           // workaround for chrome bug 124926 - we do not always get oncanplaythrough or onerror
-          setTimeout(function() {
+          Browser.safeSetTimeout(function() {
             finish(audio); // try to use it even though it is not necessarily ready to play
           }, 10000);
         } else {
@@ -191,6 +192,37 @@ mergeInto(LibraryManager.library, {
         }
       };
       Module['preloadPlugins'].push(audioPlugin);
+
+      // Canvas event setup
+
+      var canvas = Module['canvas'];
+      canvas.requestPointerLock = canvas['requestPointerLock'] ||
+                                  canvas['mozRequestPointerLock'] ||
+                                  canvas['webkitRequestPointerLock'];
+      canvas.exitPointerLock = document['exitPointerLock'] ||
+                               document['mozExitPointerLock'] ||
+                               document['webkitExitPointerLock'] ||
+                               function(){}; // no-op if function does not exist
+      canvas.exitPointerLock = canvas.exitPointerLock.bind(document);
+
+      function pointerLockChange() {
+        Browser.pointerLock = document['pointerLockElement'] === canvas ||
+                              document['mozPointerLockElement'] === canvas ||
+                              document['webkitPointerLockElement'] === canvas;
+      }
+
+      document.addEventListener('pointerlockchange', pointerLockChange, false);
+      document.addEventListener('mozpointerlockchange', pointerLockChange, false);
+      document.addEventListener('webkitpointerlockchange', pointerLockChange, false);
+
+      if (Module['elementPointerLock']) {
+        canvas.addEventListener("click", function(ev) {
+          if (!Browser.pointerLock && canvas.requestPointerLock) {
+            canvas.requestPointerLock();
+            ev.preventDefault();
+          }
+        }, false);
+      }
     },
 
     createContext: function(canvas, useWebGL, setInModule) {
@@ -200,8 +232,18 @@ mergeInto(LibraryManager.library, {
         return null;
       }
 #endif
+      var ctx;
       try {
-        var ctx = canvas.getContext(useWebGL ? 'experimental-webgl' : '2d');
+        if (useWebGL) {
+          ctx = canvas.getContext('experimental-webgl', {
+#if GL_TESTING
+            preserveDrawingBuffer: true,
+#endif
+            alpha: false
+          });
+        } else {
+          ctx = canvas.getContext('2d');
+        }
         if (!ctx) throw ':(';
       } catch (e) {
         Module.print('Could not create canvas - ' + e);
@@ -259,39 +301,47 @@ mergeInto(LibraryManager.library, {
         Module.ctx = ctx;
         Module.useWebGL = useWebGL;
         Browser.moduleContextCreatedCallbacks.forEach(function(callback) { callback() });
+        Browser.init();
       }
       return ctx;
     },
 
-    requestFullScreen: function() {
+    destroyContext: function(canvas, useWebGL, setInModule) {},
+
+    fullScreenHandlersInstalled: false,
+    lockPointer: undefined,
+    resizeCanvas: undefined,
+    requestFullScreen: function(lockPointer, resizeCanvas) {
+      Browser.lockPointer = lockPointer;
+      Browser.resizeCanvas = resizeCanvas;
+      if (typeof Browser.lockPointer === 'undefined') Browser.lockPointer = true;
+      if (typeof Browser.resizeCanvas === 'undefined') Browser.resizeCanvas = false;
+
       var canvas = Module['canvas'];
       function fullScreenChange() {
-        var isFullScreen = false;
+        Browser.isFullScreen = false;
         if ((document['webkitFullScreenElement'] || document['webkitFullscreenElement'] ||
              document['mozFullScreenElement'] || document['mozFullscreenElement'] ||
              document['fullScreenElement'] || document['fullscreenElement']) === canvas) {
-          canvas.requestPointerLock = canvas['requestPointerLock'] ||
-                                      canvas['mozRequestPointerLock'] ||
-                                      canvas['webkitRequestPointerLock'];
-          canvas.requestPointerLock();
-          isFullScreen = true;
+          canvas.cancelFullScreen = document['cancelFullScreen'] ||
+                                    document['mozCancelFullScreen'] ||
+                                    document['webkitCancelFullScreen'];
+          canvas.cancelFullScreen = canvas.cancelFullScreen.bind(document);
+          if (Browser.lockPointer) canvas.requestPointerLock();
+          Browser.isFullScreen = true;
+          if (Browser.resizeCanvas) Browser.setFullScreenCanvasSize();
+        } else if (Browser.resizeCanvas){
+          Browser.setWindowedCanvasSize();
         }
-        if (Module['onFullScreen']) Module['onFullScreen'](isFullScreen);
+        if (Module['onFullScreen']) Module['onFullScreen'](Browser.isFullScreen);
       }
 
-      document.addEventListener('fullscreenchange', fullScreenChange, false);
-      document.addEventListener('mozfullscreenchange', fullScreenChange, false);
-      document.addEventListener('webkitfullscreenchange', fullScreenChange, false);
-
-      function pointerLockChange() {
-        Browser.pointerLock = document['pointerLockElement'] === canvas ||
-                              document['mozPointerLockElement'] === canvas ||
-                              document['webkitPointerLockElement'] === canvas;
+      if (!Browser.fullScreenHandlersInstalled) {
+        Browser.fullScreenHandlersInstalled = true;
+        document.addEventListener('fullscreenchange', fullScreenChange, false);
+        document.addEventListener('mozfullscreenchange', fullScreenChange, false);
+        document.addEventListener('webkitfullscreenchange', fullScreenChange, false);
       }
-
-      document.addEventListener('pointerlockchange', pointerLockChange, false);
-      document.addEventListener('mozpointerlockchange', pointerLockChange, false);
-      document.addEventListener('webkitpointerlockchange', pointerLockChange, false);
 
       canvas.requestFullScreen = canvas['requestFullScreen'] ||
                                  canvas['mozRequestFullScreen'] ||
@@ -311,6 +361,30 @@ mergeInto(LibraryManager.library, {
       window.requestAnimationFrame(func);
     },
 
+    // generic abort-aware wrapper for an async callback
+    safeCallback: function(func) {
+      return function() {
+        if (!ABORT) return func.apply(null, arguments);
+      };
+    },
+
+    // abort-aware versions
+    safeRequestAnimationFrame: function(func) {
+      Browser.requestAnimationFrame(function() {
+        if (!ABORT) func();
+      });
+    },
+    safeSetTimeout: function(func, timeout) {
+      setTimeout(function() {
+        if (!ABORT) func();
+      }, timeout);
+    },
+    safeSetInterval: function(func, timeout) {
+      setInterval(function() {
+        if (!ABORT) func();
+      }, timeout);
+    },
+
     getMovementX: function(event) {
       return event['movementX'] ||
              event['mozMovementX'] ||
@@ -325,12 +399,53 @@ mergeInto(LibraryManager.library, {
              0;
     },
 
+    mouseX: 0,
+    mouseY: 0,
+    mouseMovementX: 0,
+    mouseMovementY: 0,
+
+    calculateMouseEvent: function(event) { // event should be mousemove, mousedown or mouseup
+      if (Browser.pointerLock) {
+        // When the pointer is locked, calculate the coordinates
+        // based on the movement of the mouse.
+        // Workaround for Firefox bug 764498
+        if (event.type != 'mousemove' &&
+            ('mozMovementX' in event)) {
+          Browser.mouseMovementX = Browser.mouseMovementY = 0;
+        } else {
+          Browser.mouseMovementX = Browser.getMovementX(event);
+          Browser.mouseMovementY = Browser.getMovementY(event);
+        }
+        Browser.mouseX = SDL.mouseX + Browser.mouseMovementX;
+        Browser.mouseY = SDL.mouseY + Browser.mouseMovementY;
+      } else {
+        // Otherwise, calculate the movement based on the changes
+        // in the coordinates.
+        var rect = Module["canvas"].getBoundingClientRect();
+        var x = event.pageX - (window.scrollX + rect.left);
+        var y = event.pageY - (window.scrollY + rect.top);
+
+        // the canvas might be CSS-scaled compared to its backbuffer;
+        // SDL-using content will want mouse coordinates in terms
+        // of backbuffer units.
+        var cw = Module["canvas"].width;
+        var ch = Module["canvas"].height;
+        x = x * (cw / rect.width);
+        y = y * (ch / rect.height);
+
+        Browser.mouseMovementX = x - Browser.mouseX;
+        Browser.mouseMovementY = y - Browser.mouseY;
+        Browser.mouseX = x;
+        Browser.mouseY = y;
+      }
+    },
+
     xhrLoad: function(url, onload, onerror) {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', url, true);
       xhr.responseType = 'arraybuffer';
       xhr.onload = function() {
-        if (xhr.status == 200) {
+        if (xhr.status == 200 || (xhr.status == 0 && xhr.response)) { // file URLs can return 0
           onload(xhr.response);
         } else {
           onerror();
@@ -369,7 +484,32 @@ mergeInto(LibraryManager.library, {
       canvas.width = width;
       canvas.height = height;
       if (!noUpdates) Browser.updateResizeListeners();
+    },
+
+    windowedWidth: 0,
+    windowedHeight: 0,
+    setFullScreenCanvasSize: function() {
+      var canvas = Module['canvas'];
+      this.windowedWidth = canvas.width;
+      this.windowedHeight = canvas.height;
+      canvas.width = screen.width;
+      canvas.height = screen.height;
+      var flags = {{{ makeGetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'i32', 0, 1) }}};
+      flags = flags | 0x00800000; // set SDL_FULLSCREEN flag
+      {{{ makeSetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'flags', 'i32') }}}
+      Browser.updateResizeListeners();
+    },
+    
+    setWindowedCanvasSize: function() {
+      var canvas = Module['canvas'];
+      canvas.width = this.windowedWidth;
+      canvas.height = this.windowedHeight;
+      var flags = {{{ makeGetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'i32', 0, 1) }}};
+      flags = flags & ~0x00800000; // clear SDL_FULLSCREEN flag
+      {{{ makeSetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'flags', 'i32') }}}
+      Browser.updateResizeListeners();
     }
+    
   },
 
   emscripten_async_wget: function(url, file, onload, onerror) {
@@ -496,7 +636,7 @@ mergeInto(LibraryManager.library, {
     Module['noExitRuntime'] = true;
 
     // TODO: cache these to avoid generating garbage
-    setTimeout(function() {
+    Browser.safeSetTimeout(function() {
       _emscripten_run_script(script);
     }, millis);
   },
@@ -505,6 +645,7 @@ mergeInto(LibraryManager.library, {
     Module['noExitRuntime'] = true;
 
     Browser.mainLoop.runner = function() {
+      if (ABORT) return;
       if (Browser.mainLoop.queue.length > 0) {
         var start = Date.now();
         var blocker = Browser.mainLoop.queue.shift();
@@ -562,7 +703,7 @@ mergeInto(LibraryManager.library, {
     Browser.mainLoop.scheduler();
 
     if (simulateInfiniteLoop) {
-      throw 'emscripten_set_main_loop simulating infinite loop by throwing so we get right into the JS event loop';
+      throw 'SimulateInfiniteLoop';
     }
   },
 
@@ -607,9 +748,9 @@ mergeInto(LibraryManager.library, {
     }
 
     if (millis >= 0) {
-      setTimeout(wrapper, millis);
+      Browser.safeSetTimeout(wrapper, millis);
     } else {
-      Browser.requestAnimationFrame(wrapper);
+      Browser.safeRequestAnimationFrame(wrapper);
     }
   },
 
@@ -630,7 +771,11 @@ mergeInto(LibraryManager.library, {
   },
 
   emscripten_get_now: function() {
-    if (window['performance'] && window['performance']['now']) {
+    if (ENVIRONMENT_IS_NODE) {
+        var t = process['hrtime']();
+        return t[0] * 1e3 + t[1] / 1e6;
+    }
+    else if (window['performance'] && window['performance']['now']) {
       return window['performance']['now']();
     } else {
       return Date.now();
