@@ -502,7 +502,7 @@ function intertyper(data, sidePass, baseLineNums) {
       } else {
         // variable
         var ident = item.tokens[0].text;
-        var private_ = findTokenText(item, 'private') >= 0;
+        var private_ = findTokenText(item, 'private') >= 0 || findTokenText(item, 'internal') >= 0;
         cleanOutTokens(LLVM.GLOBAL_MODIFIERS, item.tokens, [2, 3]);
         var external = false;
         if (item.tokens[2].text === 'external') {
@@ -537,12 +537,17 @@ function intertyper(data, sidePass, baseLineNums) {
             });
           }
         } else if (!external) {
-          if (item.tokens[3].text == 'c')
-            item.tokens.splice(3, 1);
-          if (item.tokens[3].text in PARSABLE_LLVM_FUNCTIONS) {
-            ret.value = parseLLVMFunctionCall(item.tokens.slice(2));
+          if (item.tokens[3] && item.tokens[3].text != ';') {
+            if (item.tokens[3].text == 'c') {
+              item.tokens.splice(3, 1);
+            }
+            if (item.tokens[3].text in PARSABLE_LLVM_FUNCTIONS) {
+              ret.value = parseLLVMFunctionCall(item.tokens.slice(2));
+            } else {
+              ret.value = scanConst(item.tokens[3], ret.type);
+            }
           } else {
-            ret.value = scanConst(item.tokens[3], ret.type);
+            ret.value = { intertype: 'value', ident: '0', value: '0', type: ret.type };
           }
         }
         return [ret];

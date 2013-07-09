@@ -114,7 +114,8 @@ var Debugging = {
         m = metadataToParentMetadata[m];
         assert(m, 'Confused as to parent metadata for llvm #' + l + ', metadata !' + m);
       }
-      this.llvmLineToSourceFile[l] = metadataToFilename[m];
+      // Normalize Windows path slashes coming from LLVM metadata, so that forward slashes can be assumed as path delimiters.
+      this.llvmLineToSourceFile[l] = metadataToFilename[m].replace(/\\5C/g, '/');
     }
 
     this.on = true;
@@ -244,6 +245,8 @@ var Functions = {
 
   blockAddresses: {}, // maps functions to a map of block labels to label ids
 
+  aliases: {}, // in shared modules (MAIN_MODULE or SHARED_MODULE), a list of aliases for functions that have them
+
   getSignature: function(returnType, argTypes, hasVarArgs) {
     var sig = returnType == 'void' ? 'v' : (isIntImplemented(returnType) ? 'i' : 'f');
     for (var i = 0; i < argTypes.length; i++) {
@@ -256,25 +259,32 @@ var Functions = {
   },
 
   // Mark a function as needing indexing. Python will coordinate them all
-  getIndex: function(ident, doNotCreate) {
+  getIndex: function(ident, doNotCreate, sig) {
     if (doNotCreate && !(ident in this.indexedFunctions)) {
       if (!Functions.getIndex.tentative) Functions.getIndex.tentative = {}; // only used by GL emulation; TODO: generalize when needed
       Functions.getIndex.tentative[ident] = 0;
     }
+    var ret;
     if (phase != 'post' && singlePhase) {
       if (!doNotCreate) this.indexedFunctions[ident] = 0; // tell python we need this indexized
-      return "'{{ FI_" + toNiceIdent(ident) + " }}'"; // something python will replace later
+      ret = "'{{ FI_" + toNiceIdent(ident) + " }}'"; // something python will replace later
     } else {
       if (!singlePhase) return 'NO_INDEX'; // Should not index functions in post
-      var ret = this.indexedFunctions[ident];
+      ret = this.indexedFunctions[ident];
       if (!ret) {
         if (doNotCreate) return '0';
         ret = this.nextIndex;
         this.nextIndex += 2; // Need to have indexes be even numbers, see |polymorph| test
         this.indexedFunctions[ident] = ret;
       }
-      return ret.toString();
+      ret = ret.toString();
     }
+    if (SIDE_MODULE && sig) { // sig can be undefined for the GL library functions
+      ret = '((F_BASE_' + sig + ' + ' + ret + ')|0)';
+    } else if (BUILD_AS_SHARED_LIB) {
+      ret = '(FUNCTION_TABLE_OFFSET + ' + ret + ')';
+    }
+    return ret;
   },
 
   getTable: function(sig) {
@@ -341,6 +351,7 @@ var Functions = {
                 call += (j > 1 ? ',' : '') + asmCoercion('a' + j, t[j] != 'i' ? 'float' : 'i32');
               }
               call += ')';
+              if (curr == '_setjmp') printErr('WARNING: setjmp used via a function pointer. If this is for libc setjmp (not something of your own with the same name), it will break things');
               tables.pre += 'function ' + curr + '__wrapper(' + args + ') { ' + arg_coercions + ' ; ' + retPre + call + retPost + ' }\n';
               wrapped[curr] = 1;
             }

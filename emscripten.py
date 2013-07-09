@@ -11,6 +11,7 @@ headers, for the libc implementation in JS).
 
 import os, sys, json, optparse, subprocess, re, time, multiprocessing, functools
 
+from tools import shared
 from tools import jsrun, cache as cache_module, tempfiles
 from tools.response_file import read_response_file
 
@@ -25,7 +26,6 @@ def get_configuration():
   if hasattr(get_configuration, 'configuration'):
     return get_configuration.configuration
 
-  from tools import shared
   configuration = shared.Configuration(environ=os.environ)
   get_configuration.configuration = configuration
   return configuration
@@ -126,6 +126,9 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
   meta = ''.join(meta)
   if DEBUG and len(meta) > 1024*1024: print >> sys.stderr, 'emscript warning: large amounts of metadata, will slow things down'
   if DEBUG: print >> sys.stderr, '  emscript: split took %s seconds' % (time.time() - t)
+
+  if len(funcs) == 0:
+    print >> sys.stderr, 'No functions to process. Make sure you prevented LLVM from eliminating them as dead (use EXPORTED_FUNCTIONS if necessary, see the FAQ)'
 
   #if DEBUG:
   #  print >> sys.stderr, '========= pre ================\n'
@@ -338,8 +341,18 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
     ret = re.sub(r'"?{{{ BA_([\w\d_$]+)\|([\w\d_$]+) }}}"?,0,0,0', lambda m: split_32(blockaddrs[m.groups(0)[0]][m.groups(0)[1]]), js)
     return re.sub(r'"?{{{ BA_([\w\d_$]+)\|([\w\d_$]+) }}}"?', lambda m: str(blockaddrs[m.groups(0)[0]][m.groups(0)[1]]), ret)
 
+  pre = blockaddrsize(indexize(pre))
+
+  if settings.get('ASM_JS'):
+    # move postsets into the asm module
+    class PostSets: js = ''
+    def handle_post_sets(m):
+      PostSets.js = m.group(0)
+      return '\n'
+    pre = re.sub(r'function runPostSets[^}]+}', handle_post_sets, pre)
+
   #if DEBUG: outfile.write('// pre\n')
-  outfile.write(blockaddrsize(indexize(pre)))
+  outfile.write(pre)
   pre = None
 
   #if DEBUG: outfile.write('// funcs\n')
@@ -404,7 +417,7 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
     math_envs = ['Math.min'] # TODO: move min to maths
     asm_setup += '\n'.join(['var %s = %s;' % (f.replace('.', '_'), f) for f in math_envs])
 
-    basic_funcs = ['abort', 'assert', 'asmPrintInt', 'asmPrintFloat', 'copyTempDouble', 'copyTempFloat'] + [m.replace('.', '_') for m in math_envs]
+    basic_funcs = ['abort', 'assert', 'asmPrintInt', 'asmPrintFloat'] + [m.replace('.', '_') for m in math_envs]
     if settings['RESERVED_FUNCTION_POINTERS'] > 0: basic_funcs.append('jsCall')
     if settings['SAFE_HEAP']: basic_funcs += ['SAFE_HEAP_LOAD', 'SAFE_HEAP_STORE', 'SAFE_HEAP_CLEAR']
     if settings['CHECK_HEAP_ALIGN']: basic_funcs += ['CHECK_ALIGN_2', 'CHECK_ALIGN_4', 'CHECK_ALIGN_8']
@@ -450,23 +463,12 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
   }
 
 ''' % (sig, i, args, arg_coercions, jsret))
-      args = ','.join(['a' + str(i) for i in range(1, len(sig))])
-      args = 'index' + (',' if args else '') + args
-      # C++ exceptions are numbers, and longjmp is a string 'longjmp'
-      asm_setup += '''
-function invoke_%s(%s) {
-  try {
-    %sModule["dynCall_%s"](%s);
-  } catch(e) {
-    if (typeof e !== 'number' && e !== 'longjmp') throw e;
-    asm["setThrew"](1, 0);
-  }
-}
-''' % (sig, args, 'return ' if sig[0] != 'v' else '', sig, args)
+      asm_setup += '\n' + shared.JS.make_invoke(sig) + '\n'
       basic_funcs.append('invoke_%s' % sig)
 
     # calculate exports
     exported_implemented_functions = list(exported_implemented_functions)
+    exported_implemented_functions.append('runPostSets')
     exports = []
     if not simple:
       for export in exported_implemented_functions + asm_runtime_funcs + function_tables:
@@ -488,6 +490,15 @@ function invoke_%s(%s) {
                        ''.join(['  var ' + g + '=env.' + math_fix(g) + ';\n' for g in basic_funcs + global_funcs])
     asm_global_vars = ''.join(['  var ' + g + '=env.' + g + '|0;\n' for g in basic_vars + global_vars]) + \
                       ''.join(['  var ' + g + '=+env.' + g + ';\n' for g in basic_float_vars])
+    # In linkable modules, we need to add some explicit globals for global variables that can be linked and used across modules
+    if settings.get('MAIN_MODULE') or settings.get('SIDE_MODULE'):
+      assert settings.get('TARGET_LE32'), 'TODO: support x86 target when linking modules (needs offset of 4 and not 8 here)'
+      for key, value in forwarded_json['Variables']['globals'].iteritems():
+        if value.get('linkable'):
+          init = forwarded_json['Variables']['indexedGlobals'][key] + 8 # 8 is Runtime.GLOBAL_BASE / STATIC_BASE
+          if settings.get('SIDE_MODULE'): init = '(H_BASE+' + str(init) + ')|0'
+          asm_global_vars += '  var %s=%s;\n' % (key, str(init))
+
     # sent data
     the_global = '{ ' + ', '.join(['"' + math_fix(s) + '": ' + s for s in fundamentals]) + ' }'
     sending = '{ ' + ', '.join(['"' + math_fix(s) + '": ' + s for s in basic_funcs + global_funcs + basic_vars + basic_float_vars + global_vars]) + ' }'
@@ -552,12 +563,30 @@ var asm = (function(global, env, buffer) {
       threwValue = value;
     }
   }
+  function copyTempFloat(ptr) {
+    ptr = ptr|0;
+    HEAP8[tempDoublePtr] = HEAP8[ptr];
+    HEAP8[tempDoublePtr+1|0] = HEAP8[ptr+1|0];
+    HEAP8[tempDoublePtr+2|0] = HEAP8[ptr+2|0];
+    HEAP8[tempDoublePtr+3|0] = HEAP8[ptr+3|0];
+  }
+  function copyTempDouble(ptr) {
+    ptr = ptr|0;
+    HEAP8[tempDoublePtr] = HEAP8[ptr];
+    HEAP8[tempDoublePtr+1|0] = HEAP8[ptr+1|0];
+    HEAP8[tempDoublePtr+2|0] = HEAP8[ptr+2|0];
+    HEAP8[tempDoublePtr+3|0] = HEAP8[ptr+3|0];
+    HEAP8[tempDoublePtr+4|0] = HEAP8[ptr+4|0];
+    HEAP8[tempDoublePtr+5|0] = HEAP8[ptr+5|0];
+    HEAP8[tempDoublePtr+6|0] = HEAP8[ptr+6|0];
+    HEAP8[tempDoublePtr+7|0] = HEAP8[ptr+7|0];
+  }
 ''' + ''.join(['''
   function setTempRet%d(value) {
     value = value|0;
     tempRet%d = value;
   }
-''' % (i, i) for i in range(10)])] + funcs_js + ['''
+''' % (i, i) for i in range(10)])] + [PostSets.js + '\n'] + funcs_js + ['''
   %s
 
   return %s;

@@ -36,6 +36,7 @@ var ASSERTIONS = 1; // Whether we should add runtime assertions, for example to
                     // exceed it's size, whether all allocations (stack and static) are
                     // of positive size, etc., whether we should throw if we encounter a bad __label__, i.e.,
                     // if code flow runs into a fault
+                    // ASSERTIONS == 2 gives even more runtime checks
 var VERBOSE = 0; // When set to 1, will generate more verbose output during compilation.
 
 var INVOKE_RUN = 1; // Whether we will run the main() function. Disable if you embed the generated
@@ -66,9 +67,9 @@ var RELOOP = 0; // Recreate js native loops from llvm data
 var RELOOPER = 'relooper.js'; // Loads the relooper from this path relative to compiler.js
 
 var USE_TYPED_ARRAYS = 2; // Use typed arrays for the heap. See https://github.com/kripken/emscripten/wiki/Code-Generation-Modes/
-                          // 0 means no typed arrays are used.
+                          // 0 means no typed arrays are used. This mode disallows LLVM optimizations
                           // 1 has two heaps, IHEAP (int32) and FHEAP (double),
-                          // and addresses there are a match for normal addresses. This is deprecated.
+                          // and addresses there are a match for normal addresses. This mode disallows LLVM optimizations.
                           // 2 is a single heap, accessible through views as int8, int32, etc. This is
                           //   the recommended mode both for performance and for compatibility.
 var USE_FHEAP = 1; // Relevant in USE_TYPED_ARRAYS == 1. If this is disabled, only IHEAP will be used, and FHEAP
@@ -174,6 +175,7 @@ var LIBRARY_DEBUG = 0; // Print out when we enter a library call (library*.js). 
                        // want it back. A simple way to set it in C++ is
                        //   emscripten_run_script("Runtime.debug = ...;");
 var SOCKET_DEBUG = 0; // Log out socket/network data transfer.
+var SOCKET_WEBRTC = 0; // Select socket backend, either webrtc or websockets.
 
 var OPENAL_DEBUG = 0; // Print out debugging information from our OpenAL implementation.
 
@@ -184,6 +186,8 @@ var GL_MAX_TEMP_BUFFER_SIZE = 2097152; // How large GL emulation temp buffers ar
 var GL_UNSAFE_OPTS = 1; // Enables some potentially-unsafe optimizations in GL emulation code
 var FULL_ES2 = 0; // Forces support for all GLES2 features, not just the WebGL-friendly subset.
 var FORCE_GL_EMULATION = 0; // Forces inclusion of full GL emulation code.
+var DISABLE_GL_EMULATION = 0; // Disable inclusion of full GL emulation code. Useful when you don't want emulation
+                              // but do need INCLUDE_FULL_LIBRARY or MAIN_MODULE.
 
 var DISABLE_EXCEPTION_CATCHING = 0; // Disables generating code to actually catch exceptions. If the code you
                                     // are compiling does not actually rely on catching exceptions (but the
@@ -193,7 +197,7 @@ var DISABLE_EXCEPTION_CATCHING = 0; // Disables generating code to actually catc
                                     // introduce silent failures, which is good).
                                     // DISABLE_EXCEPTION_CATCHING = 0 - generate code to actually catch exceptions
                                     // DISABLE_EXCEPTION_CATCHING = 1 - disable exception catching at all
-                                    // DISABLE_EXCEPTION_CATCHING = 2 - disable exception catching, but enables 
+                                    // DISABLE_EXCEPTION_CATCHING = 2 - disable exception catching, but enables
                                     // catching in whitelist
                                     // TODO: Make this also remove cxa_begin_catch etc., optimize relooper
                                     //       for it, etc. (perhaps do all of this as preprocessing on .ll?)
@@ -234,15 +238,22 @@ var FS_LOG = 0; // Log all FS operations.  This is especially helpful when you'r
                 // a new project and want to see a list of file system operations happening
                 // so that you can create a virtual file system with all of the required files.
 
+var USE_BSS = 1; // https://en.wikipedia.org/wiki/.bss
+                 // When enabled, 0-initialized globals are sorted to the end of the globals list,
+                 // enabling us to not explicitly store the initialization value for each 0 byte.
+                 // This significantly lowers the memory initialization array size.
+
 var NAMED_GLOBALS = 0; // If 1, we use global variables for globals. Otherwise
                        // they are referred to by a base plus an offset (called an indexed global),
                        // saving global variables but adding runtime overhead.
 
-var EXPORTED_FUNCTIONS = ['_main']; // Functions that are explicitly exported. These functions are kept alive
+var EXPORTED_FUNCTIONS = ['_main', '_malloc'];
+                                    // Functions that are explicitly exported. These functions are kept alive
                                     // through LLVM dead code elimination, and also made accessible outside of
                                     // the generated code even after running closure compiler (on "Module").
                                     // Note the necessary prefix of "_".
-var EXPORT_ALL = 0; // If true, we export all the symbols
+var EXPORT_ALL = 0; // If true, we export all the symbols. Note that this does *not* affect LLVM, so it can
+                    // still eliminate functions as dead. This just exports them on the Module object.
 var EXPORT_BINDINGS = 0; // Export all bindings generator functions (prefixed with emscripten_bind_). This
                          // is necessary to use the bindings generator with asm.js
 
@@ -286,6 +297,10 @@ var SHELL_FILE = 0; // set this to a string to override the shell file used
 var SHOW_LABELS = 0; // Show labels in the generated code
 
 var PRINT_SPLIT_FILE_MARKER = 0; // Prints markers in Javascript generation to split the file later on. See emcc --split option.
+
+var MAIN_MODULE = 0; // A main module is a file compiled in a way that allows us to link it to
+                     // a side module using emlink.py.
+var SIDE_MODULE = 0; // Corresponds to MAIN_MODULE
 
 var BUILD_AS_SHARED_LIB = 0; // Whether to build the code as a shared library
                              // 0 here means this is not a shared lib: It is a main file.
@@ -371,6 +386,9 @@ var NECESSARY_BLOCKADDRS = []; // List of (function, block) for all block addres
 var EMIT_GENERATED_FUNCTIONS = 0; // whether to emit the list of generated functions, needed for external JS optimization passes
 
 var JS_CHUNK_SIZE = 10240; // Used as a maximum size before breaking up expressions and lines into smaller pieces
+
+var EXPORT_NAME = 'Module'; // Global variable to export the module as for environments without a standardized module
+                            // loading system (e.g. the browser and SM shell).
 
 // Compiler debugging options
 var DEBUG_TAGS_SHOWING = [];
@@ -1253,10 +1271,14 @@ var C_DEFINES = {'SI_MESGQ': '5',
    'SIGTTOU': '22',
    '_CS_POSIX_V7_LP64_OFF64_LDFLAGS': '10',
    '_SC_TTY_NAME_MAX': '41',
-   'AF_INET': '1',
+   'AF_INET': '2',
    'AF_INET6': '6',
+   'PF_INET': '2',
+   'PF_INET6': '6',
    'FIONREAD': '1',
    'SOCK_STREAM': '200',
-   'IPPROTO_TCP': 1
+   'SOCK_DGRAM': '20',
+   'IPPROTO_TCP': '1',
+   'IPPROTO_UDP': '2'
 };
 

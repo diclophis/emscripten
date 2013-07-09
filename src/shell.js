@@ -1,5 +1,6 @@
 try {
   this['Module'] = Module;
+  Module.test;
 } catch(e) {
   this['Module'] = Module = {};
 }
@@ -45,6 +46,8 @@ if (ENVIRONMENT_IS_NODE) {
   if (!Module['arguments']) {
     Module['arguments'] = process['argv'].slice(2);
   }
+
+  module.exports = Module;
 }
 
 if (ENVIRONMENT_IS_SHELL) {
@@ -63,6 +66,8 @@ if (ENVIRONMENT_IS_SHELL) {
       Module['arguments'] = arguments;
     }
   }
+  
+  this['{{{ EXPORT_NAME }}}'] = Module;
 }
 
 if (ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_WORKER) {
@@ -77,6 +82,8 @@ if (ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_WORKER) {
       console.log(x);
     };
   }
+
+  this['{{{ EXPORT_NAME }}}'] = Module;
 }
 
 if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {

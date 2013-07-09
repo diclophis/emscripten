@@ -6,7 +6,8 @@ mergeInto(LibraryManager.library, {
   $Browser__postset: 'Module["requestFullScreen"] = function(lockPointer, resizeCanvas) { Browser.requestFullScreen(lockPointer, resizeCanvas) };\n' + // exports
                      'Module["requestAnimationFrame"] = function(func) { Browser.requestAnimationFrame(func) };\n' +
                      'Module["pauseMainLoop"] = function() { Browser.mainLoop.pause() };\n' +
-                     'Module["resumeMainLoop"] = function() { Browser.mainLoop.resume() };\n',
+                     'Module["resumeMainLoop"] = function() { Browser.mainLoop.resume() };\n' +
+                     'Module["getUserMedia"] = function() { Browser.getUserMedia() }',
   $Browser: {
     mainLoop: {
       scheduler: null,
@@ -46,8 +47,11 @@ mergeInto(LibraryManager.library, {
     workers: [],
 
     init: function() {
-      if (Browser.initted) return;
+      if (!Module["preloadPlugins"]) Module["preloadPlugins"] = []; // needs to exist even in workers
+
+      if (Browser.initted || ENVIRONMENT_IS_WORKER) return;
       Browser.initted = true;
+
       try {
         new Blob();
         Browser.hasBlobConstructor = true;
@@ -77,8 +81,6 @@ mergeInto(LibraryManager.library, {
           'mp3': 'audio/mpeg'
         }[name.substr(name.lastIndexOf('.')+1)];
       }
-
-      if (!Module["preloadPlugins"]) Module["preloadPlugins"] = [];
 
       var imagePlugin = {};
       imagePlugin['canHandle'] = function(name) {
@@ -346,7 +348,7 @@ mergeInto(LibraryManager.library, {
       canvas.requestFullScreen = canvas['requestFullScreen'] ||
                                  canvas['mozRequestFullScreen'] ||
                                  (canvas['webkitRequestFullScreen'] ? function() { canvas['webkitRequestFullScreen'](Element['ALLOW_KEYBOARD_INPUT']) } : null);
-      canvas.requestFullScreen(); 
+      canvas.requestFullScreen();
     },
 
     requestAnimationFrame: function(func) {
@@ -370,19 +372,27 @@ mergeInto(LibraryManager.library, {
 
     // abort-aware versions
     safeRequestAnimationFrame: function(func) {
-      Browser.requestAnimationFrame(function() {
+      return Browser.requestAnimationFrame(function() {
         if (!ABORT) func();
       });
     },
     safeSetTimeout: function(func, timeout) {
-      setTimeout(function() {
+      return setTimeout(function() {
         if (!ABORT) func();
       }, timeout);
     },
     safeSetInterval: function(func, timeout) {
-      setInterval(function() {
+      return setInterval(function() {
         if (!ABORT) func();
       }, timeout);
+    },
+
+    getUserMedia: function(func) {
+      if(!window.getUserMedia) {
+        window.getUserMedia = navigator['getUserMedia'] ||
+                              navigator['mozGetUserMedia'];
+      }
+      window.getUserMedia(func);
     },
 
     getMovementX: function(event) {
@@ -416,8 +426,17 @@ mergeInto(LibraryManager.library, {
           Browser.mouseMovementX = Browser.getMovementX(event);
           Browser.mouseMovementY = Browser.getMovementY(event);
         }
-        Browser.mouseX = SDL.mouseX + Browser.mouseMovementX;
-        Browser.mouseY = SDL.mouseY + Browser.mouseMovementY;
+        
+        // check if SDL is available
+        if (typeof SDL != "undefined") {
+        	Browser.mouseX = SDL.mouseX + Browser.mouseMovementX;
+        	Browser.mouseY = SDL.mouseY + Browser.mouseMovementY;
+        } else {
+        	// just add the mouse delta to the current absolut mouse position
+        	// FIXME: ideally this should be clamped against the canvas size and zero
+        	Browser.mouseX += Browser.mouseMovementX;
+        	Browser.mouseY += Browser.mouseMovementY;
+        }        
       } else {
         // Otherwise, calculate the movement based on the changes
         // in the coordinates.
@@ -494,22 +513,28 @@ mergeInto(LibraryManager.library, {
       this.windowedHeight = canvas.height;
       canvas.width = screen.width;
       canvas.height = screen.height;
-      var flags = {{{ makeGetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'i32', 0, 1) }}};
-      flags = flags | 0x00800000; // set SDL_FULLSCREEN flag
-      {{{ makeSetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'flags', 'i32') }}}
+      // check if SDL is available   
+      if (typeof SDL != "undefined") {
+      	var flags = {{{ makeGetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'i32', 0, 1) }}};
+      	flags = flags | 0x00800000; // set SDL_FULLSCREEN flag
+      	{{{ makeSetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'flags', 'i32') }}}
+      }
       Browser.updateResizeListeners();
     },
-    
+
     setWindowedCanvasSize: function() {
       var canvas = Module['canvas'];
       canvas.width = this.windowedWidth;
       canvas.height = this.windowedHeight;
-      var flags = {{{ makeGetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'i32', 0, 1) }}};
-      flags = flags & ~0x00800000; // clear SDL_FULLSCREEN flag
-      {{{ makeSetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'flags', 'i32') }}}
+      // check if SDL is available       
+      if (typeof SDL != "undefined") {
+      	var flags = {{{ makeGetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'i32', 0, 1) }}};
+      	flags = flags & ~0x00800000; // clear SDL_FULLSCREEN flag
+      	{{{ makeSetValue('SDL.screen+Runtime.QUANTUM_SIZE*0', '0', 'flags', 'i32') }}}
+      }
       Browser.updateResizeListeners();
     }
-    
+
   },
 
   emscripten_async_wget: function(url, file, onload, onerror) {
@@ -546,11 +571,11 @@ mergeInto(LibraryManager.library, {
     var _request = Pointer_stringify(request);
     var _param = Pointer_stringify(param);
     var index = _file.lastIndexOf('/');
-     
+
     var http = new XMLHttpRequest();
     http.open(_request, _url, true);
     http.responseType = 'arraybuffer';
-    
+
     // LOAD
     http.onload = function(e) {
       if (http.status == 200) {
@@ -560,20 +585,20 @@ mergeInto(LibraryManager.library, {
         if (onerror) Runtime.dynCall('vii', onerror, [arg, http.status]);
       }
     };
-      
+
     // ERROR
     http.onerror = function(e) {
       if (onerror) Runtime.dynCall('vii', onerror, [arg, http.status]);
     };
-	
+
     // PROGRESS
     http.onprogress = function(e) {
       var percentComplete = (e.position / e.totalSize)*100;
       if (onprogress) Runtime.dynCall('vii', onprogress, [arg, percentComplete]);
     };
-	  
+
     // Useful because the browser can limit the number of redirection
-    try {  
+    try {
       if (http.channel instanceof Ci.nsIHttpChannel)
       http.channel.redirectionLimit = 0;
     } catch (ex) { /* whatever */ }
@@ -588,7 +613,7 @@ mergeInto(LibraryManager.library, {
       http.send(null);
     }
   },
-  
+
   emscripten_async_prepare: function(file, onload, onerror) {
     var _file = Pointer_stringify(file);
     var data = FS.analyzePath(_file);
@@ -754,6 +779,11 @@ mergeInto(LibraryManager.library, {
     }
   },
 
+  emscripten_exit_with_live_runtime: function() {
+    Module['noExitRuntime'] = true;
+    throw 'SimulateInfiniteLoop';
+  },
+
   emscripten_hide_mouse: function() {
     var styleSheet = document.styleSheets[0];
     var rules = styleSheet.cssRules;
@@ -775,7 +805,7 @@ mergeInto(LibraryManager.library, {
         var t = process['hrtime']();
         return t[0] * 1e3 + t[1] / 1e6;
     }
-    else if (window['performance'] && window['performance']['now']) {
+    else if (ENVIRONMENT_IS_WEB && window['performance'] && window['performance']['now']) {
       return window['performance']['now']();
     } else {
       return Date.now();

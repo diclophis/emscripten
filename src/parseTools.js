@@ -290,18 +290,18 @@ function isVarArgsFunctionType(type) {
   return type.substr(-varArgsSuffix.length) == varArgsSuffix;
 }
 
-function getNumVars(type) { // how many variables are needed to represent this type
+function getNumLegalizedVars(type) { // how many legalized variables are needed to represent this type
   if (type in Runtime.FLOAT_TYPES) return 1;
   return Math.max(getNumIntChunks(type), 1);
 }
 
-function countNormalArgs(type, out) {
+function countNormalArgs(type, out, legalized) {
   out = out || {};
   if (!isFunctionType(type, out)) return -1;
   var ret = 0;
   if (out.segments) {
     for (var i = 0; i < out.segments.length; i++) {
-      ret += getNumVars(out.segments[i][0].text);
+      ret += legalized ? getNumLegalizedVars(out.segments[i][0].text) : 1;
     }
   }
   if (isVarArgsFunctionType(type)) ret--;
@@ -467,6 +467,18 @@ function isIndexableGlobal(ident) {
   return !data.alias && !data.external;
 }
 
+function isBSS(item) {
+  if (!USE_BSS) {
+    return false;
+  }
+
+  if (item.external) return false; // externals are typically implemented in a JS library, and must be accessed by name, explicitly
+
+  // return true if a global is uninitialized or initialized to 0
+  return (item.value && item.value.intertype === 'emptystruct') ||
+         (item.value && item.value.value !== undefined && item.value.value === '0');
+}
+
 function makeGlobalDef(ident) {
   if (!NAMED_GLOBALS && isIndexableGlobal(ident)) return '';
   return 'var ' + ident + ';';
@@ -480,7 +492,9 @@ function makeGlobalUse(ident) {
       UNINDEXABLE_GLOBALS[ident] = 1;
       return ident;
     }
-    return (Runtime.GLOBAL_BASE + index).toString();
+    var ret = (Runtime.GLOBAL_BASE + index).toString();
+    if (SIDE_MODULE) ret = '(H_BASE+' + ret + ')';
+    return ret;
   }
   return ident;
 }
@@ -490,7 +504,10 @@ function sortGlobals(globals) {
   ks.sort();
   var inv = invertArray(ks);
   return values(globals).sort(function(a, b) {
-    return inv[b.ident] - inv[a.ident];
+    // sort globals based on if they need to be explicitly initialized or not (moving
+    // values that don't need to be to the end of the array). if equal, sort by name.
+    return (Number(isBSS(a)) - Number(isBSS(b))) ||
+      (inv[b.ident] - inv[a.ident]);
   });
 }
 
@@ -710,9 +727,9 @@ function splitI64(value, floatConversion) {
   var lowInput = legalizedI64s ? value : 'VALUE';
   if (floatConversion && ASM_JS) lowInput = asmFloatToInt(lowInput);
   if (legalizedI64s) {
-    return [lowInput + '>>>0', 'Math.min(Math.floor((' + value + ')/' + asmEnsureFloat(4294967296, 'float') + '), ' + asmEnsureFloat(4294967295, 'float') + ')>>>0'];
+    return [lowInput + '>>>0', asmCoercion('Math.min(' + asmCoercion('Math.floor((' + value + ')/' + asmEnsureFloat(4294967296, 'float') + ')', 'double') + ', ' + asmEnsureFloat(4294967295, 'float') + ')', 'i32') + '>>>0'];
   } else {
-    return makeInlineCalculation(makeI64(lowInput + '>>>0', 'Math.min(Math.floor(VALUE/' + asmEnsureFloat(4294967296, 'float') + '), ' + asmEnsureFloat(4294967295, 'float') + ')>>>0'), value, 'tempBigIntP');
+    return makeInlineCalculation(makeI64(lowInput + '>>>0', asmCoercion('Math.min(' + asmCoercion('Math.floor(VALUE/' + asmEnsureFloat(4294967296, 'float') + ')', 'double') + ', ' + asmEnsureFloat(4294967295, 'float') + ')', 'i32') + '>>>0'), value, 'tempBigIntP');
   }
 }
 function mergeI64(value, unsigned) {
@@ -1049,7 +1066,7 @@ function getHeapOffset(offset, type, forceAsm) {
   offset = '(' + offset + ')';
   if (shifts != 0) {
     if (CHECK_HEAP_ALIGN) {
-      return '(CHECK_ALIGN_' + sz + '(' + offset + '|0)>>' + shifts + ')';
+      return '((CHECK_ALIGN_' + sz + '(' + offset + '|0)|0)>>' + shifts + ')';
     } else {
       return '(' + offset + '>>' + shifts + ')';
     }
@@ -1212,15 +1229,11 @@ function indexizeFunctions(value, type) {
   var out = {};
   if (type && isFunctionType(type, out) && value[0] === '_') { // checking for _ differentiates from $ (local vars)
     // add signature to library functions that we now know need indexing
-    if (!(value in Functions.implementedFunctions) && !(value in Functions.unimplementedFunctions)) {
-      Functions.unimplementedFunctions[value] = Functions.getSignature(out.returnType, out.segments ? out.segments.map(function(segment) { return segment[0].text }) : []);
+    var sig = Functions.implementedFunctions[value] || Functions.unimplementedFunctions[value];
+    if (!sig) {
+      sig = Functions.unimplementedFunctions[value] = Functions.getSignature(out.returnType, out.segments ? out.segments.map(function(segment) { return segment[0].text }) : []);
     }
-
-    if (BUILD_AS_SHARED_LIB) {
-      return '(FUNCTION_TABLE_OFFSET + ' + Functions.getIndex(value) + ')';
-    } else {
-      return Functions.getIndex(value);
-    }
+    return Functions.getIndex(value, undefined, sig);
   }
   return value;
 }
@@ -1383,7 +1396,7 @@ function makeCopyValues(dest, src, num, type, modifier, align, sep) {
     if (!isNumber(num)) num = stripCorrections(num);
     if (!isNumber(align)) align = stripCorrections(align);
     if (!isNumber(num) || (parseInt(num)/align >= UNROLL_LOOP_MAX)) {
-      return '_memcpy(' + dest + ', ' + src + ', ' + num + ')';
+      return '(_memcpy(' + dest + ', ' + src + ', ' + num + ')|0)';
     }
     num = parseInt(num);
     if (ASM_JS) {
@@ -1465,7 +1478,7 @@ function getFastValue(a, op, b, type) {
         if ((isNumber(a) && Math.abs(a) < TWO_TWENTY) || (isNumber(b) && Math.abs(b) < TWO_TWENTY) || (bits < 32 && !ASM_JS)) {
           return '(((' + a + ')*(' + b + '))&' + ((Math.pow(2, bits)-1)|0) + ')'; // keep a non-eliminatable coercion directly on this
         }
-        return 'Math.imul(' + a + ',' + b + ')';
+        return '(Math.imul(' + a + ',' + b + ')|0)';
       }
     } else {
       if (a == '0') {
@@ -1612,6 +1625,9 @@ function makePointer(slab, pos, allocator, type, ptr, finalMemoryInitialization)
       // writing out into memory, without a normal allocation. We put all of these into a single big chunk.
       assert(typeof slab == 'object');
       assert(slab.length % QUANTUM_SIZE == 0, slab.length); // must be aligned already
+      if (SIDE_MODULE && typeof ptr == 'string') {
+        ptr = parseInt(ptr.substring(ptr.indexOf('+'), ptr.length-1)); // parse into (H_BASE+X)
+      }
       var offset = ptr - Runtime.GLOBAL_BASE;
       for (var i = 0; i < slab.length; i++) {
         memoryInitialization[offset + i] = slab[i];
@@ -2038,12 +2054,20 @@ function processMathop(item) {
   }
   var bitsBefore = parseInt((item.params[0] ? item.params[0].type : item.type).substr(1)); // remove i to leave the number of bits left after this
   var bitsLeft = parseInt(((item.params[1] && item.params[1].ident) ? item.params[1].ident : item.type).substr(1)); // remove i to leave the number of bits left after this operation
+  var rawBits = getBits(item.type);
+  assert(rawBits <= 64);
 
   function integerizeBignum(value) {
     return makeInlineCalculation('VALUE-VALUE%1', value, 'tempBigIntI');
   }
 
-  if ((type == 'i64' || paramTypes[0] == 'i64' || paramTypes[1] == 'i64' || idents[1] == '(i64)') && USE_TYPED_ARRAYS == 2) {
+  if ((type == 'i64' || paramTypes[0] == 'i64' || paramTypes[1] == 'i64' || idents[1] == '(i64)' || rawBits > 32) && USE_TYPED_ARRAYS == 2) {
+    // this code assumes i64 for the most part
+    if (ASSERTIONS && rawBits > 1 && rawBits < 64) {
+      warnOnce('processMathop processing illegal non-i64 value');
+      if (VERBOSE) printErr([op, item.type, rawBits, type, paramTypes, idents]);
+    }
+
     var warnI64_1 = function() {
       warnOnce('Arithmetic on 64-bit integers in mode 1 is rounded and flaky, like mode 0!');
     };
@@ -2123,7 +2147,11 @@ function processMathop(item) {
       }
       case 'select': return idents[0] + ' ? ' + makeCopyI64(idents[1]) + ' : ' + makeCopyI64(idents[2]);
       case 'ptrtoint': return makeI64(idents[0], 0);
-      case 'inttoptr': return '(' + idents[0] + '[0])'; // just directly truncate the i64 to a 'pointer', which is an i32
+      case 'inttoptr': {
+        var m = /\(?\[(\d+),\d+\]\)?/.exec(idents[0]);
+        if (m) return m[1]; // constant, can just parse it right now
+        return '(' + idents[0] + '[0])'; // just directly truncate the i64 to a 'pointer', which is an i32
+      }
       // Dangerous, rounded operations. TODO: Fully emulate
       case 'add': {
         if (PRECISE_I64_MATH) {
@@ -2196,7 +2224,7 @@ function processMathop(item) {
     case 'sub': return handleOverflow(getFastValue(idents[0], '-', idents[1], item.type), bits);
     case 'sdiv': case 'udiv': return makeRounding(getFastValue(idents[0], '/', idents[1], item.type), bits, op[0] === 's');
     case 'mul': return getFastValue(idents[0], '*', idents[1], item.type); // overflow handling is already done in getFastValue for '*'
-    case 'urem': case 'srem': return getFastValue(idents[0], '%', idents[1], item.type);
+    case 'urem': case 'srem': return makeRounding(getFastValue(idents[0], '%', idents[1], item.type), bits, op[0] === 's');
     case 'or': {
       if (bits > 32) {
         assert(bits === 64, 'Too many bits for or: ' + bits);
