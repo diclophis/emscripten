@@ -83,7 +83,8 @@ function run(args) {
 
     var ret = 0;
     calledRun = true;
-    if (Module['_main'] && shouldRunNow) {
+    if (Module['_main'] && (shouldRunNow || (Module['noInitialRun'] && !shouldRunNow))) {
+    //if (Module['_main'] && shouldRunNow) {
       ret = Module['callMain'](args);
       if (!Module['noExitRuntime']) {
         exitRuntime();
@@ -130,9 +131,11 @@ var shouldRunNow = false;
 #endif
 if (Module['noInitialRun']) {
   shouldRunNow = false;
-}
+} else {
 
 run();
+
+}
 
 // {{POST_RUN_ADDITIONS}}
 
