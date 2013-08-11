@@ -10,7 +10,7 @@
 //                   or otherwise).
 
 var LibrarySDL = {
-  $SDL__deps: ['$FS', '$Browser'],
+  $SDL__deps: ['$FS', '$PATH', '$Browser'],
   $SDL: {
     defaults: {
       width: 320,
@@ -21,11 +21,14 @@ var LibrarySDL = {
     version: null,
 
     surfaces: {},
+    // A pool of freed canvas elements. Reusing them avoids GC pauses.
+    canvasPool: [],
     events: [],
     fonts: [null],
 
     // The currently preloaded audio elements ready to be played
     audios: [null],
+    rwops: [null],
     // The currently playing audio element.  There's only one music track.
     music: {
       audio: null,
@@ -246,7 +249,7 @@ var LibrarySDL = {
     },
 
     translateRGBAToCSSRGBA: function(r, g, b, a) {
-      return 'rgba(' + r + ',' + g + ',' + b + ',' + (a/255) + ')';
+      return 'rgba(' + (r&0xff) + ',' + (g&0xff) + ',' + (b&0xff) + ',' + (a&0xff)/255 + ')';
     },
 
     translateRGBAToColor: function(r, g, b, a) {
@@ -273,6 +276,8 @@ var LibrarySDL = {
       {{{ makeSetValue('surf+Runtime.QUANTUM_SIZE*5', '0', 'buffer', 'void*') }}}      // SDL_Surface.pixels
       {{{ makeSetValue('surf+Runtime.QUANTUM_SIZE*6', '0', '0', 'i32*') }}}      // SDL_Surface.offset
 
+      {{{ makeSetValue('surf+Runtime.QUANTUM_SIZE*14', '0', '1', 'i32') }}}
+
       {{{ makeSetValue('pixelFormat + SDL.structs.PixelFormat.format', '0', '-2042224636', 'i32') }}} // SDL_PIXELFORMAT_RGBA8888
       {{{ makeSetValue('pixelFormat + SDL.structs.PixelFormat.palette', '0', '0', 'i32') }}} // TODO
       {{{ makeSetValue('pixelFormat + SDL.structs.PixelFormat.BitsPerPixel', '0', 'bpp * 8', 'i8') }}}
@@ -288,7 +293,11 @@ var LibrarySDL = {
       SDL.GL = SDL.GL || useWebGL;
       var canvas;
       if (!usePageCanvas) {
-        canvas = document.createElement('canvas');
+        if (SDL.canvasPool.length > 0) {
+          canvas = SDL.canvasPool.pop();
+        } else {
+          canvas = document.createElement('canvas');
+        }
         canvas.width = width;
         canvas.height = height;
       } else {
@@ -309,7 +318,7 @@ var LibrarySDL = {
         usePageCanvas: usePageCanvas,
         source: source,
 
-        isFlagSet: function (flag) {
+        isFlagSet: function(flag) {
           return flags & flag;
         }
       };
@@ -355,14 +364,63 @@ var LibrarySDL = {
     },
 
     freeSurface: function(surf) {
-      _free(SDL.surfaces[surf].buffer);
-      _free(SDL.surfaces[surf].pixelFormat);
+      var refcountPointer = surf + Runtime.QUANTUM_SIZE * 14;
+      var refcount = {{{ makeGetValue('refcountPointer', '0', 'i32') }}};
+      if (refcount > 1) {
+        {{{ makeSetValue('refcountPointer', '0', 'refcount - 1', 'i32') }}};
+        return;
+      }
+
+      var info = SDL.surfaces[surf];
+      if (!info.usePageCanvas && info.canvas) SDL.canvasPool.push(info.canvas);
+      _free(info.buffer);
+      _free(info.pixelFormat);
       _free(surf);
       SDL.surfaces[surf] = null;
     },
 
+    touchX:0, touchY: 0,
+
     receiveEvent: function(event) {
       switch(event.type) {
+        case 'touchstart':
+          event.preventDefault();
+          var touch = event.touches[0];
+          touchX = touch.pageX;
+          touchY = touch.pageY;
+          var event = {
+            type: 'mousedown',
+            button: 0,
+            pageX: touchX,
+            pageY: touchY
+          };
+          SDL.DOMButtons[0] = 1;
+          SDL.events.push(event);
+          break;
+        case 'touchmove':
+          event.preventDefault();
+          var touch = event.touches[0];
+          touchX = touch.pageX;
+          touchY = touch.pageY;
+          event = {
+            type: 'mousemove',
+            button: 0,
+            pageX: touchX,
+            pageY: touchY
+          };
+          SDL.events.push(event);
+          break;
+        case 'touchend':
+          event.preventDefault();
+          event = {
+            type: 'mouseup',
+            button: 0,
+            pageX: touchX,
+            pageY: touchY
+          };
+          SDL.DOMButtons[0] = 0;
+          SDL.events.push(event);
+          break;
         case 'mousemove':
           if (Browser.pointerLock) {
             // workaround for firefox bug 750111
@@ -891,7 +949,10 @@ var LibrarySDL = {
     // TODO
   },
 
-  SDL_GetKeyboardState: function() {
+  SDL_GetKeyboardState: function(numKeys) {
+    if (numKeys) {
+      {{{ makeSetValue('numKeys', 0, 0x10000, 'i32') }}};
+    }
     return SDL.keyboardState;
   },
 
@@ -1022,6 +1083,7 @@ var LibrarySDL = {
     surfData.ctx.fillStyle = SDL.translateColorToCSSRGBA(color);
     surfData.ctx.fillRect(r.x, r.y, r.w, r.h);
     surfData.ctx.restore();
+    return 0;
   },
 
   SDL_BlitSurface__deps: ['SDL_UpperBlit'],
@@ -1031,15 +1093,27 @@ var LibrarySDL = {
 
   zoomSurface: function(src, x, y, smooth) {
     var srcData = SDL.surfaces[src];
-    var w = srcData.width*x;
-    var h = srcData.height*y;
-    var ret = SDL.makeSurface(w, h, srcData.flags, false, 'zoomSurface');
+    var w = srcData.width * x;
+    var h = srcData.height * y;
+    var ret = SDL.makeSurface(Math.abs(w), Math.abs(h), srcData.flags, false, 'zoomSurface');
     var dstData = SDL.surfaces[ret];
-    dstData.ctx.drawImage(srcData.canvas, 0, 0, w, h);
+    if (x >= 0 && y >= 0) dstData.ctx.drawImage(srcData.canvas, 0, 0, w, h);
+    else {
+      dstData.ctx.save();
+      dstData.ctx.scale(x < 0 ? -1 : 1, y < 0 ? -1 : 1);
+      dstData.ctx.drawImage(srcData.canvas, w < 0 ? w : 0, h < 0 ? h : 0, Math.abs(w), Math.abs(h));
+      // XXX I think this should work according to the spec, but currently
+      // fails on FF: dstData.ctx.drawImage(srcData.canvas, 0, 0, w, h);
+      dstData.ctx.restore();
+    }
     return ret;
   },
 
+  rotozoomSurface__deps: ['zoomSurface'],
   rotozoomSurface: function(src, angle, zoom, smooth) {
+    if (angle % 360 === 0) {
+      return _zoomSurface(src, zoom, zoom, smooth);
+    }
     var srcData = SDL.surfaces[src];
     var w = srcData.width * zoom;
     var h = srcData.height * zoom;
@@ -1054,6 +1128,14 @@ var LibrarySDL = {
 
   SDL_SetAlpha: function(surf, flag, alpha) {
     SDL.surfaces[surf].alpha = alpha;
+  },
+
+  SDL_SetColorKey: function(surf, flag, key) {
+    // SetColorKey assigns one color to be rendered as transparent. I don't
+    // think the canvas API allows for anything like this, and iterating through
+    // each pixel to replace that color seems prohibitively expensive.
+    Runtime.warnOnce('SDL_SetColorKey is a no-op for performance reasons');
+    return 0;
   },
 
   SDL_GetTicks: function() {
@@ -1156,42 +1238,131 @@ var LibrarySDL = {
     return flags; // We support JPG, PNG, TIF because browsers do
   },
 
-  IMG_Load__deps: ['SDL_LockSurface'],
-  IMG_Load: function(filename) {
-    filename = FS.standardizePath(Pointer_stringify(filename));
-    if (filename[0] == '/') {
-      // Convert the path to relative
-      filename = filename.substr(1);
+  IMG_Load_RW__deps: ['SDL_LockSurface', 'SDL_FreeRW'],
+  IMG_Load_RW: function(rwopsID, freeSrc) {
+    try {
+      // stb_image integration support
+      var cleanup = function() {
+        if (rwops && freeSrc) _SDL_FreeRW(rwopsID);
+      };
+      function addCleanup(func) {
+        var old = cleanup;
+        cleanup = function() {
+          old();
+          func();
+        }
+      }
+      function callStbImage(func, params) {
+        var x = Module['_malloc']({{{ QUANTUM_SIZE }}});
+        var y = Module['_malloc']({{{ QUANTUM_SIZE }}});
+        var comp = Module['_malloc']({{{ QUANTUM_SIZE }}});
+        addCleanup(function() {
+          Module['_free'](x);
+          Module['_free'](y);
+          Module['_free'](comp);
+          if (data) Module['_stbi_image_free'](data);
+        });
+        var data = Module['_' + func].apply(null, params.concat([x, y, comp, 0]));
+        if (!data) return null;
+        return {
+          rawData: true,
+          data: data,
+          width: {{{ makeGetValue('x', 0, 'i32') }}},
+          height: {{{ makeGetValue('y', 0, 'i32') }}},
+          size: {{{ makeGetValue('x', 0, 'i32') }}} * {{{ makeGetValue('y', 0, 'i32') }}} * {{{ makeGetValue('comp', 0, 'i32') }}},
+          bpp: {{{ makeGetValue('comp', 0, 'i32') }}}
+        };
+      }
+
+      var rwops = SDL.rwops[rwopsID];
+      if (rwops === undefined) {
+        return 0;
+      }
+
+      var filename = rwops.filename;
+      if (filename === undefined) {
+#if STB_IMAGE
+        var raw = callStbImage('stbi_load_from_memory', [rwops.bytes, rwops.count]);
+        if (!raw) return 0;
+#else
+        Runtime.warnOnce('Only file names that have been preloaded are supported for IMG_Load_RW. Consider using STB_IMAGE=1 if you want synchronous image decoding (see settings.js)');
+        return 0;
+#endif
+      }
+
+      if (!raw) {
+        filename = PATH.resolve(filename);
+        var raw = Module["preloadedImages"][filename];
+        if (!raw) {
+          if (raw === null) Module.printErr('Trying to reuse preloaded image, but freePreloadedMediaOnUse is set!');
+#if STB_IMAGE
+          var name = Module['_malloc'](filename.length+1);
+          writeStringToMemory(filename, name);
+          addCleanup(function() {
+            Module['_free'](name);
+          });
+          var raw = callStbImage('stbi_load', [name]);
+          if (!raw) return 0;
+#else
+          Runtime.warnOnce('Cannot find preloaded image ' + filename);
+          Runtime.warnOnce('Cannot find preloaded image ' + filename + '. Consider using STB_IMAGE=1 if you want synchronous image decoding (see settings.js)');
+          return 0;
+#endif
+        } else if (Module['freePreloadedMediaOnUse']) {
+          Module["preloadedImages"][filename] = null;
+        }
+      }
+
+      var surf = SDL.makeSurface(raw.width, raw.height, 0, false, 'load:' + filename);
+      var surfData = SDL.surfaces[surf];
+      surfData.ctx.globalCompositeOperation = "copy";
+      if (!raw.rawData) {
+        surfData.ctx.drawImage(raw, 0, 0, raw.width, raw.height, 0, 0, raw.width, raw.height);
+      } else {
+        var imageData = surfData.ctx.getImageData(0, 0, surfData.width, surfData.height);
+        if (raw.bpp == 4) {
+          imageData.data.set({{{ makeHEAPView('U8', 'raw.data', 'raw.data+raw.size') }}});
+        } else if (raw.bpp == 3) {
+          var pixels = raw.size/3;
+          var data = imageData.data;
+          var sourcePtr = raw.data;
+          var destPtr = 0;
+          for (var i = 0; i < pixels; i++) {
+            data[destPtr++] = {{{ makeGetValue('sourcePtr++', 0, 'i8', null, 1) }}};
+            data[destPtr++] = {{{ makeGetValue('sourcePtr++', 0, 'i8', null, 1) }}};
+            data[destPtr++] = {{{ makeGetValue('sourcePtr++', 0, 'i8', null, 1) }}};
+            data[destPtr++] = 255;
+          }
+        } else {
+          Module.printErr('cannot handle bpp ' + raw.bpp);
+          return 0;
+        }
+        surfData.ctx.putImageData(imageData, 0, 0);
+      }
+      surfData.ctx.globalCompositeOperation = "source-over";
+      // XXX SDL does not specify that loaded images must have available pixel data, in fact
+      //     there are cases where you just want to blit them, so you just need the hardware
+      //     accelerated version. However, code everywhere seems to assume that the pixels
+      //     are in fact available, so we retrieve it here. This does add overhead though.
+      _SDL_LockSurface(surf);
+      surfData.locked--; // The surface is not actually locked in this hack
+      if (SDL.GL) {
+        // After getting the pixel data, we can free the canvas and context if we do not need to do 2D canvas blitting
+        surfData.canvas = surfData.ctx = null;
+      }
+      return surf;
+    } finally {
+      cleanup();
     }
-    var raw = Module["preloadedImages"][filename];
-    if (!raw) {
-      if (raw === null) Module.printErr('Trying to reuse preloaded image, but freePreloadedMediaOnUse is set!');
-      Runtime.warnOnce('Cannot find preloaded image ' + filename);
-      return 0;
-    }
-    if (Module['freePreloadedMediaOnUse']) {
-      Module["preloadedImages"][filename] = null;
-    }
-    var surf = SDL.makeSurface(raw.width, raw.height, 0, false, 'load:' + filename);
-    var surfData = SDL.surfaces[surf];
-    surfData.ctx.globalCompositeOperation = "copy";
-    surfData.ctx.drawImage(raw, 0, 0, raw.width, raw.height, 0, 0, raw.width, raw.height);
-    surfData.ctx.globalCompositeOperation = "source-over";
-    // XXX SDL does not specify that loaded images must have available pixel data, in fact
-    //     there are cases where you just want to blit them, so you just need the hardware
-    //     accelerated version. However, code everywhere seems to assume that the pixels
-    //     are in fact available, so we retrieve it here. This does add overhead though.
-    _SDL_LockSurface(surf);
-    surfData.locked--; // The surface is not actually locked in this hack
-    if (SDL.GL) {
-      // After getting the pixel data, we can free the canvas and context if we do not need to do 2D canvas blitting
-      surfData.canvas = surfData.ctx = null;
-    }
-    return surf;
   },
   SDL_LoadBMP: 'IMG_Load',
-  SDL_LoadBMP_RW: 'IMG_Load',
-  IMG_Load_RW: 'IMG_Load',
+  SDL_LoadBMP_RW: 'IMG_Load_RW',
+  IMG_Load__deps: ['IMG_Load_RW', 'SDL_RWFromFile'],
+  IMG_Load: function(filename){
+    var rwops = _SDL_RWFromFile(filename);
+    var result = _IMG_Load_RW(rwops, 1);
+    return result;
+  },
 
   // SDL_Audio
 
@@ -1327,22 +1498,61 @@ var LibrarySDL = {
     return 0; // error
   },
 
-  Mix_LoadWAV_RW: function(filename, freesrc) {
-    filename = FS.standardizePath(Pointer_stringify(filename));
-    var raw = Module["preloadedAudios"][filename];
-    if (!raw) {
-      if (raw === null) Module.printErr('Trying to reuse preloaded audio, but freePreloadedMediaOnUse is set!');
-      Runtime.warnOnce('Cannot find preloaded audio ' + filename);
+  Mix_LoadWAV_RW: function(rwopsID, freesrc) {
+    var rwops = SDL.rwops[rwopsID];
+
+    if (rwops === undefined)
+      return 0;
+
+    var filename = '';
+    var audio;
+    var bytes;
+    
+    if (rwops.filename !== undefined) {
+      filename = PATH.resolve(rwops.filename);
+      var raw = Module["preloadedAudios"][filename];
+      if (!raw) {
+        if (raw === null) Module.printErr('Trying to reuse preloaded audio, but freePreloadedMediaOnUse is set!');
+        Runtime.warnOnce('Cannot find preloaded audio ' + filename);
+        
+        // see if we can read the file-contents from the in-memory FS
+        var fileObject = FS.findObject(filename);
+        
+        if (fileObject === null) Module.printErr('Couldn\'t find file for: ' + filename);
+        
+        // We found the file. Load the contents
+        if (fileObject && !fileObject.isFolder && fileObject.read) {
+          bytes = fileObject.contents;
+        } else {
+          return 0;
+        }
+      }
+      if (Module['freePreloadedMediaOnUse']) {
+        Module["preloadedAudios"][filename] = null;
+      }
+      audio = raw;
+    }
+    else if (rwops.bytes !== undefined) {
+      bytes = HEAPU8.subarray(rwops.bytes, rwops.bytes + rwops.count);
+    }
+    else {
       return 0;
     }
-    if (Module['freePreloadedMediaOnUse']) {
-      Module["preloadedAudios"][filename] = null;
+    
+    // Here, we didn't find a preloaded audio but we either were passed a filepath for
+    // which we loaded bytes, or we were passed some bytes
+    if (audio === undefined && bytes) {
+      var blob = new Blob([new Uint8Array(bytes)], {type: rwops.mimetype});
+      var url = URL.createObjectURL(blob);
+      audio = new Audio();
+      audio.src = url;
     }
+    
     var id = SDL.audios.length;
     // Keep the loaded audio in the audio arrays, ready for playback
     SDL.audios.push({
       source: filename,
-      audio: raw
+      audio: audio
     });
     return id;
   },
@@ -1472,15 +1682,20 @@ var LibrarySDL = {
   },
 
   Mix_HaltChannel: function(channel) {
-    var info = SDL.channels[channel];
-    if (info.audio) {
-      info.audio.pause();
-      info.audio = null;
-    } else {
-      Module.printErr('No Audio for channel: ' + channel);
+    function halt(channel) {
+      var info = SDL.channels[channel];
+      if (info.audio) {
+        info.audio.pause();
+        info.audio = null;
+      }
+      if (SDL.channelFinished) {
+        Runtime.getFuncWrapper(SDL.channelFinished, 'vi')(channel);
+      }
     }
-    if (SDL.channelFinished) {
-      Runtime.getFuncWrapper(SDL.channelFinished, 'vi')(channel);
+    if (channel != -1) {
+      halt(channel);
+    } else {
+      for (var i = 0; i < SDL.channels.length; ++i) halt(i);
     }
     return 0;
   },
@@ -1497,8 +1712,14 @@ var LibrarySDL = {
     return SDL.setGetVolume(SDL.music, volume);
   },
 
-  Mix_LoadMUS: 'Mix_LoadWAV_RW',
   Mix_LoadMUS_RW: 'Mix_LoadWAV_RW',
+  Mix_LoadMUS__deps: ['Mix_LoadMUS_RW', 'SDL_RWFromFile', 'SDL_FreeRW'],
+  Mix_LoadMUS: function(filename) {
+    var rwops = _SDL_RWFromFile(filename);
+    var result = _Mix_LoadMUS_RW(rwops);
+    _SDL_FreeRW(rwops);
+    return result;
+  },
 
   Mix_FreeMusic: 'Mix_FreeChunk',
 
@@ -1667,6 +1888,7 @@ var LibrarySDL = {
   },
   TTF_RenderText_Blended: 'TTF_RenderText_Solid', // XXX ignore blending vs. solid
   TTF_RenderText_Shaded: 'TTF_RenderText_Solid', // XXX ignore blending vs. solid
+  TTF_RenderUTF8_Solid: 'TTF_RenderText_Solid',
 
   TTF_SizeText: function(font, text, w, h) {
     var fontData = SDL.fonts[font];
@@ -1689,37 +1911,121 @@ var LibrarySDL = {
     return Math.floor(fontData.size*0.02); // XXX
   },
 
+  TTF_FontHeight: function(font) {
+    var fontData = SDL.fonts[font];
+    return fontData.size;
+  },
+
   // SDL gfx
 
+  $SDL_gfx: {
+    drawRectangle: function(surf, x1, y1, x2, y2, action, cssColor) {
+      x1 = x1 << 16 >> 16;
+      y1 = y1 << 16 >> 16;
+      x2 = x2 << 16 >> 16;
+      y2 = y2 << 16 >> 16;
+      var surfData = SDL.surfaces[surf];
+      assert(!surfData.locked); // but we could unlock and re-lock if we must..
+      // TODO: if ctx does not change, leave as is, and also do not re-set xStyle etc.
+      var x = x1 < x2 ? x1 : x2;
+      var y = y1 < y2 ? y1 : y2;
+      var w = Math.abs(x2 - x1);
+      var h = Math.abs(y2 - y1);
+      surfData.ctx.save();
+      surfData.ctx[action + 'Style'] = cssColor;
+      surfData.ctx[action + 'Rect'](x, y, w, h);
+      surfData.ctx.restore();
+    },
+    drawLine: function(surf, x1, y1, x2, y2, cssColor) {
+      x1 = x1 << 16 >> 16;
+      y1 = y1 << 16 >> 16;
+      x2 = x2 << 16 >> 16;
+      y2 = y2 << 16 >> 16;
+      var surfData = SDL.surfaces[surf];
+      assert(!surfData.locked); // but we could unlock and re-lock if we must..
+      surfData.ctx.save();
+      surfData.ctx.strokeStyle = cssColor;
+      surfData.ctx.beginPath();
+      surfData.ctx.moveTo(x1, y1);
+      surfData.ctx.lineTo(x2, y2);
+      surfData.ctx.stroke();
+      surfData.ctx.restore();
+    },
+    // See http://stackoverflow.com/questions/2172798/how-to-draw-an-oval-in-html5-canvas
+    drawEllipse: function(surf, x, y, rx, ry, action, cssColor) {
+      x = x << 16 >> 16;
+      y = y << 16 >> 16;
+      rx = rx << 16 >> 16;
+      ry = ry << 16 >> 16;
+      var surfData = SDL.surfaces[surf];
+      assert(!surfData.locked); // but we could unlock and re-lock if we must..
+
+      surfData.ctx.save();
+      surfData.ctx.beginPath();
+      surfData.ctx.translate(x, y);
+      surfData.ctx.scale(rx, ry);
+      surfData.ctx.arc(0, 0, 1, 0, 2 * Math.PI);
+      surfData.ctx.restore();
+
+      surfData.ctx.save();
+      surfData.ctx[action + 'Style'] = cssColor;
+      surfData.ctx[action]();
+      surfData.ctx.restore();
+    },
+    // the gfx library uses something different from the rest of SDL...
+    translateColorToCSSRGBA: function(rgba) {
+      return 'rgba(' + (rgba>>>24) + ',' + (rgba>>16 & 0xff) + ',' + (rgba>>8 & 0xff) + ',' + (rgba&0xff) + ')';
+    }
+  },
+
+  boxColor__deps: ['$SDL_gfx'],
+  boxColor: function(surf, x1, y1, x2, y2, color) {
+    return SDL_gfx.drawRectangle(surf, x1, y1, x2, y2, 'fill', SDL_gfx.translateColorToCSSRGBA(color));
+  },
+
+  boxRGBA__deps: ['$SDL_gfx'],
   boxRGBA: function(surf, x1, y1, x2, y2, r, g, b, a) {
-    var surfData = SDL.surfaces[surf];
-    assert(!surfData.locked); // but we could unlock and re-lock if we must..
-    // TODO: if ctx does not change, leave as is, and also do not re-set xStyle etc.
-    surfData.ctx.save();
-    surfData.ctx.fillStyle = SDL.translateRGBAToCSSRGBA(r, g, b, a);
-    surfData.ctx.fillRect(x1, y1, x2-x1, y2-y1);
-    surfData.ctx.restore();
+    return SDL_gfx.drawRectangle(surf, x1, y1, x2, y2, 'fill', SDL.translateRGBAToCSSRGBA(r, g, b, a));
   },
 
+  rectangleColor__deps: ['$SDL_gfx'],
+  rectangleColor: function(surf, x1, y1, x2, y2, color) {
+    return SDL_gfx.drawRectangle(surf, x1, y1, x2, y2, 'stroke', SDL_gfx.translateColorToCSSRGBA(color));
+  },
+
+  rectangleRGBA__deps: ['$SDL_gfx'],
   rectangleRGBA: function(surf, x1, y1, x2, y2, r, g, b, a) {
-    var surfData = SDL.surfaces[surf];
-    assert(!surfData.locked); // but we could unlock and re-lock if we must..
-    surfData.ctx.save();
-    surfData.ctx.strokeStyle = SDL.translateRGBAToCSSRGBA(r, g, b, a);
-    surfData.ctx.strokeRect(x1, y1, x2-x1, y2-y1);
-    surfData.ctx.restore();
+    return SDL_gfx.drawRectangle(surf, x1, y1, x2, y2, 'stroke', SDL.translateRGBAToCSSRGBA(r, g, b, a));
   },
 
+  ellipseColor__deps: ['$SDL_gfx'],
+  ellipseColor: function(surf, x, y, rx, ry, color) {
+    return SDL_gfx.drawEllipse(surf, x, y, rx, ry, 'stroke', SDL_gfx.translateColorToCSSRGBA(color));
+  },
+
+  ellipseRGBA__deps: ['$SDL_gfx'],
+  ellipseRGBA: function(surf, x, y, rx, ry, r, g, b, a) {
+    return SDL_gfx.drawEllipse(surf, x, y, rx, ry, 'stroke', SDL.translateRGBAToCSSRGBA(r, g, b, a));
+  },
+
+  filledEllipseColor__deps: ['$SDL_gfx'],
+  filledEllipseColor: function(surf, x, y, rx, ry, color) {
+    return SDL_gfx.drawEllipse(surf, x, y, rx, ry, 'fill', SDL_gfx.translateColorToCSSRGBA(color));
+  },
+
+  filledEllipseRGBA__deps: ['$SDL_gfx'],
+  filledEllipseRGBA: function(surf, x, y, rx, ry, r, g, b, a) {
+    return SDL_gfx.drawEllipse(surf, x, y, rx, ry, 'fill', SDL.translateRGBAToCSSRGBA(r, g, b, a));
+  },
+
+  lineColor__deps: ['$SDL_gfx'],
+  lineColor: function(surf, x1, y1, x2, y2, color) {
+    return SDL_gfx.drawLine(surf, x1, y1, x2, y2, SDL_gfx.translateColorToCSSRGBA(color));
+  },
+
+  lineRGBA__deps: ['$SDL_gfx'],
   lineRGBA: function(surf, x1, y1, x2, y2, r, g, b, a) {
-    var surfData = SDL.surfaces[surf];
-    assert(!surfData.locked); // but we could unlock and re-lock if we must..
-    surfData.ctx.save();
-    surfData.ctx.strokeStyle = SDL.translateRGBAToCSSRGBA(r, g, b, a);
-    surfData.ctx.beginPath();
-    surfData.ctx.moveTo(x1, y1);
-    surfData.ctx.lineTo(x2, y2);
-    surfData.ctx.stroke();
-    surfData.ctx.restore();
+    return SDL_gfx.drawLine(surf, x1, y1, x2, y2, SDL.translateRGBAToCSSRGBA(r, g, b, a));
   },
 
   pixelRGBA__deps: ['boxRGBA'],
@@ -1801,18 +2107,41 @@ var LibrarySDL = {
     return -1;
   },
 
-  SDL_SetGammaRamp: function (redTable, greenTable, blueTable) {
+  SDL_SetGammaRamp: function(redTable, greenTable, blueTable) {
     return -1;
   },
+
+  // Joysticks
+
+  SDL_NumJoysticks: function() { return 0 },
+
+  SDL_JoystickOpen: function(deviceIndex) { return 0 },
+
+  SDL_JoystickGetButton: function(joystick, button) { return 0 },
 
   // Misc
 
   SDL_InitSubSystem: function(flags) { return 0 },
 
-  SDL_NumJoysticks: function() { return 0 },
+  SDL_RWFromConstMem: function(mem, size) {
+    var id = SDL.rwops.length; // TODO: recycle ids when they are null
+    SDL.rwops.push({ bytes: mem, count: size });
+    return id;
+  },
+  SDL_RWFromMem: 'SDL_RWFromConstMem',
 
-  SDL_RWFromFile: function(filename, mode) {
-    return filename; // XXX We just forward the filename
+  SDL_RWFromFile: function(_name, mode) {
+    var id = SDL.rwops.length; // TODO: recycle ids when they are null
+    var name = Pointer_stringify(_name)
+    SDL.rwops.push({ filename: name, mimetype: Browser.getMimetype(name) });
+    return id;
+  },
+  
+  SDL_FreeRW: function(rwopsID) {
+    SDL.rwops[rwopsID] = null;
+    while (SDL.rwops.length > 0 && SDL.rwops[SDL.rwops.length-1] === null) {
+      SDL.rwops.pop();
+    }
   },
 
   SDL_EnableUNICODE: function(on) {
@@ -1839,7 +2168,6 @@ var LibrarySDL = {
   SDL_GetThreadID: function() { throw 'SDL_GetThreadID' },
   SDL_ThreadID: function() { throw 'SDL_ThreadID' },
   SDL_AllocRW: function() { throw 'SDL_AllocRW: TODO' },
-  SDL_FreeRW: function() { throw 'SDL_FreeRW: TODO' },
   SDL_CondBroadcast: function() { throw 'SDL_CondBroadcast: TODO' },
   SDL_CondWaitTimeout: function() { throw 'SDL_CondWaitTimeout: TODO' },
   SDL_WM_IconifyWindow: function() { throw 'SDL_WM_IconifyWindow TODO' },

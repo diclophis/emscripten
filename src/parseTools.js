@@ -396,11 +396,17 @@ function parseParamTokens(params) {
       // handle 'byval' and 'byval align X'. We store the alignment in 'byVal'
       byVal = QUANTUM_SIZE;
       segment.splice(1, 1);
+      if (segment[1] && segment[1].text === 'nocapture') {
+        segment.splice(1, 1);
+      }
       if (segment[1] && segment[1].text === 'align') {
         assert(isNumber(segment[2].text));
         byVal = parseInt(segment[2].text);
         segment.splice(1, 2);
       }
+    }
+    if (segment[1] && segment[1].text === 'nocapture') {
+      segment.splice(1, 1);
     }
     if (segment.length == 1) {
       if (segment[0].text == '...') {
@@ -969,6 +975,11 @@ function generateStructTypes(type) {
         }
         ret[index++] = type;
       } else {
+        if (Runtime.isStructType(type) && type[1] === '0') {
+          // this is [0 x something], which does nothing
+          // XXX this happens in java_nbody... assert(i === typeData.fields.length-1);
+          continue;
+        }
         add(Types.types[type]);
       }
       var more = (i+1 < typeData.fields.length ? typeData.flatIndexes[i+1] : typeData.flatSize) - (index - start);
@@ -1231,7 +1242,7 @@ function indexizeFunctions(value, type) {
     // add signature to library functions that we now know need indexing
     var sig = Functions.implementedFunctions[value] || Functions.unimplementedFunctions[value];
     if (!sig) {
-      sig = Functions.unimplementedFunctions[value] = Functions.getSignature(out.returnType, out.segments ? out.segments.map(function(segment) { return segment[0].text }) : []);
+      sig = Functions.unimplementedFunctions[value] = Functions.getSignature(out.returnType, out.segments ? out.segments.map(function(segment) { return segment[0].text }) : [], isVarArgsFunctionType(type));
     }
     return Functions.getIndex(value, undefined, sig);
   }
@@ -1694,7 +1705,7 @@ function makeGetSlabs(ptr, type, allowMultiple, unsigned) {
       }
       case 'float': return ['HEAPF32'];
       default: {
-        throw 'what, exactly, can we do for unknown types in TA2?! ' + new Error().stack;
+        throw 'what, exactly, can we do for unknown types in TA2?! ' + [new Error().stack, ptr, type, allowMultiple, unsigned];
       }
     }
   }
@@ -2222,9 +2233,9 @@ function processMathop(item) {
     // basic integer ops
     case 'add': return handleOverflow(getFastValue(idents[0], '+', idents[1], item.type), bits);
     case 'sub': return handleOverflow(getFastValue(idents[0], '-', idents[1], item.type), bits);
-    case 'sdiv': case 'udiv': return makeRounding(getFastValue(idents[0], '/', idents[1], item.type), bits, op[0] === 's');
+    case 'sdiv': case 'udiv': return makeRounding(getFastValue(idents[0], '/', idents[1], item.type), bits, true);
     case 'mul': return getFastValue(idents[0], '*', idents[1], item.type); // overflow handling is already done in getFastValue for '*'
-    case 'urem': case 'srem': return makeRounding(getFastValue(idents[0], '%', idents[1], item.type), bits, op[0] === 's');
+    case 'urem': case 'srem': return makeRounding(getFastValue(idents[0], '%', idents[1], item.type), bits, true);
     case 'or': {
       if (bits > 32) {
         assert(bits === 64, 'Too many bits for or: ' + bits);

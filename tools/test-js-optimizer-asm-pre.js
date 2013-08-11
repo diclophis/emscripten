@@ -70,6 +70,7 @@ function b($this, $__n) {
  HEAP32[$4] = HEAP32[$5]^-1;
  // Rewrite to ~ and eliminate the |0.
  HEAP32[$4] = ((HEAP32[$5]|0)^-1)|0;
+ h((~~g) ^ -1); // do NOT convert this, as it would lead to ~~~ which is confusing in asm, given the role of ~~
  return;
 }
 function rett() {
@@ -166,6 +167,8 @@ function tempDoublePtr($45, $14, $28, $42) {
  unelim2 = (HEAP32[tempDoublePtr >> 2] = 127 + $14, +HEAPF32[tempDoublePtr >> 2]);
  func();
  HEAPF32[4] = unelim2;
+ barrier();
+ $f163 = (HEAP32[tempDoublePtr >> 2] = HEAP32[$f165 >> 2], HEAP32[tempDoublePtr + 4 >> 2] = HEAP32[$f165 + 4 >> 2], +HEAPF64[tempDoublePtr >> 3]);
 }
 function boxx($this, $aabb, $xf, $childIndex) {
  $this = $this | 0;

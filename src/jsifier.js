@@ -286,6 +286,8 @@ function JSify(data, functionsOnly, givenFunctions) {
         allocator = 'ALLOC_NONE';
       }
 
+      Variables.globals[item.ident].named = item.named;
+
       if (ASM_JS && (MAIN_MODULE || SIDE_MODULE) && !item.private_ && !NAMED_GLOBALS && isIndexableGlobal(item.ident)) {
         // We need this to be named (and it normally would not be), so that it can be linked to and used from other modules
         Variables.globals[item.ident].linkable = 1;
@@ -602,6 +604,8 @@ function JSify(data, functionsOnly, givenFunctions) {
           var associatedSourceFile = "NO_SOURCE";
       }
       
+      if (DLOPEN_SUPPORT) Functions.getIndex(func.ident);
+
       func.JS += 'function ' + func.ident + '(' + paramIdents.join(', ') + ') {\n';
 
       if (PGO) {
@@ -652,6 +656,10 @@ function JSify(data, functionsOnly, givenFunctions) {
         if (hasByVal) {
           func.JS += INDENTATION + 'var tempParam = 0;\n';
         }
+      }
+
+      if (func.hasVarArgsCall) {
+        func.JS += INDENTATION + 'var tempVarArgs = 0;\n';
       }
 
       // Prepare the stack, if we need one. If we have other stack allocations, force the stack to be set up.
@@ -1207,7 +1215,7 @@ function JSify(data, functionsOnly, givenFunctions) {
     // in an assignment
     var disabled = DISABLE_EXCEPTION_CATCHING == 2  && !(item.funcData.ident in EXCEPTION_CATCHING_WHITELIST); 
     var phiSets = calcPhiSets(item);
-    var call_ = makeFunctionCall(item.ident, item.params, item.funcData, item.type, ASM_JS && !disabled, !!item.assignTo || !item.standalone);
+    var call_ = makeFunctionCall(item.ident, item.params, item.funcData, item.type, ASM_JS && !disabled, !!item.assignTo || !item.standalone, true);
 
     var ret;
 
@@ -1230,6 +1238,7 @@ function JSify(data, functionsOnly, givenFunctions) {
           + (EXCEPTION_DEBUG ? 'Module.print("Exception: " + e + ", currently at: " + (new Error().stack)); ' : '')
           + 'return null } })();';
     }
+    ret = makeVarArgsCleanup(ret);
 
     if (item.assignTo) {
       ret = 'var ' + item.assignTo + ' = ' + ret;
@@ -1364,7 +1373,7 @@ function JSify(data, functionsOnly, givenFunctions) {
     return ret;
   });
 
-  function makeFunctionCall(ident, params, funcData, type, forceByPointer, hasReturn) {
+  function makeFunctionCall(ident, params, funcData, type, forceByPointer, hasReturn, invoke) {
     // We cannot compile assembly. See comment in intertyper.js:'Call'
     assert(ident != 'asm', 'Inline assembly cannot be compiled to JavaScript!');
 
@@ -1429,7 +1438,7 @@ function JSify(data, functionsOnly, givenFunctions) {
 
     args = args.map(function(arg, i) { return indexizeFunctions(arg, argsTypes[i]) });
     if (ASM_JS) {
-      if (shortident in Functions.libraryFunctions || simpleIdent in Functions.libraryFunctions || byPointerForced || funcData.setjmpTable) {
+      if (shortident in Functions.libraryFunctions || simpleIdent in Functions.libraryFunctions || byPointerForced || invoke || funcData.setjmpTable) {
         args = args.map(function(arg, i) { return asmCoercion(arg, argsTypes[i]) });
       } else {
         args = args.map(function(arg, i) { return asmEnsureFloat(arg, argsTypes[i]) });
@@ -1442,12 +1451,13 @@ function JSify(data, functionsOnly, givenFunctions) {
     });
 
     if (hasVarArgs && !useJSArgs) {
+      funcData.hasVarArgsCall = true;
       if (varargs.length === 0) {
         varargs = [0];
         varargsTypes = ['i32'];
       }
       var offset = 0;
-      varargs = '(tempInt=' + RuntimeGenerator.stackAlloc(varargs.length, ',') + ',' +
+      varargs = '(tempVarArgs=' + RuntimeGenerator.stackAlloc(varargs.length, ',') + ',' +
                 varargs.map(function(arg, i) {
                   var type = varargsTypes[i];
                   if (type == 0) return null;
@@ -1455,22 +1465,21 @@ function JSify(data, functionsOnly, givenFunctions) {
                   var ret;
                   assert(offset % Runtime.STACK_ALIGN == 0); // varargs must be aligned
                   if (!varargsByVals[i]) {
-                    ret = makeSetValue(getFastValue('tempInt', '+', offset), 0, arg, type, null, null, Runtime.STACK_ALIGN, null, ',');
+                    ret = makeSetValue(getFastValue('tempVarArgs', '+', offset), 0, arg, type, null, null, Runtime.STACK_ALIGN, null, ',');
                     offset += Runtime.alignMemory(Runtime.getNativeFieldSize(type), Runtime.STACK_ALIGN);
                   } else {
                     var size = calcAllocatedSize(removeAllPointing(type));
-                    ret = makeCopyValues(getFastValue('tempInt', '+', offset), arg, size, null, null, varargsByVals[i], ',');
+                    ret = makeCopyValues(getFastValue('tempVarArgs', '+', offset), arg, size, null, null, varargsByVals[i], ',');
                     offset += Runtime.forceAlign(size, Runtime.STACK_ALIGN);
                   }
                   return ret;
                 }).filter(function(arg) {
                   return arg !== null;
-                }).join(',') + ',tempInt)';
+                }).join(',') + ',tempVarArgs)';
       varargs = asmCoercion(varargs, 'i32');
     }
 
     args = args.concat(varargs);
-    var argsText = args.join(', ');
 
     // Inline if either we inline whenever we can (and we can), or if there is no noninlined version
     var inline = LibraryManager.library[simpleIdent + '__inline'];
@@ -1479,8 +1488,8 @@ function JSify(data, functionsOnly, givenFunctions) {
       return inline.apply(null, args); // Warning: inlining does not prevent recalculation of the arguments. They should be simple identifiers
     }
 
-    if (ASM_JS) {
-      // remove unneeded arguments, which the asm sig can show us. this lets us alias memset with llvm.memset, we just
+    if (ASM_JS && ident.indexOf('llvm_') >= 0) {
+      // remove unneeded arguments in llvm intrinsic functions, which the asm sig can show us. this lets us alias memset with llvm.memset, we just
       // drop the final 2 args so things validate properly in asm
       var libsig = LibraryManager.library[simpleIdent + '__sig'];
       if (libsig) {
@@ -1492,16 +1501,35 @@ function JSify(data, functionsOnly, givenFunctions) {
       }
     }
 
+    if (callIdent in Functions.implementedFunctions) {
+      // LLVM sometimes bitcasts for no reason. We must call using the exact same type as the actual function is generated as.
+      var numArgs = Functions.implementedFunctions[callIdent].length - 1;
+      if (numArgs !== args.length) {
+        if (VERBOSE) warnOnce('Fixing function call arguments based on signature, on ' + [callIdent, args.length, numArgs]);
+        while (args.length > numArgs) { args.pop(); argsTypes.pop() }
+        while (args.length < numArgs) { args.push('0'); argsTypes.push('i32') }
+      }
+    }
+
     var returnType = 'void';
     if ((byPointer || ASM_JS) && hasReturn) {
       returnType = getReturnType(type);
+      if (callIdent in Functions.implementedFunctions) {
+        // LLVM sometimes bitcasts for no reason. We must call using the exact same type as the actual function is generated as
+        var trueType = Functions.getSignatureReturnType(Functions.implementedFunctions[callIdent]);
+        if (trueType !== returnType && !isIdenticallyImplemented(trueType, returnType)) {
+          if (VERBOSE) warnOnce('Fixing function call based on return type from signature, on ' + [callIdent, returnType, trueType]);
+          returnType = trueType;
+        }
+      }
     }
 
     if (byPointer) {
       var sig = Functions.getSignature(returnType, argsTypes, hasVarArgs);
       if (ASM_JS) {
         assert(returnType.search(/\("'\[,/) == -1); // XXX need isFunctionType(type, out)
-        if (!byPointerForced && !funcData.setjmpTable) {
+        var functionTableCall = !byPointerForced && !funcData.setjmpTable && !invoke;
+        if (functionTableCall) {
           // normal asm function pointer call
           callIdent = '(' + callIdent + ')&{{{ FTM_' + sig + ' }}}'; // the function table mask is set in emscripten.py
           Functions.neededTables[sig] = 1;
@@ -1516,7 +1544,7 @@ function JSify(data, functionsOnly, givenFunctions) {
         assert(!ASM_JS, 'cannot emit safe dyncalls in asm');
         callIdent = '(tempInt=' + callIdent + ',tempInt < 0 || tempInt >= FUNCTION_TABLE.length-1 || !FUNCTION_TABLE[tempInt] ? abort("dyncall error: ' + sig + ' " + FUNCTION_TABLE_NAMES[tempInt]) : tempInt)';
       }
-      if (!ASM_JS || (!byPointerForced && !funcData.setjmpTable)) callIdent = Functions.getTable(sig) + '[' + callIdent + ']';
+      if (!ASM_JS || functionTableCall) callIdent = Functions.getTable(sig) + '[' + callIdent + ']';
     }
 
     var ret = callIdent + '(' + args.join(', ') + ')';
@@ -1535,10 +1563,24 @@ function JSify(data, functionsOnly, givenFunctions) {
 
     return ret;
   }
+
+  function makeVarArgsCleanup(js) {
+    if (js.indexOf('(tempVarArgs=') >= 0) {
+      if (js[js.length-1] == ';') {
+        return js + ' STACKTOP=tempVarArgs;';
+      } else {
+        assert(js.indexOf(';') < 0);
+        return '((' + js + '), STACKTOP=tempVarArgs)';
+      }
+    }
+    return js;
+  }
+
   makeFuncLineActor('getelementptr', function(item) { return finalizeLLVMFunctionCall(item) });
   makeFuncLineActor('call', function(item) {
     if (item.standalone && LibraryManager.isStubFunction(item.ident)) return ';';
-    return makeFunctionCall(item.ident, item.params, item.funcData, item.type, false, !!item.assignTo || !item.standalone) + (item.standalone ? ';' : '');
+    var ret = makeFunctionCall(item.ident, item.params, item.funcData, item.type, false, !!item.assignTo || !item.standalone) + (item.standalone ? ';' : '');
+    return makeVarArgsCleanup(ret);
   });
 
   makeFuncLineActor('unreachable', function(item) {

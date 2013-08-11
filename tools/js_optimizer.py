@@ -74,7 +74,7 @@ class Minifier:
     f = open(temp_file, 'w')
     f.write(shell)
     f.write('\n')
-    f.write('// EXTRA_INFO:' + self.serialize())
+    f.write('// EXTRA_INFO:' + json.dumps(self.serialize()))
     f.close()
 
     output = subprocess.Popen(self.js_engine +
@@ -91,10 +91,10 @@ class Minifier:
 
 
   def serialize(self):
-    return json.dumps({
+    return {
       'names': self.names,
       'globals': self.globs
-    })
+    }
 
 start_funcs_marker = '// EMSCRIPTEN_START_FUNCS\n'
 end_funcs_marker = '// EMSCRIPTEN_END_FUNCS\n'
@@ -102,16 +102,20 @@ start_asm_marker = '// EMSCRIPTEN_START_ASM\n'
 end_asm_marker = '// EMSCRIPTEN_END_ASM\n'
 
 def run_on_chunk(command):
-  filename = command[2] # XXX hackish
-  #print >> sys.stderr, 'running js optimizer command', ' '.join(command), '""""', open(filename).read()
-  output = subprocess.Popen(command, stdout=subprocess.PIPE).communicate()[0]
-  assert len(output) > 0 and not output.startswith('Assertion failed'), 'Error in js optimizer: ' + output
-  filename = temp_files.get(os.path.basename(filename) + '.jo.js').name
-  f = open(filename, 'w')
-  f.write(output)
-  f.close()
-  if DEBUG and not shared.WINDOWS: print >> sys.stderr, '.' # Skip debug progress indicator on Windows, since it doesn't buffer well with multiple threads printing to console.
-  return filename
+  try:
+    filename = command[2] # XXX hackish
+    #print >> sys.stderr, 'running js optimizer command', ' '.join(command), '""""', open(filename).read()
+    output = subprocess.Popen(command, stdout=subprocess.PIPE).communicate()[0]
+    assert len(output) > 0 and not output.startswith('Assertion failed'), 'Error in js optimizer: ' + output
+    filename = temp_files.get(os.path.basename(filename) + '.jo.js').name
+    f = open(filename, 'w')
+    f.write(output)
+    f.close()
+    if DEBUG and not shared.WINDOWS: print >> sys.stderr, '.' # Skip debug progress indicator on Windows, since it doesn't buffer well with multiple threads printing to console.
+    return filename
+  except KeyboardInterrupt:
+    # avoid throwing keyboard interrupts from a child process
+    raise Exception()
 
 def run_on_js(filename, passes, js_engine, jcache, source_map=False, extra_info=None):
   if isinstance(jcache, bool) and jcache: jcache = shared.JCache
@@ -252,9 +256,12 @@ EMSCRIPTEN_FUNCS();
       f.write(chunk)
       f.write(suffix_marker)
       if minify_globals:
-        assert not extra_info
+        if extra_info:
+          for key, value in extra_info.iteritems():
+            assert key not in minify_info or value == minify_info[key], [key, value, minify_info[key]]
+            minify_info[key] = value
         f.write('\n')
-        f.write('// EXTRA_INFO:' + minify_info)
+        f.write('// EXTRA_INFO:' + json.dumps(minify_info))
       elif extra_info:
         f.write('\n')
         f.write('// EXTRA_INFO:' + json.dumps(extra_info))

@@ -46,7 +46,9 @@ var Debugging = {
     var form3ab = new RegExp(/^!(\d+) = metadata !{i32 \d+, (?:metadata !\d+|i32 \d+|null), metadata !(\d+).*$/);
     var form3ac = new RegExp(/^!(\d+) = metadata !{i32 \d+, (?:metadata !\d+|null), metadata !"[^"]*", metadata !(\d+)[^\[]*.*$/);
     var form3ad = new RegExp(/^!(\d+) = metadata !{i32 \d+, (?:i32 \d+|null), (?:i32 \d+|null), metadata !"[^"]*", metadata !"[^"]*", metadata !"[^"]*", metadata !(\d+),.*$/);
-    var form3b = new RegExp(/^!(\d+) = metadata !{i32 \d+, metadata !"([^"]+)", metadata !"([^"]*)", (metadata !\d+|null)}.*$/);
+    var form3ae = new RegExp(/^!(\d+) = metadata !{i32 \d+, metadata !(\d+).*$/);
+    // LLVM 3.3 drops the first and last parameters.
+    var form3b = new RegExp(/^!(\d+) = metadata !{(?:i32 \d+, )?metadata !"([^"]+)", metadata !"([^"]*)"(?:, (metadata !\d+|null))?}.*$/);
     var form3c = new RegExp(/^!(\d+) = metadata !{\w+\d* !?(\d+)[^\d].*$/);
     var form4 = new RegExp(/^!llvm.dbg.[\w\.]+ = .*$/);
     var form5 = new RegExp(/^!(\d+) = metadata !{.*$/);
@@ -75,7 +77,7 @@ var Debugging = {
         lines[i] = ';'; // return an empty line, to keep line numbers of subsequent lines the same
         continue;
       }
-      calc = form3a.exec(line) || form3ab.exec(line) || form3ac.exec(line) || form3ad.exec(line);
+      calc = form3a.exec(line) || form3ab.exec(line) || form3ac.exec(line) || form3ad.exec(line) || form3ae.exec(line);
       if (calc) {
         metadataToParentMetadata[calc[1]] = calc[2];
         lines[i] = ';';
@@ -252,10 +254,24 @@ var Functions = {
     for (var i = 0; i < argTypes.length; i++) {
       var type = argTypes[i];
       if (!type) break; // varargs
-      sig += isIntImplemented(type) ? (getBits(type) == 64 ? 'ii' : 'i') : 'f'; // legalized i64s will be i32s
+      if (type in Runtime.FLOAT_TYPES) {
+        sig += 'f';
+      } else {
+        var chunks = getNumIntChunks(type);
+        for (var j = 0; j < chunks; j++) sig += 'i';
+      }
     }
     if (hasVarArgs) sig += 'i';
     return sig;
+  },
+
+  getSignatureReturnType: function(sig) {
+    switch(sig[0]) {
+      case 'v': return 'void';
+      case 'i': return 'i32';
+      case 'f': return 'double';
+      default: throw 'what is this sig? ' + sig;
+    }
   },
 
   // Mark a function as needing indexing. Python will coordinate them all
@@ -408,7 +424,7 @@ var LibraryManager = {
   load: function() {
     if (this.library) return;
 
-    var libraries = ['library.js', 'library_browser.js', 'library_sdl.js', 'library_gl.js', 'library_glut.js', 'library_xlib.js', 'library_egl.js', 'library_gc.js', 'library_jansson.js', 'library_openal.js', 'library_glfw.js'].concat(additionalLibraries);
+    var libraries = ['library.js', 'library_path.js', 'library_fs.js', 'library_memfs.js', 'library_sockfs.js', 'library_tty.js', 'library_browser.js', 'library_sdl.js', 'library_gl.js', 'library_glut.js', 'library_xlib.js', 'library_egl.js', 'library_gc.js', 'library_jansson.js', 'library_openal.js', 'library_glfw.js'].concat(additionalLibraries);
     for (var i = 0; i < libraries.length; i++) {
       eval(processMacros(preprocess(read(libraries[i]))));
     }
@@ -449,7 +465,8 @@ var PassManager = {
         Types: Types,
         Variables: Variables,
         Functions: Functions,
-        EXPORTED_FUNCTIONS: EXPORTED_FUNCTIONS // needed for asm.js global constructors (ctors)
+        EXPORTED_FUNCTIONS: EXPORTED_FUNCTIONS, // needed for asm.js global constructors (ctors)
+        Runtime: { GLOBAL_BASE: Runtime.GLOBAL_BASE }
       }));
     } else if (phase == 'funcs') {
       print('\n//FORWARDED_DATA:' + JSON.stringify({
