@@ -401,7 +401,7 @@ var LibraryGLUT = {
     if (GLUT.reshapeFunc) {
       Runtime.dynCall('vii', GLUT.reshapeFunc, [width, height]);
     }
-    _glutPostRedisplay();
+    //_glutPostRedisplay();
   },
 
   glutPositionWindow__deps: ['$GLUT', 'glutPostRedisplay'],
