@@ -38,17 +38,17 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 if (ENVIRONMENT_IS_NODE) {
   // Expose functionality in the same simple way that the shells work
   // Note that we pollute the global namespace here, otherwise we break in node
-  Module['print'] = function(x) {
+  Module['print'] = function print(x) {
     process['stdout'].write(x + '\n');
   };
-  Module['printErr'] = function(x) {
+  Module['printErr'] = function printErr(x) {
     process['stderr'].write(x + '\n');
   };
 
   var nodeFS = require('fs');
   var nodePath = require('path');
 
-  Module['read'] = function(filename, binary) {
+  Module['read'] = function read(filename, binary) {
     filename = nodePath['normalize'](filename);
     var ret = nodeFS['readFileSync'](filename);
     // The path is absolute if the normalized version is the same as the resolved.
@@ -60,22 +60,27 @@ if (ENVIRONMENT_IS_NODE) {
     return ret;
   };
 
-  Module['readBinary'] = function(filename) { return Module['read'](filename, true) };
+  Module['readBinary'] = function readBinary(filename) { return Module['read'](filename, true) };
 
-  Module['load'] = function(f) {
+  Module['load'] = function load(f) {
     globalEval(read(f));
   };
 
   Module['arguments'] = process['argv'].slice(2);
 
-  module.exports = Module;
+  module['exports'] = Module;
 }
 else if (ENVIRONMENT_IS_SHELL) {
   Module['print'] = print;
   if (typeof printErr != 'undefined') Module['printErr'] = printErr; // not present in v8 or older sm
 
-  Module['read'] = read;
-  Module['readBinary'] = function(f) {
+  if (typeof read != 'undefined') {
+    Module['read'] = read;
+  } else {
+    Module['read'] = function read() { throw 'no read() available (jsc?)' };
+  }
+
+  Module['readBinary'] = function readBinary(f) {
     return read(f, 'binary');
   };
 
@@ -86,9 +91,11 @@ else if (ENVIRONMENT_IS_SHELL) {
   }
 
   this['{{{ EXPORT_NAME }}}'] = Module;
+
+  eval("if (typeof gc === 'function' && gc.toString().indexOf('[native code]') > 0) var gc = undefined"); // wipe out the SpiderMonkey shell 'gc' function, which can confuse closure (uses it as a minified name, and it is then initted to a non-falsey value unexpectedly)
 }
 else if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
-  Module['read'] = function(url) {
+  Module['read'] = function read(url) {
     var xhr = new XMLHttpRequest();
     xhr.open('GET', url, false);
     xhr.send(null);
@@ -99,25 +106,26 @@ else if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
     Module['arguments'] = arguments;
   }
 
-  if (ENVIRONMENT_IS_WEB) {
-    Module['print'] = function(x) {
+  if (typeof console !== 'undefined') {
+    Module['print'] = function print(x) {
       console.log(x);
     };
-
-    Module['printErr'] = function(x) {
+    Module['printErr'] = function printErr(x) {
       console.log(x);
     };
-
-    this['{{{ EXPORT_NAME }}}'] = Module;
-  } else if (ENVIRONMENT_IS_WORKER) {
-    // We can do very little here...
+  } else {
+    // Probably a worker, and without console.log. We can do very little here...
     var TRY_USE_DUMP = false;
     Module['print'] = (TRY_USE_DUMP && (typeof(dump) !== "undefined") ? (function(x) {
       dump(x);
     }) : (function(x) {
       // self.postMessage(x); // enable this if you want stdout to be sent as messages
     }));
+  }
 
+  if (ENVIRONMENT_IS_WEB) {
+    this['{{{ EXPORT_NAME }}}'] = Module;
+  } else {
     Module['load'] = importScripts;
   }
 }
@@ -130,7 +138,7 @@ function globalEval(x) {
   eval.call(null, x);
 }
 if (!Module['load'] == 'undefined' && Module['read']) {
-  Module['load'] = function(f) {
+  Module['load'] = function load(f) {
     globalEval(Module['read'](f));
   };
 }

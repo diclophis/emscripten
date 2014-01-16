@@ -31,7 +31,10 @@ REDISTRIBUTION OF THIS SOFTWARE.
 
 int main(int argc, char *argv[])
 {
-    int temp; // testing
+    // testing
+    GLint tempInt;
+    GLboolean tempBool;
+    void *tempPtr;
 
     SDL_Surface *screen;
     if ( SDL_Init(SDL_INIT_VIDEO) != 0 ) {
@@ -51,9 +54,21 @@ int main(int argc, char *argv[])
 
     // Create a texture
 
+    GLuint boundTex = 123;
+    assert(!glGetError());
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &boundTex);
+    assert(!glGetError());
+    assert(boundTex == 0);
+
     GLuint texture;
     glGenTextures( 1, &texture );
     glBindTexture( GL_TEXTURE_2D, texture );
+
+    assert(!glGetError());
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &boundTex);
+    assert(!glGetError());
+    assert(boundTex == texture);
+
     glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
     glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
     GLubyte textureData[16*16*4];
@@ -112,9 +127,9 @@ int main(int argc, char *argv[])
 
     glActiveTexture(GL_TEXTURE0);
 
-    glGetBooleanv(GL_VERTEX_ARRAY, &temp); assert(!temp);
+    glGetBooleanv(GL_VERTEX_ARRAY, &tempBool); assert(!tempBool);
     glEnableClientState(GL_VERTEX_ARRAY);
-    glGetBooleanv(GL_VERTEX_ARRAY, &temp); assert(temp);
+    glGetBooleanv(GL_VERTEX_ARRAY, &tempBool); assert(tempBool);
 
     GLuint arrayBuffer, elementBuffer;
     glGenBuffers(1, &arrayBuffer);
@@ -191,25 +206,31 @@ int main(int argc, char *argv[])
     // sauer vertex data is apparently 0-12: V3F, 12: N1B, 16-24: T2F, 24-28: T2S, 28-32: C4B
     glVertexPointer(3, GL_FLOAT, 32, (void*)0); // all these apply to the ARRAY_BUFFER that is bound
     glTexCoordPointer(2, GL_FLOAT, 32, (void*)16);
+
     glClientActiveTexture(GL_TEXTURE1); // XXX seems to be ignored in native build
     glTexCoordPointer(2, GL_SHORT, 32, (void*)24);
+    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_SIZE, &tempInt); assert(tempInt == 2);
+    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_TYPE, &tempInt); assert(tempInt == GL_SHORT);
+    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_STRIDE, &tempInt); assert(tempInt == 32);
+    glGetPointerv(GL_TEXTURE_COORD_ARRAY_POINTER, &tempPtr); assert(tempPtr == (void *)24);
+
     glClientActiveTexture(GL_TEXTURE0); // likely not needed, it is a cleanup
     glNormalPointer(GL_BYTE, 32, (void*)12);
     glColorPointer(4, GL_UNSIGNED_BYTE, 32, (void*)28);
 
-    glGetPointerv(GL_VERTEX_ARRAY_POINTER, &temp); assert(temp == 0);
-    glGetPointerv(GL_COLOR_ARRAY_POINTER, &temp); assert(temp == 28);
-    glGetPointerv(GL_TEXTURE_COORD_ARRAY_POINTER, &temp); assert(temp == 16);
-    glGetIntegerv(GL_VERTEX_ARRAY_SIZE, &temp); assert(temp == 3);
-    glGetIntegerv(GL_VERTEX_ARRAY_TYPE, &temp); assert(temp == GL_FLOAT);
-    glGetIntegerv(GL_VERTEX_ARRAY_STRIDE, &temp); assert(temp == 32);
-    glGetIntegerv(GL_COLOR_ARRAY_SIZE, &temp); assert(temp == 4);
-    glGetIntegerv(GL_COLOR_ARRAY_TYPE, &temp); assert(temp == GL_UNSIGNED_BYTE);
-    glGetIntegerv(GL_COLOR_ARRAY_STRIDE, &temp); assert(temp == 32);
-    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_SIZE, &temp); assert(temp == 2);
-    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_TYPE, &temp); assert(temp == GL_FLOAT);
-    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_STRIDE, &temp); assert(temp == 32);
-    glGetBooleanv(GL_VERTEX_ARRAY, &temp); assert(temp);
+    glGetPointerv(GL_VERTEX_ARRAY_POINTER, &tempPtr); assert(tempPtr == (void *)0);
+    glGetPointerv(GL_COLOR_ARRAY_POINTER, &tempPtr); assert(tempPtr == (void *)28);
+    glGetPointerv(GL_TEXTURE_COORD_ARRAY_POINTER, &tempPtr); assert(tempPtr == (void *)16);
+    glGetIntegerv(GL_VERTEX_ARRAY_SIZE, &tempInt); assert(tempInt == 3);
+    glGetIntegerv(GL_VERTEX_ARRAY_TYPE, &tempInt); assert(tempInt == GL_FLOAT);
+    glGetIntegerv(GL_VERTEX_ARRAY_STRIDE, &tempInt); assert(tempInt == 32);
+    glGetIntegerv(GL_COLOR_ARRAY_SIZE, &tempInt); assert(tempInt == 4);
+    glGetIntegerv(GL_COLOR_ARRAY_TYPE, &tempInt); assert(tempInt == GL_UNSIGNED_BYTE);
+    glGetIntegerv(GL_COLOR_ARRAY_STRIDE, &tempInt); assert(tempInt == 32);
+    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_SIZE, &tempInt); assert(tempInt == 2);
+    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_TYPE, &tempInt); assert(tempInt == GL_FLOAT);
+    glGetIntegerv(GL_TEXTURE_COORD_ARRAY_STRIDE, &tempInt); assert(tempInt == 32);
+    glGetBooleanv(GL_VERTEX_ARRAY, &tempBool); assert(tempBool);
 
     glBindTexture(GL_TEXTURE_2D, texture); // diffuse?
     glActiveTexture(GL_TEXTURE0);

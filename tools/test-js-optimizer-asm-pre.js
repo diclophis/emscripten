@@ -66,33 +66,16 @@ function b($this, $__n) {
  HEAP8[($38 + $40 | 0) & 16777215] = 0;
  // Eliminate the |0.
  HEAP32[$4] = ((~(HEAP32[$5]|0))|0);
+ // Eliminate the &255
+ HEAP8[$4] = HEAP32[$5]&255;
+ // Eliminate the &65535
+ HEAP16[$4] = HEAP32[$5]&65535;
  // Rewrite to ~.
  HEAP32[$4] = HEAP32[$5]^-1;
  // Rewrite to ~ and eliminate the |0.
  HEAP32[$4] = ((HEAP32[$5]|0)^-1)|0;
  h((~~g) ^ -1); // do NOT convert this, as it would lead to ~~~ which is confusing in asm, given the role of ~~
  return;
-}
-function rett() {
- if (f()) {
-  g();
-  return 5;
- }
- // missing final return, need to add it
-}
-function ret2t() {
- if (f()) {
-  g();
-  return;
- }
- // missing final return, but no need
-}
-function retf() {
- if (f()) {
-  g();
-  return +h();
- }
- // missing final return, need it as a float
 }
 function i32_8() {
  if (((HEAP8[$4 & 16777215] | 0) << 24 >> 24) == 0) {

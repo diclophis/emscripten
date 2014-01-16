@@ -1,5 +1,5 @@
 mergeInto(LibraryManager.library, {
-  $FS__deps: ['$ERRNO_CODES', '$ERRNO_MESSAGES', '__setErrNo', '$VFS', '$PATH', '$TTY', '$MEMFS', 'stdin', 'stdout', 'stderr', 'fflush'],
+  $FS__deps: ['$ERRNO_CODES', '$ERRNO_MESSAGES', '__setErrNo', '$PATH', '$TTY', '$MEMFS', '$IDBFS', '$NODEFS', 'stdin', 'stdout', 'stderr', 'fflush'],
   $FS__postset: 'FS.staticInit();' +
                 '__ATINIT__.unshift({ func: function() { if (!Module["noFSInit"] && !FS.init.initialized) FS.init() } });' +
                 '__ATMAIN__.push({ func: function() { FS.ignorePermissions = false } });' +
@@ -14,11 +14,11 @@ mergeInto(LibraryManager.library, {
                 'Module["FS_createDevice"] = FS.createDevice;',
   $FS: {
     root: null,
-    nodes: [null],
+    mounts: [],
     devices: [null],
     streams: [null],
     nextInode: 1,
-    name_table: new Array(4096),
+    nameTable: null,
     currentPath: '/',
     initialized: false,
     // Whether we are currently ignoring permissions. Useful when preparing the
@@ -27,142 +27,19 @@ mergeInto(LibraryManager.library, {
     // to modify the filesystem freely before run() is called.
     ignorePermissions: true,
     
-    ErrnoError: function(errno) {
-      this.errno = errno;
-      for (var key in ERRNO_CODES) {
-        if (ERRNO_CODES[key] === errno) {
-          this.code = key;
-          break;
-        }
-      }
-      this.message = ERRNO_MESSAGES[errno];
-    },
+    ErrnoError: null, // set during init
+    genericErrors: {},
 
     handleFSError: function(e) {
-      if (!(e instanceof FS.ErrnoError)) throw e + ' : ' + new Error().stack;
+      if (!(e instanceof FS.ErrnoError)) throw e + ' : ' + stackTrace();
       return ___setErrNo(e.errno);
-    },
-
-    //
-    // nodes
-    //
-    hashName: function(parentid, name) {
-      var hash = 0;
-      for (var i = 0; i < name.length; i++) {
-        hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
-      }
-      return (parentid + hash) % FS.name_table.length;
-    },
-    hashAddNode: function(node) {
-      var hash = FS.hashName(node.parent.id, node.name);
-      node.name_next = FS.name_table[hash];
-      FS.name_table[hash] = node;
-    },
-    hashRemoveNode: function(node) {
-      var hash = FS.hashName(node.parent.id, node.name);
-      if (FS.name_table[hash] === node) {
-        FS.name_table[hash] = node.name_next;
-      } else {
-        var current = FS.name_table[hash];
-        while (current) {
-          if (current.name_next === node) {
-            current.name_next = node.name_next;
-            break;
-          }
-          current = current.name_next;
-        }
-      }
-    },
-    lookupNode: function(parent, name) {
-      var err = FS.mayLookup(parent);
-      if (err) {
-        throw new FS.ErrnoError(err);
-      }
-      var hash = FS.hashName(parent.id, name);
-      for (var node = FS.name_table[hash]; node; node = node.name_next) {
-        if (node.parent.id === parent.id && node.name === name) {
-          return node;
-        }
-      }
-      // if we failed to find it in the cache, call into the VFS
-      return FS.lookup(parent, name);
-    },
-    createNode: function(parent, name, mode, rdev) {
-      var node = {
-        id: FS.nextInode++,
-        name: name,
-        mode: mode,
-        node_ops: {},
-        stream_ops: {},
-        rdev: rdev,
-        parent: null,
-        mount: null
-      };
-      if (!parent) {
-        parent = node;  // root node sets parent to itself
-      }
-      node.parent = parent;
-      node.mount = parent.mount;
-      // compatibility
-      var readMode = {{{ cDefine('S_IRUGO') }}} | {{{ cDefine('S_IXUGO') }}};
-      var writeMode = {{{ cDefine('S_IWUGO') }}};
-      // NOTE we must use Object.defineProperties instead of individual calls to
-      // Object.defineProperty in order to make closure compiler happy
-      Object.defineProperties(node, {
-        read: {
-          get: function() { return (node.mode & readMode) === readMode; },
-          set: function(val) { val ? node.mode |= readMode : node.mode &= ~readMode; }
-        },
-        write: {
-          get: function() { return (node.mode & writeMode) === writeMode; },
-          set: function(val) { val ? node.mode |= writeMode : node.mode &= ~writeMode; }
-        },
-        isFolder: {
-          get: function() { return FS.isDir(node.mode); },
-        },
-        isDevice: {
-          get: function() { return FS.isChrdev(node.mode); },
-        },
-      });
-      FS.hashAddNode(node);
-      return node;
-    },
-    destroyNode: function(node) {
-      FS.hashRemoveNode(node);
-    },
-    isRoot: function(node) {
-      return node === node.parent;
-    },
-    isMountpoint: function(node) {
-      return node.mounted;
-    },
-    isFile: function(mode) {
-      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFREG') }}};
-    },
-    isDir: function(mode) {
-      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFDIR') }}};
-    },
-    isLink: function(mode) {
-      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFLNK') }}};
-    },
-    isChrdev: function(mode) {
-      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFCHR') }}};
-    },
-    isBlkdev: function(mode) {
-      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFBLK') }}};
-    },
-    isFIFO: function(mode) {
-      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFIFO') }}};
     },
 
     //
     // paths
     //
-    cwd: function() {
-      return FS.currentPath;
-    },
     lookupPath: function(path, opts) {
-      path = PATH.resolve(FS.currentPath, path);
+      path = PATH.resolve(FS.cwd(), path);
       opts = opts || { recurse_count: 0 };
 
       if (opts.recurse_count > 8) {  // max recursive lookup of 8
@@ -186,7 +63,7 @@ mergeInto(LibraryManager.library, {
         }
 
         current = FS.lookupNode(current, parts[i]);
-        current_path = PATH.join(current_path, parts[i]);
+        current_path = PATH.join2(current_path, parts[i]);
 
         // jump to the mount's root node if this is a mountpoint
         if (FS.isMountpoint(current)) {
@@ -218,11 +95,146 @@ mergeInto(LibraryManager.library, {
       var path;
       while (true) {
         if (FS.isRoot(node)) {
-          return path ? PATH.join(node.mount.mountpoint, path) : node.mount.mountpoint;
+          var mount = node.mount.mountpoint;
+          if (!path) return mount;
+          return mount[mount.length-1] !== '/' ? mount + '/' + path : mount + path;
         }
-        path = path ? PATH.join(node.name, path) : node.name;
+        path = path ? node.name + '/' + path : node.name;
         node = node.parent;
       }
+    },
+
+    //
+    // nodes
+    //
+    hashName: function(parentid, name) {
+      var hash = 0;
+
+#if CASE_INSENSITIVE_FS
+      name = name.toLowerCase();
+#endif
+
+      for (var i = 0; i < name.length; i++) {
+        hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+      }
+      return ((parentid + hash) >>> 0) % FS.nameTable.length;
+    },
+    hashAddNode: function(node) {
+      var hash = FS.hashName(node.parent.id, node.name);
+      node.name_next = FS.nameTable[hash];
+      FS.nameTable[hash] = node;
+    },
+    hashRemoveNode: function(node) {
+      var hash = FS.hashName(node.parent.id, node.name);
+      if (FS.nameTable[hash] === node) {
+        FS.nameTable[hash] = node.name_next;
+      } else {
+        var current = FS.nameTable[hash];
+        while (current) {
+          if (current.name_next === node) {
+            current.name_next = node.name_next;
+            break;
+          }
+          current = current.name_next;
+        }
+      }
+    },
+    lookupNode: function(parent, name) {
+      var err = FS.mayLookup(parent);
+      if (err) {
+        throw new FS.ErrnoError(err);
+      }
+      var hash = FS.hashName(parent.id, name);
+#if CASE_INSENSITIVE_FS
+      name = name.toLowerCase();
+#endif
+      for (var node = FS.nameTable[hash]; node; node = node.name_next) {
+        var nodeName = node.name;
+#if CASE_INSENSITIVE_FS
+        nodeName = nodeName.toLowerCase();
+#endif
+        if (node.parent.id === parent.id && nodeName === name) {
+          return node;
+        }
+      }
+      // if we failed to find it in the cache, call into the VFS
+      return FS.lookup(parent, name);
+    },
+    createNode: function(parent, name, mode, rdev) {
+      if (!FS.FSNode) {
+        FS.FSNode = function(parent, name, mode, rdev) {
+          this.id = FS.nextInode++;
+          this.name = name;
+          this.mode = mode;
+          this.node_ops = {};
+          this.stream_ops = {};
+          this.rdev = rdev;
+          this.parent = null;
+          this.mount = null;
+          if (!parent) {
+            parent = this;  // root node sets parent to itself
+          }
+          this.parent = parent;
+          this.mount = parent.mount;
+          FS.hashAddNode(this);
+        };
+
+        // compatibility
+        var readMode = {{{ cDefine('S_IRUGO') }}} | {{{ cDefine('S_IXUGO') }}};
+        var writeMode = {{{ cDefine('S_IWUGO') }}};
+
+        FS.FSNode.prototype = {};
+
+        // NOTE we must use Object.defineProperties instead of individual calls to
+        // Object.defineProperty in order to make closure compiler happy
+        Object.defineProperties(FS.FSNode.prototype, {
+          read: {
+            get: function() { return (this.mode & readMode) === readMode; },
+            set: function(val) { val ? this.mode |= readMode : this.mode &= ~readMode; }
+          },
+          write: {
+            get: function() { return (this.mode & writeMode) === writeMode; },
+            set: function(val) { val ? this.mode |= writeMode : this.mode &= ~writeMode; }
+          },
+          isFolder: {
+            get: function() { return FS.isDir(this.mode); },
+          },
+          isDevice: {
+            get: function() { return FS.isChrdev(this.mode); },
+          },
+        });
+      }
+      return new FS.FSNode(parent, name, mode, rdev);
+    },
+    destroyNode: function(node) {
+      FS.hashRemoveNode(node);
+    },
+    isRoot: function(node) {
+      return node === node.parent;
+    },
+    isMountpoint: function(node) {
+      return node.mounted;
+    },
+    isFile: function(mode) {
+      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFREG') }}};
+    },
+    isDir: function(mode) {
+      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFDIR') }}};
+    },
+    isLink: function(mode) {
+      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFLNK') }}};
+    },
+    isChrdev: function(mode) {
+      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFCHR') }}};
+    },
+    isBlkdev: function(mode) {
+      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFBLK') }}};
+    },
+    isFIFO: function(mode) {
+      return (mode & {{{ cDefine('S_IFMT') }}}) === {{{ cDefine('S_IFIFO') }}};
+    },
+    isSocket: function(mode) {
+      return (mode & {{{ cDefine('S_IFSOCK') }}}) === {{{ cDefine('S_IFSOCK') }}};
     },
 
     //
@@ -279,18 +291,6 @@ mergeInto(LibraryManager.library, {
     mayLookup: function(dir) {
       return FS.nodePermissions(dir, 'x');
     },
-    mayMknod: function(mode) {
-      switch (mode & {{{ cDefine('S_IFMT') }}}) {
-        case {{{ cDefine('S_IFREG') }}}:
-        case {{{ cDefine('S_IFCHR') }}}:
-        case {{{ cDefine('S_IFBLK') }}}:
-        case {{{ cDefine('S_IFIFO') }}}:
-        case {{{ cDefine('S_IFSOCK') }}}:
-          return 0;
-        default:
-          return ERRNO_CODES.EINVAL;
-      }
-    },
     mayCreate: function(dir, name) {
       try {
         var node = FS.lookupNode(dir, name);
@@ -314,7 +314,7 @@ mergeInto(LibraryManager.library, {
         if (!FS.isDir(node.mode)) {
           return ERRNO_CODES.ENOTDIR;
         }
-        if (FS.isRoot(node) || FS.getPath(node) === FS.currentPath) {
+        if (FS.isRoot(node) || FS.getPath(node) === FS.cwd()) {
           return ERRNO_CODES.EBUSY;
         }
       } else {
@@ -337,6 +337,66 @@ mergeInto(LibraryManager.library, {
         }
       }
       return FS.nodePermissions(node, FS.flagsToPermissionString(flags));
+    },
+
+    //
+    // streams
+    //
+    MAX_OPEN_FDS: 4096,
+    nextfd: function(fd_start, fd_end) {
+      fd_start = fd_start || 1;
+      fd_end = fd_end || FS.MAX_OPEN_FDS;
+      for (var fd = fd_start; fd <= fd_end; fd++) {
+        if (!FS.streams[fd]) {
+          return fd;
+        }
+      }
+      throw new FS.ErrnoError(ERRNO_CODES.EMFILE);
+    },
+    getStream: function(fd) {
+      return FS.streams[fd];
+    },
+    // TODO parameterize this function such that a stream
+    // object isn't directly passed in. not possible until
+    // SOCKFS is completed.
+    createStream: function(stream, fd_start, fd_end) {
+      if (!FS.FSStream) {
+        FS.FSStream = function(){};
+        FS.FSStream.prototype = {};
+        // compatibility
+        Object.defineProperties(FS.FSStream.prototype, {
+          object: {
+            get: function() { return this.node; },
+            set: function(val) { this.node = val; }
+          },
+          isRead: {
+            get: function() { return (this.flags & {{{ cDefine('O_ACCMODE') }}}) !== {{{ cDefine('O_WRONLY') }}}; }
+          },
+          isWrite: {
+            get: function() { return (this.flags & {{{ cDefine('O_ACCMODE') }}}) !== {{{ cDefine('O_RDONLY') }}}; }
+          },
+          isAppend: {
+            get: function() { return (this.flags & {{{ cDefine('O_APPEND') }}}); }
+          }
+        });
+      }
+      if (stream.__proto__) {
+        // reuse the object
+        stream.__proto__ = FS.FSStream.prototype;
+      } else {
+        var newStream = new FS.FSStream();
+        for (var p in stream) {
+          newStream[p] = stream[p];
+        }
+        stream = newStream;
+      }
+      var fd = FS.nextfd(fd_start, fd_end);
+      stream.fd = fd;
+      FS.streams[fd] = stream;
+      return stream;
+    },
+    closeStream: function(fd) {
+      FS.streams[fd] = null;
     },
 
     //
@@ -379,529 +439,47 @@ mergeInto(LibraryManager.library, {
     },
 
     //
-    // streams
+    // core
     //
-    MAX_OPEN_FDS: 4096,
-    nextfd: function(fd_start, fd_end) {
-      fd_start = fd_start || 1;
-      fd_end = fd_end || FS.MAX_OPEN_FDS;
-      for (var fd = fd_start; fd <= fd_end; fd++) {
-        if (!FS.streams[fd]) {
-          return fd;
-        }
+    syncfs: function(populate, callback) {
+      if (typeof(populate) === 'function') {
+        callback = populate;
+        populate = false;
       }
-      throw new FS.ErrnoError(ERRNO_CODES.EMFILE);
-    },
-    getStream: function(fd) {
-      return FS.streams[fd];
-    },
-    createStream: function(stream, fd_start, fd_end) {
-      var fd = FS.nextfd(fd_start, fd_end);
-      stream.fd = fd;
-      // compatibility
-      Object.defineProperties(stream, {
-        object: {
-          get: function() { return stream.node; },
-          set: function(val) { stream.node = val; }
-        },
-        isRead: {
-          get: function() { return (stream.flags & {{{ cDefine('O_ACCMODE') }}}) !== {{{ cDefine('O_WRONLY') }}}; }
-        },
-        isWrite: {
-          get: function() { return (stream.flags & {{{ cDefine('O_ACCMODE') }}}) !== {{{ cDefine('O_RDONLY') }}}; }
-        },
-        isAppend: {
-          get: function() { return (stream.flags & {{{ cDefine('O_APPEND') }}}); }
-        }
-      });
-      FS.streams[fd] = stream;
-      return stream;
-    },
-    closeStream: function(fd) {
-      FS.streams[fd] = null;
-    },
 
-    //
-    // compatibility
-    //
-    getMode: function(canRead, canWrite) {
-      var mode = 0;
-      if (canRead) mode |= {{{ cDefine('S_IRUGO') }}} | {{{ cDefine('S_IXUGO') }}};
-      if (canWrite) mode |= {{{ cDefine('S_IWUGO') }}};
-      return mode;
-    },
-    joinPath: function(parts, forceRelative) {
-      var path = PATH.join.apply(null, parts);
-      if (forceRelative && path[0] == '/') path = path.substr(1);
-      return path;
-    },
-    absolutePath: function(relative, base) {
-      return PATH.resolve(base, relative);
-    },
-    standardizePath: function(path) {
-      return PATH.normalize(path);
-    },
-    findObject: function(path, dontResolveLastLink) {
-      var ret = FS.analyzePath(path, dontResolveLastLink);
-      if (ret.exists) {
-        return ret.object;
-      } else {
-        ___setErrNo(ret.error);
-        return null;
-      }
-    },
-    analyzePath: function(path, dontResolveLastLink) {
-      // operate from within the context of the symlink's target
-      try {
-        var lookup = FS.lookupPath(path, { follow: !dontResolveLastLink });
-        path = lookup.path;
-      } catch (e) {
-      }
-      var ret = {
-        isRoot: false, exists: false, error: 0, name: null, path: null, object: null,
-        parentExists: false, parentPath: null, parentObject: null
+      var completed = 0;
+      var total = FS.mounts.length;
+      function done(err) {
+        if (err) {
+          return callback(err);
+        }
+        if (++completed >= total) {
+          callback(null);
+        }
       };
-      try {
-        var lookup = FS.lookupPath(path, { parent: true });
-        ret.parentExists = true;
-        ret.parentPath = lookup.path;
-        ret.parentObject = lookup.node;
-        ret.name = PATH.basename(path);
-        lookup = FS.lookupPath(path, { follow: !dontResolveLastLink });
-        ret.exists = true;
-        ret.path = lookup.path;
-        ret.object = lookup.node;
-        ret.name = lookup.node.name;
-        ret.isRoot = lookup.path === '/';
-      } catch (e) {
-        ret.error = e.errno;
-      };
-      return ret;
-    },
-    createFolder: function(parent, name, canRead, canWrite) {
-      var path = PATH.join(typeof parent === 'string' ? parent : FS.getPath(parent), name);
-      var mode = FS.getMode(canRead, canWrite);
-      return FS.mkdir(path, mode);
-    },
-    createPath: function(parent, path, canRead, canWrite) {
-      parent = typeof parent === 'string' ? parent : FS.getPath(parent);
-      var parts = path.split('/').reverse();
-      while (parts.length) {
-        var part = parts.pop();
-        if (!part) continue;
-        var current = PATH.join(parent, part);
-        try {
-          FS.mkdir(current, 0777);
-        } catch (e) {
-          // ignore EEXIST
-        }
-        parent = current;
-      }
-      return current;
-    },
-    createFile: function(parent, name, properties, canRead, canWrite) {
-      var path = PATH.join(typeof parent === 'string' ? parent : FS.getPath(parent), name);
-      var mode = FS.getMode(canRead, canWrite);
-      return FS.create(path, mode);
-    },
-    createDataFile: function(parent, name, data, canRead, canWrite) {
-      var path = PATH.join(typeof parent === 'string' ? parent : FS.getPath(parent), name);
-      var mode = FS.getMode(canRead, canWrite);
-      var node = FS.create(path, mode);
-      if (data) {
-        if (typeof data === 'string') {
-          var arr = new Array(data.length);
-          for (var i = 0, len = data.length; i < len; ++i) arr[i] = data.charCodeAt(i);
-          data = arr;
-        }
-        // make sure we can write to the file
-        FS.chmod(path, mode | {{{ cDefine('S_IWUGO') }}});
-        var stream = FS.open(path, 'w');
-        FS.write(stream, data, 0, data.length, 0);
-        FS.close(stream);
-        FS.chmod(path, mode);
-      }
-      return node;
-    },
-    createDevice: function(parent, name, input, output) {
-      var path = PATH.join(typeof parent === 'string' ? parent : FS.getPath(parent), name);
-      var mode = input && output ? 0777 : (input ? 0333 : 0555);
-      if (!FS.createDevice.major) FS.createDevice.major = 64;
-      var dev = FS.makedev(FS.createDevice.major++, 0);
-      // Create a fake device that a set of stream ops to emulate
-      // the old behavior.
-      FS.registerDevice(dev, {
-        open: function(stream) {
-          stream.seekable = false;
-        },
-        close: function(stream) {
-          // flush any pending line data
-          if (output && output.buffer && output.buffer.length) {
-            output({{{ charCode('\n') }}});
-          }
-        },
-        read: function(stream, buffer, offset, length, pos /* ignored */) {
-          var bytesRead = 0;
-          for (var i = 0; i < length; i++) {
-            var result;
-            try {
-              result = input();
-            } catch (e) {
-              throw new FS.ErrnoError(ERRNO_CODES.EIO);
-            }
-            if (result === undefined && bytesRead === 0) {
-              throw new FS.ErrnoError(ERRNO_CODES.EAGAIN);
-            }
-            if (result === null || result === undefined) break;
-            bytesRead++;
-            buffer[offset+i] = result;
-          }
-          if (bytesRead) {
-            stream.node.timestamp = Date.now();
-          }
-          return bytesRead;
-        },
-        write: function(stream, buffer, offset, length, pos) {
-          for (var i = 0; i < length; i++) {
-            try {
-              output(buffer[offset+i]);
-            } catch (e) {
-              throw new FS.ErrnoError(ERRNO_CODES.EIO);
-            }
-          }
-          if (length) {
-            stream.node.timestamp = Date.now();
-          }
-          return i;
-        }
-      });
-      return FS.mkdev(path, mode, dev);
-    },
-    createLink: function(parent, name, target, canRead, canWrite) {
-      var path = PATH.join(typeof parent === 'string' ? parent : FS.getPath(parent), name);
-      return FS.symlink(target, path);
-    },
-    // Makes sure a file's contents are loaded. Returns whether the file has
-    // been loaded successfully. No-op for files that have been loaded already.
-    forceLoadFile: function(obj) {
-      if (obj.isDevice || obj.isFolder || obj.link || obj.contents) return true;
-      var success = true;
-      if (typeof XMLHttpRequest !== 'undefined') {
-        throw new Error("Lazy loading should have been performed (contents set) in createLazyFile, but it was not. Lazy loading only works in web workers. Use --embed-file or --preload-file in emcc on the main thread.");
-      } else if (Module['read']) {
-        // Command-line.
-        try {
-          // WARNING: Can't read binary files in V8's d8 or tracemonkey's js, as
-          //          read() will try to parse UTF8.
-          obj.contents = intArrayFromString(Module['read'](obj.url), true);
-        } catch (e) {
-          success = false;
-        }
-      } else {
-        throw new Error('Cannot load without read() or XMLHttpRequest.');
-      }
-      if (!success) ___setErrNo(ERRNO_CODES.EIO);
-      return success;
-    },
-    // Creates a file record for lazy-loading from a URL. XXX This requires a synchronous
-    // XHR, which is not possible in browsers except in a web worker! Use preloading,
-    // either --preload-file in emcc or FS.createPreloadedFile
-    createLazyFile: function(parent, name, url, canRead, canWrite) {
-      if (typeof XMLHttpRequest !== 'undefined') {
-        if (!ENVIRONMENT_IS_WORKER) throw 'Cannot do synchronous binary XHRs outside webworkers in modern browsers. Use --embed-file or --preload-file in emcc';
-        // Lazy chunked Uint8Array (implements get and length from Uint8Array). Actual getting is abstracted away for eventual reuse.
-        var LazyUint8Array = function() {
-          this.lengthKnown = false;
-          this.chunks = []; // Loaded chunks. Index is the chunk number
-        }
-        LazyUint8Array.prototype.get = function(idx) {
-          if (idx > this.length-1 || idx < 0) {
-            return undefined;
-          }
-          var chunkOffset = idx % this.chunkSize;
-          var chunkNum = Math.floor(idx / this.chunkSize);
-          return this.getter(chunkNum)[chunkOffset];
-        }
-        LazyUint8Array.prototype.setDataGetter = function(getter) {
-          this.getter = getter;
-        }
-        LazyUint8Array.prototype.cacheLength = function() {
-            // Find length
-            var xhr = new XMLHttpRequest();
-            xhr.open('HEAD', url, false);
-            xhr.send(null);
-            if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
-            var datalength = Number(xhr.getResponseHeader("Content-length"));
-            var header;
-            var hasByteServing = (header = xhr.getResponseHeader("Accept-Ranges")) && header === "bytes";
-#if SMALL_XHR_CHUNKS
-            var chunkSize = 1024; // Chunk size in bytes
-#else
-            var chunkSize = 1024*1024; // Chunk size in bytes
-#endif
 
-            if (!hasByteServing) chunkSize = datalength;
-
-            // Function to get a range from the remote URL.
-            var doXHR = (function(from, to) {
-              if (from > to) throw new Error("invalid range (" + from + ", " + to + ") or no bytes requested!");
-              if (to > datalength-1) throw new Error("only " + datalength + " bytes available! programmer error!");
-
-              // TODO: Use mozResponseArrayBuffer, responseStream, etc. if available.
-              var xhr = new XMLHttpRequest();
-              xhr.open('GET', url, false);
-              if (datalength !== chunkSize) xhr.setRequestHeader("Range", "bytes=" + from + "-" + to);
-
-              // Some hints to the browser that we want binary data.
-              if (typeof Uint8Array != 'undefined') xhr.responseType = 'arraybuffer';
-              if (xhr.overrideMimeType) {
-                xhr.overrideMimeType('text/plain; charset=x-user-defined');
-              }
-
-              xhr.send(null);
-              if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
-              if (xhr.response !== undefined) {
-                return new Uint8Array(xhr.response || []);
-              } else {
-                return intArrayFromString(xhr.responseText || '', true);
-              }
-            });
-            var lazyArray = this;
-            lazyArray.setDataGetter(function(chunkNum) {
-              var start = chunkNum * chunkSize;
-              var end = (chunkNum+1) * chunkSize - 1; // including this byte
-              end = Math.min(end, datalength-1); // if datalength-1 is selected, this is the last block
-              if (typeof(lazyArray.chunks[chunkNum]) === "undefined") {
-                lazyArray.chunks[chunkNum] = doXHR(start, end);
-              }
-              if (typeof(lazyArray.chunks[chunkNum]) === "undefined") throw new Error("doXHR failed!");
-              return lazyArray.chunks[chunkNum];
-            });
-
-            this._length = datalength;
-            this._chunkSize = chunkSize;
-            this.lengthKnown = true;
-        }
-
-        var lazyArray = new LazyUint8Array();
-        Object.defineProperty(lazyArray, "length", {
-            get: function() {
-                if(!this.lengthKnown) {
-                    this.cacheLength();
-                }
-                return this._length;
-            }
-        });
-        Object.defineProperty(lazyArray, "chunkSize", {
-            get: function() {
-                if(!this.lengthKnown) {
-                    this.cacheLength();
-                }
-                return this._chunkSize;
-            }
-        });
-
-        var properties = { isDevice: false, contents: lazyArray };
-      } else {
-        var properties = { isDevice: false, url: url };
-      }
-
-      var node = FS.createFile(parent, name, properties, canRead, canWrite);
-      // This is a total hack, but I want to get this lazy file code out of the
-      // core of MEMFS. If we want to keep this lazy file concept I feel it should
-      // be its own thin LAZYFS proxying calls to MEMFS.
-      if (properties.contents) {
-        node.contents = properties.contents;
-      } else if (properties.url) {
-        node.contents = null;
-        node.url = properties.url;
-      }
-      // override each stream op with one that tries to force load the lazy file first
-      var stream_ops = {};
-      var keys = Object.keys(node.stream_ops);
-      keys.forEach(function(key) {
-        var fn = node.stream_ops[key];
-        stream_ops[key] = function() {
-          if (!FS.forceLoadFile(node)) {
-            throw new FS.ErrnoError(ERRNO_CODES.EIO);
-          }
-          return fn.apply(null, arguments);
-        };
-      });
-      // use a custom read function
-      stream_ops.read = function(stream, buffer, offset, length, position) {
-        var contents = stream.node.contents;
-        var size = Math.min(contents.length - position, length);
-        if (contents.slice) { // normal array
-          for (var i = 0; i < size; i++) {
-            buffer[offset + i] = contents[position + i];
-          }
-        } else {
-          for (var i = 0; i < size; i++) { // LazyUint8Array from sync binary XHR
-            buffer[offset + i] = contents.get(position + i);
-          }
-        }
-        return size;
-      };
-      node.stream_ops = stream_ops;
-      return node;
-    },
-    // Preloads a file asynchronously. You can call this before run, for example in
-    // preRun. run will be delayed until this file arrives and is set up.
-    // If you call it after run(), you may want to pause the main loop until it
-    // completes, if so, you can use the onload parameter to be notified when
-    // that happens.
-    // In addition to normally creating the file, we also asynchronously preload
-    // the browser-friendly versions of it: For an image, we preload an Image
-    // element and for an audio, and Audio. These are necessary for SDL_Image
-    // and _Mixer to find the files in preloadedImages/Audios.
-    // You can also call this with a typed array instead of a url. It will then
-    // do preloading for the Image/Audio part, as if the typed array were the
-    // result of an XHR that you did manually.
-    createPreloadedFile: function(parent, name, url, canRead, canWrite, onload, onerror, dontCreateFile) {
-      Browser.init();
-      // TODO we should allow people to just pass in a complete filename instead
-      // of parent and name being that we just join them anyways
-      var fullname = PATH.resolve(PATH.join(parent, name));
-      function processData(byteArray) {
-        function finish(byteArray) {
-          if (!dontCreateFile) {
-            FS.createDataFile(parent, name, byteArray, canRead, canWrite);
-          }
-          if (onload) onload();
-          removeRunDependency('cp ' + fullname);
-        }
-        var handled = false;
-        Module['preloadPlugins'].forEach(function(plugin) {
-          if (handled) return;
-          if (plugin['canHandle'](fullname)) {
-            plugin['handle'](byteArray, fullname, finish, function() {
-              if (onerror) onerror();
-              removeRunDependency('cp ' + fullname);
-            });
-            handled = true;
-          }
-        });
-        if (!handled) finish(byteArray);
-      }
-      addRunDependency('cp ' + fullname);
-      if (typeof url == 'string') {
-        Browser.asyncLoad(url, function(byteArray) {
-          processData(byteArray);
-        }, onerror);
-      } else {
-        processData(url);
-      }
-    },
-
-    //
-    // general
-    //
-    createDefaultDirectories: function() {
-      FS.mkdir('/tmp', 0777);
-    },
-    createDefaultDevices: function() {
-      // create /dev
-      FS.mkdir('/dev', 0777);
-      // setup /dev/null
-      FS.registerDevice(FS.makedev(1, 3), {
-        read: function() { return 0; },
-        write: function() { return 0; }
-      });
-      FS.mkdev('/dev/null', 0666, FS.makedev(1, 3));
-      // setup /dev/tty and /dev/tty1
-      // stderr needs to print output using Module['printErr']
-      // so we register a second tty just for it.
-      TTY.register(FS.makedev(5, 0), TTY.default_tty_ops);
-      TTY.register(FS.makedev(6, 0), TTY.default_tty1_ops);
-      FS.mkdev('/dev/tty', 0666, FS.makedev(5, 0));
-      FS.mkdev('/dev/tty1', 0666, FS.makedev(6, 0));
-      // we're not going to emulate the actual shm device,
-      // just create the tmp dirs that reside in it commonly
-      FS.mkdir('/dev/shm', 0777);
-      FS.mkdir('/dev/shm/tmp', 0777);
-    },
-    createStandardStreams: function() {
-      // TODO deprecate the old functionality of a single
-      // input / output callback and that utilizes FS.createDevice
-      // and instead require a unique set of stream ops
-
-      // by default, we symlink the standard streams to the
-      // default tty devices. however, if the standard streams
-      // have been overwritten we create a unique device for
-      // them instead.
-      if (Module['stdin']) {
-        FS.createDevice('/dev', 'stdin', Module['stdin']);
-      } else {
-        FS.symlink('/dev/tty', '/dev/stdin');
-      }
-      if (Module['stdout']) {
-        FS.createDevice('/dev', 'stdout', null, Module['stdout']);
-      } else {
-        FS.symlink('/dev/tty', '/dev/stdout');
-      }
-      if (Module['stderr']) {
-        FS.createDevice('/dev', 'stderr', null, Module['stderr']);
-      } else {
-        FS.symlink('/dev/tty1', '/dev/stderr');
-      }
-
-      // open default streams for the stdin, stdout and stderr devices
-      var stdin = FS.open('/dev/stdin', 'r');
-      {{{ makeSetValue(makeGlobalUse('_stdin'), 0, 'stdin.fd', 'void*') }}};
-      assert(stdin.fd === 1, 'invalid handle for stdin (' + stdin.fd + ')');
-
-      var stdout = FS.open('/dev/stdout', 'w');
-      {{{ makeSetValue(makeGlobalUse('_stdout'), 0, 'stdout.fd', 'void*') }}};
-      assert(stdout.fd === 2, 'invalid handle for stdout (' + stdout.fd + ')');
-
-      var stderr = FS.open('/dev/stderr', 'w');
-      {{{ makeSetValue(makeGlobalUse('_stderr'), 0, 'stderr.fd', 'void*') }}};
-      assert(stderr.fd === 3, 'invalid handle for stderr (' + stderr.fd + ')');
-    },
-    staticInit: function() {
-      FS.root = FS.createNode(null, '/', {{{ cDefine('S_IFDIR') }}} | 0777, 0);
-      FS.mount(MEMFS, {}, '/');
-
-      FS.createDefaultDirectories();
-      FS.createDefaultDevices();
-    },
-    init: function(input, output, error) {
-      assert(!FS.init.initialized, 'FS.init was previously called. If you want to initialize later with custom parameters, remove any earlier calls (note that one is automatically added to the generated code)');
-      FS.init.initialized = true;
-
-      // Allow Module.stdin etc. to provide defaults, if none explicitly passed to us here
-      Module['stdin'] = input || Module['stdin'];
-      Module['stdout'] = output || Module['stdout'];
-      Module['stderr'] = error || Module['stderr'];
-
-      FS.createStandardStreams();
-    },
-    quit: function() {
-      FS.init.initialized = false;
-      for (var i = 0; i < FS.streams.length; i++) {
-        var stream = FS.streams[i];
-        if (!stream) {
+      // sync all mounts
+      for (var i = 0; i < FS.mounts.length; i++) {
+        var mount = FS.mounts[i];
+        if (!mount.type.syncfs) {
+          done(null);
           continue;
         }
-        FS.close(stream);
+        mount.type.syncfs(mount, populate, done);
       }
     },
-
-    //
-    // vfs functionality
-    //
     mount: function(type, opts, mountpoint) {
+      var lookup;
+      if (mountpoint) {
+        lookup = FS.lookupPath(mountpoint, { follow: false });
+        mountpoint = lookup.path;  // use the absolute path
+      }
       var mount = {
         type: type,
         opts: opts,
         mountpoint: mountpoint,
         root: null
       };
-      var lookup;
-      if (mountpoint) {
-        lookup = FS.lookupPath(mountpoint, { follow: false });
-      }
       // create a root node for the fs
       var root = type.mount(mount);
       root.mount = mount;
@@ -915,6 +493,8 @@ mergeInto(LibraryManager.library, {
           FS.root = mount.root;
         }
       }
+      // add to our cached list of mounts
+      FS.mounts.push(mount);
       return root;
     },
     lookup: function(parent, name) {
@@ -936,16 +516,22 @@ mergeInto(LibraryManager.library, {
     },
     // helpers to create specific types of nodes
     create: function(path, mode) {
+      mode = mode !== undefined ? mode : 0666;
       mode &= {{{ cDefine('S_IALLUGO') }}};
       mode |= {{{ cDefine('S_IFREG') }}};
       return FS.mknod(path, mode, 0);
     },
     mkdir: function(path, mode) {
+      mode = mode !== undefined ? mode : 0777;
       mode &= {{{ cDefine('S_IRWXUGO') }}} | {{{ cDefine('S_ISVTX') }}};
       mode |= {{{ cDefine('S_IFDIR') }}};
       return FS.mknod(path, mode, 0);
     },
     mkdev: function(path, mode, dev) {
+      if (typeof(dev) === 'undefined') {
+        dev = mode;
+        mode = 0666;
+      }
       mode |= {{{ cDefine('S_IFCHR') }}};
       return FS.mknod(path, mode, dev);
     },
@@ -1035,7 +621,7 @@ mergeInto(LibraryManager.library, {
       FS.hashRemoveNode(old_node);
       // do the underlying fs rename
       try {
-        old_node.node_ops.rename(old_node, new_dir, new_name);
+        old_dir.node_ops.rename(old_node, new_dir, new_name);
       } catch (e) {
         throw e;
       } finally {
@@ -1061,6 +647,14 @@ mergeInto(LibraryManager.library, {
       }
       parent.node_ops.rmdir(parent, name);
       FS.destroyNode(node);
+    },
+    readdir: function(path) {
+      var lookup = FS.lookupPath(path, { follow: true });
+      var node = lookup.node;
+      if (!node.node_ops.readdir) {
+        throw new FS.ErrnoError(ERRNO_CODES.ENOTDIR);
+      }
+      return node.node_ops.readdir(node);
     },
     unlink: function(path) {
       var lookup = FS.lookupPath(path, { parent: true });
@@ -1200,22 +794,26 @@ mergeInto(LibraryManager.library, {
       });
     },
     open: function(path, flags, mode, fd_start, fd_end) {
-      path = PATH.normalize(path);
       flags = typeof flags === 'string' ? FS.modeStringToFlags(flags) : flags;
+      mode = typeof mode === 'undefined' ? 0666 : mode;
       if ((flags & {{{ cDefine('O_CREAT') }}})) {
         mode = (mode & {{{ cDefine('S_IALLUGO') }}}) | {{{ cDefine('S_IFREG') }}};
       } else {
         mode = 0;
       }
       var node;
-      try {
-        var lookup = FS.lookupPath(path, {
-          follow: !(flags & {{{ cDefine('O_NOFOLLOW') }}})
-        });
-        node = lookup.node;
-        path = lookup.path;
-      } catch (e) {
-        // ignore
+      if (typeof path === 'object') {
+        node = path;
+      } else {
+        path = PATH.normalize(path);
+        try {
+          var lookup = FS.lookupPath(path, {
+            follow: !(flags & {{{ cDefine('O_NOFOLLOW') }}})
+          });
+          node = lookup.node;
+        } catch (e) {
+          // ignore
+        }
       }
       // perhaps we need to create the node
       if ((flags & {{{ cDefine('O_CREAT') }}})) {
@@ -1245,10 +843,13 @@ mergeInto(LibraryManager.library, {
       if ((flags & {{{ cDefine('O_TRUNC')}}})) {
         FS.truncate(node, 0);
       }
+      // we've already handled these, don't pass down to the underlying vfs
+      flags &= ~({{{ cDefine('O_EXCL') }}} | {{{ cDefine('O_TRUNC') }}});
+
       // register the stream with the filesystem
       var stream = FS.createStream({
-        path: path,
         node: node,
+        path: FS.getPath(node),  // we want the absolute path to the node
         flags: flags,
         seekable: true,
         position: 0,
@@ -1260,6 +861,13 @@ mergeInto(LibraryManager.library, {
       // call the new stream's open function
       if (stream.stream_ops.open) {
         stream.stream_ops.open(stream);
+      }
+      if (Module['logReadFiles'] && !(flags & {{{ cDefine('O_WRONLY')}}})) {
+        if (!FS.readFiles) FS.readFiles = {};
+        if (!(path in FS.readFiles)) {
+          FS.readFiles[path] = 1;
+          Module['printErr']('read file: ' + path);
+        }
       }
       return stream;
     },
@@ -1279,12 +887,6 @@ mergeInto(LibraryManager.library, {
         throw new FS.ErrnoError(ERRNO_CODES.ESPIPE);
       }
       return stream.stream_ops.llseek(stream, offset, whence);
-    },
-    readdir: function(stream) {
-      if (!stream.stream_ops.readdir) {
-        throw new FS.ErrnoError(ERRNO_CODES.ENOTDIR);
-      }
-      return stream.stream_ops.readdir(stream);
     },
     read: function(stream, buffer, offset, length, position) {
       if (length < 0 || position < 0) {
@@ -1310,7 +912,7 @@ mergeInto(LibraryManager.library, {
       if (!seeking) stream.position += bytesRead;
       return bytesRead;
     },
-    write: function(stream, buffer, offset, length, position) {
+    write: function(stream, buffer, offset, length, position, canOwn) {
       if (length < 0 || position < 0) {
         throw new FS.ErrnoError(ERRNO_CODES.EINVAL);
       }
@@ -1334,7 +936,7 @@ mergeInto(LibraryManager.library, {
         // seek to the end before writing in append mode
         FS.llseek(stream, 0, {{{ cDefine('SEEK_END') }}});
       }
-      var bytesWritten = stream.stream_ops.write(stream, buffer, offset, length, position);
+      var bytesWritten = stream.stream_ops.write(stream, buffer, offset, length, position, canOwn);
       if (!seeking) stream.position += bytesWritten;
       return bytesWritten;
     },
@@ -1359,9 +961,659 @@ mergeInto(LibraryManager.library, {
         throw new FS.ErrnoError(ERRNO_CODES.EACCES);
       }
       if (!stream.stream_ops.mmap) {
-        throw new FS.errnoError(ERRNO_CODES.ENODEV);
+        throw new FS.ErrnoError(ERRNO_CODES.ENODEV);
       }
       return stream.stream_ops.mmap(stream, buffer, offset, length, position, prot, flags);
+    },
+    ioctl: function(stream, cmd, arg) {
+      if (!stream.stream_ops.ioctl) {
+        throw new FS.ErrnoError(ERRNO_CODES.ENOTTY);
+      }
+      return stream.stream_ops.ioctl(stream, cmd, arg);
+    },
+    readFile: function(path, opts) {
+      opts = opts || {};
+      opts.flags = opts.flags || 'r';
+      opts.encoding = opts.encoding || 'binary';
+      var ret;
+      var stream = FS.open(path, opts.flags);
+      var stat = FS.stat(path);
+      var length = stat.size;
+      var buf = new Uint8Array(length);
+      FS.read(stream, buf, 0, length, 0);
+      if (opts.encoding === 'utf8') {
+        ret = '';
+        var utf8 = new Runtime.UTF8Processor();
+        for (var i = 0; i < length; i++) {
+          ret += utf8.processCChar(buf[i]);
+        }
+      } else if (opts.encoding === 'binary') {
+        ret = buf;
+      } else {
+        throw new Error('Invalid encoding type "' + opts.encoding + '"');
+      }
+      FS.close(stream);
+      return ret;
+    },
+    writeFile: function(path, data, opts) {
+      opts = opts || {};
+      opts.flags = opts.flags || 'w';
+      opts.encoding = opts.encoding || 'utf8';
+      var stream = FS.open(path, opts.flags, opts.mode);
+      if (opts.encoding === 'utf8') {
+        var utf8 = new Runtime.UTF8Processor();
+        var buf = new Uint8Array(utf8.processJSString(data));
+        FS.write(stream, buf, 0, buf.length, 0);
+      } else if (opts.encoding === 'binary') {
+        FS.write(stream, data, 0, data.length, 0);
+      } else {
+        throw new Error('Invalid encoding type "' + opts.encoding + '"');
+      }
+      FS.close(stream);
+    },
+
+    //
+    // module-level FS code
+    //
+    cwd: function() {
+      return FS.currentPath;
+    },
+    chdir: function(path) {
+      var lookup = FS.lookupPath(path, { follow: true });
+      if (!FS.isDir(lookup.node.mode)) {
+        throw new FS.ErrnoError(ERRNO_CODES.ENOTDIR);
+      }
+      var err = FS.nodePermissions(lookup.node, 'x');
+      if (err) {
+        throw new FS.ErrnoError(err);
+      }
+      FS.currentPath = lookup.path;
+    },
+    createDefaultDirectories: function() {
+      FS.mkdir('/tmp');
+    },
+    createDefaultDevices: function() {
+      // create /dev
+      FS.mkdir('/dev');
+      // setup /dev/null
+      FS.registerDevice(FS.makedev(1, 3), {
+        read: function() { return 0; },
+        write: function() { return 0; }
+      });
+      FS.mkdev('/dev/null', FS.makedev(1, 3));
+      // setup /dev/tty and /dev/tty1
+      // stderr needs to print output using Module['printErr']
+      // so we register a second tty just for it.
+      TTY.register(FS.makedev(5, 0), TTY.default_tty_ops);
+      TTY.register(FS.makedev(6, 0), TTY.default_tty1_ops);
+      FS.mkdev('/dev/tty', FS.makedev(5, 0));
+      FS.mkdev('/dev/tty1', FS.makedev(6, 0));
+      // we're not going to emulate the actual shm device,
+      // just create the tmp dirs that reside in it commonly
+      FS.mkdir('/dev/shm');
+      FS.mkdir('/dev/shm/tmp');
+    },
+    createStandardStreams: function() {
+      // TODO deprecate the old functionality of a single
+      // input / output callback and that utilizes FS.createDevice
+      // and instead require a unique set of stream ops
+
+      // by default, we symlink the standard streams to the
+      // default tty devices. however, if the standard streams
+      // have been overwritten we create a unique device for
+      // them instead.
+      if (Module['stdin']) {
+        FS.createDevice('/dev', 'stdin', Module['stdin']);
+      } else {
+        FS.symlink('/dev/tty', '/dev/stdin');
+      }
+      if (Module['stdout']) {
+        FS.createDevice('/dev', 'stdout', null, Module['stdout']);
+      } else {
+        FS.symlink('/dev/tty', '/dev/stdout');
+      }
+      if (Module['stderr']) {
+        FS.createDevice('/dev', 'stderr', null, Module['stderr']);
+      } else {
+        FS.symlink('/dev/tty1', '/dev/stderr');
+      }
+
+      // open default streams for the stdin, stdout and stderr devices
+      var stdin = FS.open('/dev/stdin', 'r');
+      {{{ makeSetValue(makeGlobalUse('_stdin'), 0, 'stdin.fd', 'void*') }}};
+      assert(stdin.fd === 1, 'invalid handle for stdin (' + stdin.fd + ')');
+
+      var stdout = FS.open('/dev/stdout', 'w');
+      {{{ makeSetValue(makeGlobalUse('_stdout'), 0, 'stdout.fd', 'void*') }}};
+      assert(stdout.fd === 2, 'invalid handle for stdout (' + stdout.fd + ')');
+
+      var stderr = FS.open('/dev/stderr', 'w');
+      {{{ makeSetValue(makeGlobalUse('_stderr'), 0, 'stderr.fd', 'void*') }}};
+      assert(stderr.fd === 3, 'invalid handle for stderr (' + stderr.fd + ')');
+    },
+    ensureErrnoError: function() {
+      if (FS.ErrnoError) return;
+      FS.ErrnoError = function ErrnoError(errno) {
+        this.errno = errno;
+        for (var key in ERRNO_CODES) {
+          if (ERRNO_CODES[key] === errno) {
+            this.code = key;
+            break;
+          }
+        }
+        this.message = ERRNO_MESSAGES[errno];
+#if ASSERTIONS
+        if (this.stack) this.stack = demangleAll(this.stack);
+#endif
+      };
+      FS.ErrnoError.prototype = new Error();
+      FS.ErrnoError.prototype.constructor = FS.ErrnoError;
+      // Some errors may happen quite a bit, to avoid overhead we reuse them (and suffer a lack of stack info)
+      [ERRNO_CODES.ENOENT].forEach(function(code) {
+        FS.genericErrors[code] = new FS.ErrnoError(code);
+        FS.genericErrors[code].stack = '<generic error, no stack>';
+      });
+    },
+    staticInit: function() {
+      FS.ensureErrnoError();
+
+      FS.nameTable = new Array(4096);
+
+      FS.root = FS.createNode(null, '/', {{{ cDefine('S_IFDIR') }}} | 0777, 0);
+      FS.mount(MEMFS, {}, '/');
+
+      FS.createDefaultDirectories();
+      FS.createDefaultDevices();
+    },
+    init: function(input, output, error) {
+      assert(!FS.init.initialized, 'FS.init was previously called. If you want to initialize later with custom parameters, remove any earlier calls (note that one is automatically added to the generated code)');
+      FS.init.initialized = true;
+
+      FS.ensureErrnoError();
+
+      // Allow Module.stdin etc. to provide defaults, if none explicitly passed to us here
+      Module['stdin'] = input || Module['stdin'];
+      Module['stdout'] = output || Module['stdout'];
+      Module['stderr'] = error || Module['stderr'];
+
+      FS.createStandardStreams();
+    },
+    quit: function() {
+      FS.init.initialized = false;
+      for (var i = 0; i < FS.streams.length; i++) {
+        var stream = FS.streams[i];
+        if (!stream) {
+          continue;
+        }
+        FS.close(stream);
+      }
+    },
+
+    //
+    // old v1 compatibility functions
+    //
+    getMode: function(canRead, canWrite) {
+      var mode = 0;
+      if (canRead) mode |= {{{ cDefine('S_IRUGO') }}} | {{{ cDefine('S_IXUGO') }}};
+      if (canWrite) mode |= {{{ cDefine('S_IWUGO') }}};
+      return mode;
+    },
+    joinPath: function(parts, forceRelative) {
+      var path = PATH.join.apply(null, parts);
+      if (forceRelative && path[0] == '/') path = path.substr(1);
+      return path;
+    },
+    absolutePath: function(relative, base) {
+      return PATH.resolve(base, relative);
+    },
+    standardizePath: function(path) {
+      return PATH.normalize(path);
+    },
+    findObject: function(path, dontResolveLastLink) {
+      var ret = FS.analyzePath(path, dontResolveLastLink);
+      if (ret.exists) {
+        return ret.object;
+      } else {
+        ___setErrNo(ret.error);
+        return null;
+      }
+    },
+    analyzePath: function(path, dontResolveLastLink) {
+      // operate from within the context of the symlink's target
+      try {
+        var lookup = FS.lookupPath(path, { follow: !dontResolveLastLink });
+        path = lookup.path;
+      } catch (e) {
+      }
+      var ret = {
+        isRoot: false, exists: false, error: 0, name: null, path: null, object: null,
+        parentExists: false, parentPath: null, parentObject: null
+      };
+      try {
+        var lookup = FS.lookupPath(path, { parent: true });
+        ret.parentExists = true;
+        ret.parentPath = lookup.path;
+        ret.parentObject = lookup.node;
+        ret.name = PATH.basename(path);
+        lookup = FS.lookupPath(path, { follow: !dontResolveLastLink });
+        ret.exists = true;
+        ret.path = lookup.path;
+        ret.object = lookup.node;
+        ret.name = lookup.node.name;
+        ret.isRoot = lookup.path === '/';
+      } catch (e) {
+        ret.error = e.errno;
+      };
+      return ret;
+    },
+    createFolder: function(parent, name, canRead, canWrite) {
+      var path = PATH.join2(typeof parent === 'string' ? parent : FS.getPath(parent), name);
+      var mode = FS.getMode(canRead, canWrite);
+      return FS.mkdir(path, mode);
+    },
+    createPath: function(parent, path, canRead, canWrite) {
+      parent = typeof parent === 'string' ? parent : FS.getPath(parent);
+      var parts = path.split('/').reverse();
+      while (parts.length) {
+        var part = parts.pop();
+        if (!part) continue;
+        var current = PATH.join2(parent, part);
+        try {
+          FS.mkdir(current);
+        } catch (e) {
+          // ignore EEXIST
+        }
+        parent = current;
+      }
+      return current;
+    },
+    createFile: function(parent, name, properties, canRead, canWrite) {
+      var path = PATH.join2(typeof parent === 'string' ? parent : FS.getPath(parent), name);
+      var mode = FS.getMode(canRead, canWrite);
+      return FS.create(path, mode);
+    },
+    createDataFile: function(parent, name, data, canRead, canWrite, canOwn) {
+      var path = name ? PATH.join2(typeof parent === 'string' ? parent : FS.getPath(parent), name) : parent;
+      var mode = FS.getMode(canRead, canWrite);
+      var node = FS.create(path, mode);
+      if (data) {
+        if (typeof data === 'string') {
+          var arr = new Array(data.length);
+          for (var i = 0, len = data.length; i < len; ++i) arr[i] = data.charCodeAt(i);
+          data = arr;
+        }
+        // make sure we can write to the file
+        FS.chmod(node, mode | {{{ cDefine('S_IWUGO') }}});
+        var stream = FS.open(node, 'w');
+        FS.write(stream, data, 0, data.length, 0, canOwn);
+        FS.close(stream);
+        FS.chmod(node, mode);
+      }
+      return node;
+    },
+    createDevice: function(parent, name, input, output) {
+      var path = PATH.join2(typeof parent === 'string' ? parent : FS.getPath(parent), name);
+      var mode = FS.getMode(!!input, !!output);
+      if (!FS.createDevice.major) FS.createDevice.major = 64;
+      var dev = FS.makedev(FS.createDevice.major++, 0);
+      // Create a fake device that a set of stream ops to emulate
+      // the old behavior.
+      FS.registerDevice(dev, {
+        open: function(stream) {
+          stream.seekable = false;
+        },
+        close: function(stream) {
+          // flush any pending line data
+          if (output && output.buffer && output.buffer.length) {
+            output({{{ charCode('\n') }}});
+          }
+        },
+        read: function(stream, buffer, offset, length, pos /* ignored */) {
+          var bytesRead = 0;
+          for (var i = 0; i < length; i++) {
+            var result;
+            try {
+              result = input();
+            } catch (e) {
+              throw new FS.ErrnoError(ERRNO_CODES.EIO);
+            }
+            if (result === undefined && bytesRead === 0) {
+              throw new FS.ErrnoError(ERRNO_CODES.EAGAIN);
+            }
+            if (result === null || result === undefined) break;
+            bytesRead++;
+            buffer[offset+i] = result;
+          }
+          if (bytesRead) {
+            stream.node.timestamp = Date.now();
+          }
+          return bytesRead;
+        },
+        write: function(stream, buffer, offset, length, pos) {
+          for (var i = 0; i < length; i++) {
+            try {
+              output(buffer[offset+i]);
+            } catch (e) {
+              throw new FS.ErrnoError(ERRNO_CODES.EIO);
+            }
+          }
+          if (length) {
+            stream.node.timestamp = Date.now();
+          }
+          return i;
+        }
+      });
+      return FS.mkdev(path, mode, dev);
+    },
+    createLink: function(parent, name, target, canRead, canWrite) {
+      var path = PATH.join2(typeof parent === 'string' ? parent : FS.getPath(parent), name);
+      return FS.symlink(target, path);
+    },
+    // Makes sure a file's contents are loaded. Returns whether the file has
+    // been loaded successfully. No-op for files that have been loaded already.
+    forceLoadFile: function(obj) {
+      if (obj.isDevice || obj.isFolder || obj.link || obj.contents) return true;
+      var success = true;
+      if (typeof XMLHttpRequest !== 'undefined') {
+        throw new Error("Lazy loading should have been performed (contents set) in createLazyFile, but it was not. Lazy loading only works in web workers. Use --embed-file or --preload-file in emcc on the main thread.");
+      } else if (Module['read']) {
+        // Command-line.
+        try {
+          // WARNING: Can't read binary files in V8's d8 or tracemonkey's js, as
+          //          read() will try to parse UTF8.
+          obj.contents = intArrayFromString(Module['read'](obj.url), true);
+        } catch (e) {
+          success = false;
+        }
+      } else {
+        throw new Error('Cannot load without read() or XMLHttpRequest.');
+      }
+      if (!success) ___setErrNo(ERRNO_CODES.EIO);
+      return success;
+    },
+    // Creates a file record for lazy-loading from a URL. XXX This requires a synchronous
+    // XHR, which is not possible in browsers except in a web worker! Use preloading,
+    // either --preload-file in emcc or FS.createPreloadedFile
+    createLazyFile: function(parent, name, url, canRead, canWrite) {
+      if (typeof XMLHttpRequest !== 'undefined') {
+        if (!ENVIRONMENT_IS_WORKER) throw 'Cannot do synchronous binary XHRs outside webworkers in modern browsers. Use --embed-file or --preload-file in emcc';
+        // Lazy chunked Uint8Array (implements get and length from Uint8Array). Actual getting is abstracted away for eventual reuse.
+        function LazyUint8Array() {
+          this.lengthKnown = false;
+          this.chunks = []; // Loaded chunks. Index is the chunk number
+        }
+        LazyUint8Array.prototype.get = function LazyUint8Array_get(idx) {
+          if (idx > this.length-1 || idx < 0) {
+            return undefined;
+          }
+          var chunkOffset = idx % this.chunkSize;
+          var chunkNum = Math.floor(idx / this.chunkSize);
+          return this.getter(chunkNum)[chunkOffset];
+        }
+        LazyUint8Array.prototype.setDataGetter = function LazyUint8Array_setDataGetter(getter) {
+          this.getter = getter;
+        }
+        LazyUint8Array.prototype.cacheLength = function LazyUint8Array_cacheLength() {
+            // Find length
+            var xhr = new XMLHttpRequest();
+            xhr.open('HEAD', url, false);
+            xhr.send(null);
+            if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
+            var datalength = Number(xhr.getResponseHeader("Content-length"));
+            var header;
+            var hasByteServing = (header = xhr.getResponseHeader("Accept-Ranges")) && header === "bytes";
+#if SMALL_XHR_CHUNKS
+            var chunkSize = 1024; // Chunk size in bytes
+#else
+            var chunkSize = 1024*1024; // Chunk size in bytes
+#endif
+
+            if (!hasByteServing) chunkSize = datalength;
+
+            // Function to get a range from the remote URL.
+            var doXHR = (function(from, to) {
+              if (from > to) throw new Error("invalid range (" + from + ", " + to + ") or no bytes requested!");
+              if (to > datalength-1) throw new Error("only " + datalength + " bytes available! programmer error!");
+
+              // TODO: Use mozResponseArrayBuffer, responseStream, etc. if available.
+              var xhr = new XMLHttpRequest();
+              xhr.open('GET', url, false);
+              if (datalength !== chunkSize) xhr.setRequestHeader("Range", "bytes=" + from + "-" + to);
+
+              // Some hints to the browser that we want binary data.
+              if (typeof Uint8Array != 'undefined') xhr.responseType = 'arraybuffer';
+              if (xhr.overrideMimeType) {
+                xhr.overrideMimeType('text/plain; charset=x-user-defined');
+              }
+
+              xhr.send(null);
+              if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
+              if (xhr.response !== undefined) {
+                return new Uint8Array(xhr.response || []);
+              } else {
+                return intArrayFromString(xhr.responseText || '', true);
+              }
+            });
+            var lazyArray = this;
+            lazyArray.setDataGetter(function(chunkNum) {
+              var start = chunkNum * chunkSize;
+              var end = (chunkNum+1) * chunkSize - 1; // including this byte
+              end = Math.min(end, datalength-1); // if datalength-1 is selected, this is the last block
+              if (typeof(lazyArray.chunks[chunkNum]) === "undefined") {
+                lazyArray.chunks[chunkNum] = doXHR(start, end);
+              }
+              if (typeof(lazyArray.chunks[chunkNum]) === "undefined") throw new Error("doXHR failed!");
+              return lazyArray.chunks[chunkNum];
+            });
+
+            this._length = datalength;
+            this._chunkSize = chunkSize;
+            this.lengthKnown = true;
+        }
+
+        var lazyArray = new LazyUint8Array();
+        Object.defineProperty(lazyArray, "length", {
+            get: function() {
+                if(!this.lengthKnown) {
+                    this.cacheLength();
+                }
+                return this._length;
+            }
+        });
+        Object.defineProperty(lazyArray, "chunkSize", {
+            get: function() {
+                if(!this.lengthKnown) {
+                    this.cacheLength();
+                }
+                return this._chunkSize;
+            }
+        });
+
+        var properties = { isDevice: false, contents: lazyArray };
+      } else {
+        var properties = { isDevice: false, url: url };
+      }
+
+      var node = FS.createFile(parent, name, properties, canRead, canWrite);
+      // This is a total hack, but I want to get this lazy file code out of the
+      // core of MEMFS. If we want to keep this lazy file concept I feel it should
+      // be its own thin LAZYFS proxying calls to MEMFS.
+      if (properties.contents) {
+        node.contents = properties.contents;
+      } else if (properties.url) {
+        node.contents = null;
+        node.url = properties.url;
+      }
+      // override each stream op with one that tries to force load the lazy file first
+      var stream_ops = {};
+      var keys = Object.keys(node.stream_ops);
+      keys.forEach(function(key) {
+        var fn = node.stream_ops[key];
+        stream_ops[key] = function forceLoadLazyFile() {
+          if (!FS.forceLoadFile(node)) {
+            throw new FS.ErrnoError(ERRNO_CODES.EIO);
+          }
+          return fn.apply(null, arguments);
+        };
+      });
+      // use a custom read function
+      stream_ops.read = function stream_ops_read(stream, buffer, offset, length, position) {
+        if (!FS.forceLoadFile(node)) {
+          throw new FS.ErrnoError(ERRNO_CODES.EIO);
+        }
+        var contents = stream.node.contents;
+        if (position >= contents.length)
+          return 0;
+        var size = Math.min(contents.length - position, length);
+        assert(size >= 0);
+        if (contents.slice) { // normal array
+          for (var i = 0; i < size; i++) {
+            buffer[offset + i] = contents[position + i];
+          }
+        } else {
+          for (var i = 0; i < size; i++) { // LazyUint8Array from sync binary XHR
+            buffer[offset + i] = contents.get(position + i);
+          }
+        }
+        return size;
+      };
+      node.stream_ops = stream_ops;
+      return node;
+    },
+    // Preloads a file asynchronously. You can call this before run, for example in
+    // preRun. run will be delayed until this file arrives and is set up.
+    // If you call it after run(), you may want to pause the main loop until it
+    // completes, if so, you can use the onload parameter to be notified when
+    // that happens.
+    // In addition to normally creating the file, we also asynchronously preload
+    // the browser-friendly versions of it: For an image, we preload an Image
+    // element and for an audio, and Audio. These are necessary for SDL_Image
+    // and _Mixer to find the files in preloadedImages/Audios.
+    // You can also call this with a typed array instead of a url. It will then
+    // do preloading for the Image/Audio part, as if the typed array were the
+    // result of an XHR that you did manually.
+    createPreloadedFile: function(parent, name, url, canRead, canWrite, onload, onerror, dontCreateFile, canOwn) {
+      Browser.init();
+      // TODO we should allow people to just pass in a complete filename instead
+      // of parent and name being that we just join them anyways
+      var fullname = name ? PATH.resolve(PATH.join2(parent, name)) : parent;
+      function processData(byteArray) {
+        function finish(byteArray) {
+          if (!dontCreateFile) {
+            FS.createDataFile(parent, name, byteArray, canRead, canWrite, canOwn);
+          }
+          if (onload) onload();
+          removeRunDependency('cp ' + fullname);
+        }
+        var handled = false;
+        Module['preloadPlugins'].forEach(function(plugin) {
+          if (handled) return;
+          if (plugin['canHandle'](fullname)) {
+            plugin['handle'](byteArray, fullname, finish, function() {
+              if (onerror) onerror();
+              removeRunDependency('cp ' + fullname);
+            });
+            handled = true;
+          }
+        });
+        if (!handled) finish(byteArray);
+      }
+      addRunDependency('cp ' + fullname);
+      if (typeof url == 'string') {
+        Browser.asyncLoad(url, function(byteArray) {
+          processData(byteArray);
+        }, onerror);
+      } else {
+        processData(url);
+      }
+    },
+
+    //
+    // persistence
+    //
+    indexedDB: function() {
+      return window.indexedDB || window.mozIndexedDB || window.webkitIndexedDB || window.msIndexedDB;
+    },
+
+    DB_NAME: function() {
+      return 'EM_FS_' + window.location.pathname;
+    },
+    DB_VERSION: 20,
+    DB_STORE_NAME: 'FILE_DATA',
+
+    // asynchronously saves a list of files to an IndexedDB. The DB will be created if not already existing.
+    saveFilesToDB: function(paths, onload, onerror) {
+      onload = onload || function(){};
+      onerror = onerror || function(){};
+      var indexedDB = FS.indexedDB();
+      try {
+        var openRequest = indexedDB.open(FS.DB_NAME(), FS.DB_VERSION);
+      } catch (e) {
+        return onerror(e);
+      }
+      openRequest.onupgradeneeded = function openRequest_onupgradeneeded() {
+        console.log('creating db');
+        var db = openRequest.result;
+        db.createObjectStore(FS.DB_STORE_NAME);
+      };
+      openRequest.onsuccess = function openRequest_onsuccess() {
+        var db = openRequest.result;
+        var transaction = db.transaction([FS.DB_STORE_NAME], 'readwrite');
+        var files = transaction.objectStore(FS.DB_STORE_NAME);
+        var ok = 0, fail = 0, total = paths.length;
+        function finish() {
+          if (fail == 0) onload(); else onerror();
+        }
+        paths.forEach(function(path) {
+          var putRequest = files.put(FS.analyzePath(path).object.contents, path);
+          putRequest.onsuccess = function putRequest_onsuccess() { ok++; if (ok + fail == total) finish() };
+          putRequest.onerror = function putRequest_onerror() { fail++; if (ok + fail == total) finish() };
+        });
+        transaction.onerror = onerror;
+      };
+      openRequest.onerror = onerror;
+    },
+
+    // asychronously loads a file from IndexedDB.
+    loadFilesFromDB: function(paths, onload, onerror) {
+      onload = onload || function(){};
+      onerror = onerror || function(){};
+      var indexedDB = FS.indexedDB();
+      try {
+        var openRequest = indexedDB.open(FS.DB_NAME(), FS.DB_VERSION);
+      } catch (e) {
+        return onerror(e);
+      }
+      openRequest.onupgradeneeded = onerror; // no database to load from
+      openRequest.onsuccess = function openRequest_onsuccess() {
+        var db = openRequest.result;
+        try {
+          var transaction = db.transaction([FS.DB_STORE_NAME], 'readonly');
+        } catch(e) {
+          onerror(e);
+          return;
+        }
+        var files = transaction.objectStore(FS.DB_STORE_NAME);
+        var ok = 0, fail = 0, total = paths.length;
+        function finish() {
+          if (fail == 0) onload(); else onerror();
+        }
+        paths.forEach(function(path) {
+          var getRequest = files.get(path);
+          getRequest.onsuccess = function getRequest_onsuccess() {
+            if (FS.analyzePath(path).exists) {
+              FS.unlink(path);
+            }
+            FS.createDataFile(PATH.dirname(path), PATH.basename(path), getRequest.result, true, true, true);
+            ok++;
+            if (ok + fail == total) finish();
+          };
+          getRequest.onerror = function getRequest_onerror() { fail++; if (ok + fail == total) finish() };
+        });
+        transaction.onerror = onerror;
+      };
+      openRequest.onerror = onerror;
     }
   }
 });
+
