@@ -1200,7 +1200,7 @@ function removeRunDependency(id) {
     } 
 
     // If run has never been called, and we should call run (INVOKE_RUN is true, and Module.noInitialRun is not false)
-    if (!calledRun && !shouldRunNow) run();
+    if (!shouldRunNow) run();
 
     if (dependenciesFulfilled) {
       var callback = dependenciesFulfilled;
