@@ -11,9 +11,9 @@ def path_from_root(*pathelems):
 
 JS_OPTIMIZER = path_from_root('tools', 'js-optimizer.js')
 
-NUM_CHUNKS_PER_CORE = 1.5
-MIN_CHUNK_SIZE = int(os.environ.get('EMCC_JSOPT_MIN_CHUNK_SIZE') or 1024*1024) # configuring this is just for debugging purposes
-MAX_CHUNK_SIZE = 20*1024*1024
+NUM_CHUNKS_PER_CORE = 3
+MIN_CHUNK_SIZE = int(os.environ.get('EMCC_JSOPT_MIN_CHUNK_SIZE') or 512*1024) # configuring this is just for debugging purposes
+MAX_CHUNK_SIZE = int(os.environ.get('EMCC_JSOPT_MAX_CHUNK_SIZE') or 5*1024*1024)
 
 WINDOWS = sys.platform.startswith('win')
 
@@ -32,6 +32,7 @@ class Minifier:
   def __init__(self, js, js_engine):
     self.js = js
     self.js_engine = js_engine
+    self.symbols_file = None
 
   def minify_shell(self, shell, minify_whitespace, source_map=False):
     # Run through js-optimizer.js to find and minify the global symbols
@@ -61,6 +62,14 @@ class Minifier:
     #print >> sys.stderr, "minified SHELL 3333333333333333", output, "\n44444444444444444444"
     code, metadata = output.split('// EXTRA_INFO:')
     self.globs = json.loads(metadata)
+
+    if self.symbols_file:
+      mapfile = open(self.symbols_file, 'w')
+      for key, value in self.globs.iteritems():
+        mapfile.write(value + ':' + key + '\n')
+      mapfile.close()
+      print >> sys.stderr, 'wrote symbol map file to', self.symbols_file
+
     return code.replace('13371337', '0.0')
 
 
@@ -162,6 +171,12 @@ EMSCRIPTEN_FUNCS();
 
       # we assume there is a maximum of one new name per line
       minifier = Minifier(js, js_engine)
+      def check_symbol_mapping(p):
+        if p.startswith('symbolMap='):
+          minifier.symbols_file = p.split('=')[1]
+          return False
+        return True
+      passes = filter(check_symbol_mapping, passes)
       asm_shell_pre, asm_shell_post = minifier.minify_shell(asm_shell, 'minifyWhitespace' in passes, source_map).split('EMSCRIPTEN_FUNCS();');
       asm_shell_post = asm_shell_post.replace('});', '})');
       pre += asm_shell_pre + '\n' + start_funcs_marker
@@ -212,6 +227,7 @@ EMSCRIPTEN_FUNCS();
   chunk_size = min(MAX_CHUNK_SIZE, max(MIN_CHUNK_SIZE, total_size / intended_num_chunks))
 
   chunks = shared.chunkify(funcs, chunk_size, jcache.get_cachename('jsopt') if jcache else None)
+  if DEBUG and len(chunks) > 0: print >> sys.stderr, 'chunkification: intended size:', chunk_size, 'num funcs:', len(funcs), 'actual num chunks:', len(chunks), 'chunk size range:', max(map(len, chunks)), '-', min(map(len, chunks))
   funcs = None
 
   if jcache:

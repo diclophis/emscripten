@@ -324,10 +324,6 @@
  label = 1;
  L0:  while(1) {
   switch(label|0) {
-   case 3: {
-    // block C
-    break;
-   }
    case 1: {
     // block A
     if (check == 10) {
@@ -357,6 +353,67 @@
     }
     break;
    }
+   case 3: {
+    // block C
+    break;
+   }
   }
  }
+
+
+
+-- If chain (optimized) --
+
+ // block A
+ if (a == 10) {
+  // block B
+ }
+ // block C
+
+
+
+-- If chain (optimized) --
+
+ // block A
+ if (a == 10) {
+  // block B
+  if (b == 10) {
+   // block C
+  }
+ }
+ // block D
+
+
+
+-- If chain (optimized, long) --
+
+ // block A
+ if (a == 10) {
+  // block B
+  if (b == 10) {
+   // block C
+   if (c == 10) {
+    // block D
+   }
+  }
+ }
+ // block E
+
+
+
+-- If chain (optimized, lead to complex) --
+
+ // block A
+ if (a == 10) {
+  // block B
+  if (b == 10) {
+   while(1) {
+    // block C
+    if (!(loop)) {
+     break;
+    }
+   }
+  }
+ }
+ // block D
 

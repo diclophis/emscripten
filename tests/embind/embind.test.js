@@ -55,7 +55,7 @@ module({
             });
         });
     });
-    
+
     }
 
     BaseFixture.extend("access to base class members", function() {
@@ -609,7 +609,7 @@ module({
             assert.equal("0", cm.unsigned_int_to_string(0));
             assert.equal("0", cm.long_to_string(0));
             assert.equal("0", cm.unsigned_long_to_string(0));
-            
+
             // all types should have positive values.
             assert.equal("5", cm.char_to_string(5));
             assert.equal("5", cm.signed_char_to_string(5));
@@ -650,7 +650,7 @@ module({
             assert.equal("-32768", cm.short_to_string(-32768));
             assert.equal("-2147483648", cm.int_to_string(-2147483648));
             assert.equal("-2147483648", cm.long_to_string(-2147483648));
-            
+
             // passing out of range values should fail.
             assert.throws(TypeError, function() { cm.char_to_string(-129); });
             assert.throws(TypeError, function() { cm.char_to_string(128); });
@@ -733,7 +733,7 @@ module({
 
         test("overloading of derived class member functions", function() {
             var foo = new cm.MultipleOverloadsDerived();
-            
+
             // NOTE: In C++, default lookup rules will hide overloads from base class if derived class creates them.
             // In JS, we make the base class overloads implicitly available. In C++, they would need to be explicitly
             // invoked, like foo.MultipleOverloads::Func(10);
@@ -748,7 +748,7 @@ module({
             assert.equal(foo.WhichFuncCalled(), 4);
             foo.delete();
         });
-        
+
         test("overloading of class static functions", function() {
             assert.equal(cm.MultipleOverloads.StaticFunc(10), 1);
             assert.equal(cm.MultipleOverloads.WhichStaticFuncCalled(), 1);
@@ -1408,7 +1408,7 @@ module({
             var e = assert.throws(cm.BindingError, function() {
                 cm.passThroughCustomSmartPtr(o);
             });
-            assert.equal('Cannot convert argument of type NSt3__110shared_ptrI20HeldByCustomSmartPtrEE to parameter type 14CustomSmartPtrI20HeldByCustomSmartPtrE', e.message);
+            assert.equal('Cannot convert argument of type shared_ptr<HeldByCustomSmartPtr> to parameter type CustomSmartPtr<HeldByCustomSmartPtr>', e.message);
             o.delete();
         });
 
@@ -1441,7 +1441,7 @@ module({
             test("repr includes enum value", function() {
                 assert.equal('<#Enum_ONE {}>', IMVU.repr(cm.Enum.ONE));
                 assert.equal('<#Enum_TWO {}>', IMVU.repr(cm.Enum.TWO));
-            });        
+            });
         }
 
         test("instanceof", function() {
@@ -1591,7 +1591,7 @@ module({
         test("returning a new shared pointer from interfaces implemented in JS code does not leak", function() {
             var impl = cm.AbstractClass.implement({
                 returnsSharedPtr: function() {
-                    return cm.embind_test_return_smart_derived_ptr();
+                    return cm.embind_test_return_smart_derived_ptr().deleteLater();
                 }
             });
             cm.callReturnsSharedPtrMethod(impl);
@@ -1644,8 +1644,12 @@ module({
     });
 
     if (typeof INVOKED_FROM_EMSCRIPTEN_TEST_RUNNER === "undefined") { // TODO: Enable this to work in Emscripten runner as well!
-    
+
     BaseFixture.extend("unbound types", function() {
+        if (!cm.hasUnboundTypeNames) {
+            return;
+        }
+
         function assertMessage(fn, message) {
             var e = assert.throws(cm.UnboundTypeError, fn);
             assert.equal(message, e.message);
@@ -1689,7 +1693,7 @@ module({
                 },
                 'Cannot construct HasConstructorUsingUnboundArgumentAndUnboundBase due to unbound types: 18SecondUnboundClass');
         });
-        
+
         test('class function with unbound argument', function() {
             var x = new cm.BoundClass;
             assertMessage(
@@ -1719,12 +1723,12 @@ module({
                 }, 'Cannot access BoundClass.property due to unbound types: 12UnboundClass');
             x.delete();
         });
-        
+
         // todo: tuple elements
         // todo: tuple element accessors
         // todo: struct fields
     });
-    
+
     }
 
     BaseFixture.extend("noncopyable", function() {
@@ -1743,6 +1747,10 @@ module({
 
     BaseFixture.extend("constants", function() {
         assert.equal(10, cm.INT_CONSTANT);
+
+        assert.equal(1, cm.STATIC_CONST_INTEGER_VALUE_1);
+        assert.equal(1000, cm.STATIC_CONST_INTEGER_VALUE_1000);
+
         assert.equal("some string", cm.STRING_CONSTANT);
         assert.deepEqual([1, 2, 3, 4], cm.VALUE_ARRAY_CONSTANT);
         assert.deepEqual({x:1,y:2,z:3,w:4}, cm.VALUE_OBJECT_CONSTANT);
@@ -1888,10 +1896,130 @@ module({
             sh.delete();
         });
     });
+
+    BaseFixture.extend("val::as from pointer to value", function() {
+        test("calling as on pointer with value makes a copy", function() {
+            var sh1 = new cm.StringHolder("Hello world");
+            var sh2 = cm.return_StringHolder_copy(sh1);
+            assert.equal("Hello world", sh1.get());
+            assert.equal("Hello world", sh2.get());
+            assert.false(sh1.isAliasOf(sh2));
+            sh2.delete();
+            sh1.delete();
+        });
+
+        test("calling function that returns a StringHolder", function() {
+            var sh1 = new cm.StringHolder("Hello world");
+            var sh2 = cm.call_StringHolder_func(function() {
+                return sh1;
+            });
+            assert.equal("Hello world", sh1.get());
+            assert.equal("Hello world", sh2.get());
+            assert.false(sh1.isAliasOf(sh2));
+            sh2.delete();
+            sh1.delete();
+        });
+    });
+
+    BaseFixture.extend("mixin", function() {
+        test("can call mixin method", function() {
+            var a = new cm.DerivedWithMixin();
+            assert.instanceof(a, cm.Base);
+            assert.equal(10, a.get10());
+            a.delete();
+        });
+    });
+
+    test("returning a cached new shared pointer from interfaces implemented in JS code does not leak", function() {
+        var derived = cm.embind_test_return_smart_derived_ptr();
+        var impl = cm.AbstractClass.implement({
+            returnsSharedPtr: function() {
+                return derived;
+            }
+        });
+        cm.callReturnsSharedPtrMethod(impl);
+        impl.delete();
+        derived.delete();
+        // Let the memory leak test superfixture check that no leaks occurred.
+    });
+
+    BaseFixture.extend("val::as", function() {
+        test("built-ins", function() {
+            assert.equal(true,  cm.val_as_bool(true));
+            assert.equal(false, cm.val_as_bool(false));
+            assert.equal(127,   cm.val_as_char(127));
+            assert.equal(32767, cm.val_as_short(32767));
+            assert.equal(65536, cm.val_as_int(65536));
+            assert.equal(65536, cm.val_as_long(65536));
+            assert.equal(10.5,  cm.val_as_float(10.5));
+            assert.equal(10.5,  cm.val_as_double(10.5));
+
+            assert.equal("foo", cm.val_as_string("foo"));
+            assert.equal("foo", cm.val_as_wstring("foo"));
+
+            var obj = {};
+            assert.equal(obj, cm.val_as_val(obj));
+
+            // JS->C++ memory view not implemented
+            //var ab = cm.val_as_memory_view(new ArrayBuffer(13));
+            //assert.equal(13, ab.byteLength);
+        });
+
+        test("value types", function() {
+            var tuple = [1, 2, 3, 4];
+            assert.deepEqual(tuple, cm.val_as_value_array(tuple));
+
+            var struct = {x: 1, y: 2, z: 3, w: 4};
+            assert.deepEqual(struct, cm.val_as_value_object(struct));
+        });
+
+        test("enums", function() {
+            assert.equal(cm.Enum.ONE, cm.val_as_enum(cm.Enum.ONE));
+        });
+    });
+
+    BaseFixture.extend("val::new_", function() {
+        test("variety of types", function() {
+            function factory() {
+                this.arguments = Array.prototype.slice.call(arguments, 0);
+            }
+            var instance = cm.construct_with_6_arguments(factory);
+            assert.deepEqual(
+                [6, -12.5, "a3", {x: 1, y: 2, z: 3, w: 4}, cm.EnumClass.TWO, [-1, -2, -3, -4]],
+                instance.arguments);
+        });
+
+        test("memory view", function() {
+            function factory(before, view, after) {
+                this.before = before;
+                this.view = view;
+                this.after = after;
+            }
+
+            var instance = cm.construct_with_memory_view(factory);
+            assert.equal("before", instance.before);
+            assert.equal(10, instance.view.byteLength);
+            assert.equal("after", instance.after);
+        });
+
+        test("ints_and_float", function() {
+            function factory(a, b, c) {
+                this.a = a;
+                this.b = b;
+                this.c = c;
+            }
+
+            var instance = cm.construct_with_ints_and_float(factory);
+            assert.equal(65537, instance.a);
+            assert.equal(4.0, instance.b);
+            assert.equal(65538, instance.c);
+        });
+    });
 });
 
 /* global run_all_tests */
 // If running as part of the emscripten test runner suite, and not as part of the IMVU suite,
 // we launch the test execution from here. IMVU suite uses its own dedicated mechanism instead of this.
-if (typeof run_all_tests !== "undefined")
+if (typeof run_all_tests !== "undefined") {
     run_all_tests();
+}

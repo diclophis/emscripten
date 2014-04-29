@@ -147,27 +147,25 @@ function looop3() {
  }
 }
 function looop4() {
- var i = 0, helper = 0;
+ var i = 0, i$looptemp = 0;
  while (1) {
   do_it();
-  helper = i + 1 | 0;
-  f(i, helper);
-  if (condition()) {
-   i = helper;
-  } else {
+  i$looptemp = i;
+  i = i + 1 | 0;
+  f(i$looptemp, i);
+  if (!condition()) {
    break;
   }
  }
 }
 function looop4b() {
- var i = 0, helper = 0;
+ var i = 0, i$looptemp = 0;
  while (1) {
   do_it();
-  helper = i + 1 | 0;
-  g(helper);
-  if (condition(i)) {
-   i = helper;
-  } else {
+  i$looptemp = i;
+  i = i + 1 | 0;
+  g(i);
+  if (!condition(i$looptemp)) {
    break;
   }
  }
@@ -251,24 +249,22 @@ function multiloop($n_0, $35) {
 function multiloop2($n_0, $35) {
  $n_0 = $n_0 | 0;
  $35 = $35 | 0;
- var $p_0 = 0, $39 = 0, $41 = 0, $46 = 0;
+ var $p_0 = 0, $41 = 0, $p_0$looptemp = 0;
  $n_0 = $35;
  $p_0 = (HEAP32[$15 >> 2] | 0) + ($35 << 1) | 0;
  while (1) {
-  $39 = $p_0 - 2 | 0;
-  $41 = HEAPU16[$39 >> 1] | 0;
+  $p_0$looptemp = $p_0;
+  $p_0 = $p_0 - 2 | 0;
+  $41 = HEAPU16[$p_0 >> 1] | 0;
   if ($41 >>> 0 < $2 >>> 0) {
    $_off0 = 0;
   } else {
    $_off0 = $41 - $2 & 65535;
   }
-  HEAP16[$39 >> 1] = $p_0;
-  $46 = $n_0 - 1 | 0;
-  if (($46 | 0) == 0) {
+  HEAP16[$p_0 >> 1] = $p_0$looptemp;
+  $n_0 = $n_0 - 1 | 0;
+  if (($n_0 | 0) == 0) {
    break;
-  } else {
-   $n_0 = $46;
-   $p_0 = $39;
   }
  }
 }
@@ -809,5 +805,110 @@ function cute($this, $outImage) {
   break;
  }
  return 0;
+}
+function selfAssign() {
+ var i1 = 0;
+ i1 = HEAP32[2] | 0;
+ HEAP32[2] = i1 + 1;
+ if (waka) {
+  return 0;
+ }
+ return i1 & 16384 | 0;
+}
+function elimOneLoopVar($argc, $argv) {
+ $argc = $argc | 0;
+ $argv = $argv | 0;
+ var $arg$0 = 0, $call10 = Math_fround(0), $curri$012 = 0, $inc = 0, $j$010 = 0, $ok$0 = 0, $primes$011 = 0, $retval$0 = 0, $vararg_buffer1 = 0;
+ $curri$012 = 2;
+ $primes$011 = 0;
+ while (1) {
+  $call10 = Math_fround(Math_sqrt(Math_fround(Math_fround($curri$012 | 0))));
+  L15 : do {
+   if ($call10 > Math_fround(+2)) {
+    $j$010 = 2;
+    while (1) {
+     $inc = $j$010 + 1 | 0;
+     if ((($curri$012 | 0) % ($j$010 | 0) & -1 | 0) == 0) {
+      $ok$0 = 0;
+      break L15;
+     }
+     if (Math_fround($inc | 0) < $call10) {
+      $j$010 = $inc;
+     } else {
+      $ok$0 = 1;
+      break;
+     }
+    }
+   } else {
+    $ok$0 = 1;
+   }
+  } while (0);
+  $primes$011 = $ok$0 + $primes$011 | 0;
+  if (($primes$011 | 0) >= ($arg$0 | 0)) {
+   break;
+  } else {
+   $curri$012 = $curri$012 + 1 | 0;
+  }
+ }
+ HEAP32[$vararg_buffer1 >> 2] = $curri$012;
+ return $retval$0 | 0;
+}
+function elimOneLoopVar2() {
+ var $storemerge3$neg9 = 0, $18 = 0, $25 = 0, $26 = 0, $30 = 0, $jp = 0;
+ $storemerge3$neg9 = -1;
+ while (1) {
+  $25 = $jp + ($26 << 2) | 0;
+  HEAP32[$25 >> 2] = ($18 + $storemerge3$neg9 | 0) + (HEAP32[$25 >> 2] | 0) | 0;
+  $30 = $26 + 1 | 0;
+  if (($30 | 0) == 63) {
+   break;
+  } else {
+   $storemerge3$neg9 = $26 ^ -1;
+   $26 = $30;
+  }
+ }
+}
+function elimOneLoopVar3() {
+ var $storemerge3$neg9 = 0, $18 = 0, $25 = 0, $26 = 0, $30 = 0, $jp = 0;
+ $storemerge3$neg9 = -1;
+ while (1) {
+  $25 = $jp + ($26 << 2) | 0;
+  HEAP32[$25 >> 2] = ($18 + $storemerge3$neg9 | 0) + (HEAP32[$25 >> 2] | 0) | 0;
+  $30 = $26 + 1 | 0;
+  if (($30 | 0) == 63) {
+   break;
+  } else {
+   $storemerge3$neg9 = $30 ^ -1;
+   $26 = $30;
+  }
+ }
+}
+function elimOneLoopVar4() {
+ var $storemerge3$neg9 = 0, $18 = 0, $25 = 0, $26 = 0, $jp = 0;
+ $storemerge3$neg9 = -1;
+ while (1) {
+  $25 = $jp + ($26 << 2) | 0;
+  HEAP32[$25 >> 2] = ($18 + $storemerge3$neg9 | 0) + (HEAP32[$25 >> 2] | 0) | 0;
+  $26 = $26 + 1 | 0;
+  if (($26 | 0) == 63) {
+   break;
+  } else {
+   $storemerge3$neg9 = $18 ^ -1;
+  }
+ }
+}
+function elimOneLoopVarStillUsed() {
+ var $call10 = Math_fround(0), $curri$012 = 0, $j$010 = 0, $retval$0 = 0, $j$010$looptemp = 0;
+ while (1) {
+  $j$010$looptemp = $j$010;
+  $j$010 = $j$010 + 1 | 0;
+  if ((($curri$012 | 0) % ($j$010$looptemp | 0) & -1 | 0) == 0) {
+   break;
+  }
+  if (!(Math_fround($j$010 | 0) < $call10)) {
+   break;
+  }
+ }
+ return $retval$0 | 0;
 }
 
