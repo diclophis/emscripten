@@ -11,6 +11,8 @@
 
 # After that, build the generated Makefile with the command 'make'. On Windows, you may download and use 'mingw32-make' instead.
 
+set(EMSCRIPTEN_ACTIVE true CACHE INTERNAL "Emscripten is active." FORCE)
+
 # The following variable describes the target OS we are building to.
 # Ideally, this could be 'Emscripten', but as Emscripten mimics the Linux platform, setting this to Linux will allow more of existing software to build.
 # Be sure to run Emscripten test_openjpeg if planning to change this.
