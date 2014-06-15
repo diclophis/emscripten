@@ -96,6 +96,15 @@ function unInline(name_, params) {
 }
 
 var Runtime = {
+  // When a 64 bit long is returned from a compiled function the least significant
+  // 32 bit word is passed in the return value, but the most significant 32 bit
+  // word is placed in tempRet0. This provides an accessor for that value.
+  setTempRet0: function(value) {
+    tempRet0 = value;
+  },
+  getTempRet0: function() {
+    return tempRet0;
+  },
   stackSave: function() {
     return STACKTOP;
   },
@@ -409,12 +418,16 @@ var Runtime = {
         abort('invalid EM_ASM input |' + source + '|. Please use EM_ASM(..code..) (no quotes) or EM_ASM({ ..code($0).. }, input) (to input values)');
       }
     }
+#if NO_DYNAMIC_EXECUTION == 0
     try {
       var evalled = eval('(function(' + args.join(',') + '){ ' + source + ' })'); // new Function does not allow upvars in node
     } catch(e) {
       Module.printErr('error in executing inline EM_ASM code: ' + e + ' on: \n\n' + source + '\n\nwith args |' + args + '| (make sure to use the right one out of EM_ASM, EM_ASM_ARGS, etc.)');
       throw e;
     }
+#else
+    abort('NO_DYNAMIC_EXECUTION was set, cannot eval, so EM_ASM is not functional');
+#endif
     return Runtime.asmConstCache[code] = evalled;
   },
 

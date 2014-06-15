@@ -55,27 +55,49 @@ def calculate(temp_files, in_temp, stdout, stderr):
       os.path.join('libcxx', 'new.cpp'),
     ]
     musl_files = [
+      ['ctype', [
+       'isdigit.c',
+       'isspace.c',
+       'isupper.c',
+       'tolower.c',
+      ]],
       ['internal', [
+       'intscan.c',
        'floatscan.c',
        'shgetc.c',
       ]],
       ['math', [
+       'frexp.c',
+       'frexpf.c',
+       'frexpl.c',
        'scalbn.c',
        'scalbnl.c',
+      ]],
+      ['multibyte', [
+       'wctomb.c',
+       'wcrtomb.c',
       ]],
       ['stdio', [
        '__overflow.c',
        '__toread.c',
        '__towrite.c',
        '__uflow.c',
+       'fwrite.c',
+       'snprintf.c',
+       'sprintf.c',
+       'vfprintf.c',
+       'vsnprintf.c',
+       'vsprintf.c',
       ]],
       ['stdlib', [
        'atof.c',
        'atoi.c',
        'atol.c',
        'strtod.c',
+       'strtol.c',
       ]],
       ['string', [
+       'memchr.c',
        'memcmp.c',
        'strcasecmp.c',
        'strcmp.c',
@@ -103,7 +125,22 @@ def calculate(temp_files, in_temp, stdout, stderr):
   def create_libcextra():
     logging.debug('building libcextra for cache')
     musl_files = [
+       ['compat', [
+        'strlwr.c',
+        'strtol_l.c',
+        'strupr.c'
+       ]],
        ['ctype', [
+        'isalnum.c',
+        'isalpha.c',
+        'isascii.c',
+        'isblank.c',
+        'iscntrl.c',
+        'isgraph.c',
+        'islower.c',
+        'isprint.c',
+        'ispunct.c',
+        'isxdigit.c',
         'iswalnum.c',
         'iswalpha.c',
         'iswblank.c',
@@ -117,19 +154,30 @@ def calculate(temp_files, in_temp, stdout, stderr):
         'iswspace.c',
         'iswupper.c',
         'iswxdigit.c',
+        'toascii.c',
+        'toupper.c',
         'towctrans.c',
         'wcswidth.c',
         'wctrans.c',
         'wcwidth.c',
-       ]],
-       ['internal', [
-        'intscan.c',
        ]],
        ['legacy', [
         'err.c',
        ]],
        ['locale', [
         'iconv.c',
+        'isalnum_l.c',
+        'isalpha_l.c',
+        'isblank_l.c',
+        'iscntrl_l.c',
+        'isdigit_l.c',
+        'isgraph_l.c',
+        'islower_l.c',
+        'isprint_l.c',
+        'ispunct_l.c',
+        'isspace_l.c',
+        'isupper_l.c',
+        'isxdigit_l.c',
         'iswalnum_l.c',
         'iswalpha_l.c',
         'iswblank_l.c',
@@ -148,6 +196,8 @@ def calculate(temp_files, in_temp, stdout, stderr):
         'strfmon.c',
         'strncasecmp_l.c',
         'strxfrm.c',
+        'tolower_l.c',
+        'toupper_l.c',
         'towctrans_l.c',
         'towlower_l.c',
         'towupper_l.c',
@@ -198,12 +248,10 @@ def calculate(temp_files, in_temp, stdout, stderr):
         'mbsrtowcs.c',
         'mbstowcs.c',
         'mbtowc.c',
-        'wcrtomb.c',
         'wcsnrtombs.c',
         'wcsrtombs.c',
         'wcstombs.c',
         'wctob.c',
-        'wctomb.c',
        ]],
        ['regex', [
         'fnmatch.c',
@@ -213,6 +261,8 @@ def calculate(temp_files, in_temp, stdout, stderr):
         'tre-mem.c',
        ]],
        ['stdio', [
+        '__string_read.c',
+        'asprintf.c',
         'fwprintf.c',
         'swprintf.c',
         'vfwprintf.c',
@@ -221,6 +271,10 @@ def calculate(temp_files, in_temp, stdout, stderr):
         'wprintf.c',
         'fputwc.c',
         'fputws.c',
+        'sscanf.c',
+        'vasprintf.c',
+        'vfscanf.c',
+        'vsscanf.c',
        ]],
        ['stdlib', [
          'atoll.c',
@@ -240,7 +294,6 @@ def calculate(temp_files, in_temp, stdout, stderr):
          'memccpy.c',
          'memmem.c',
          'mempcpy.c',
-         'memchr.c',
          'memrchr.c',
          'rindex.c',
          'stpcpy.c',
@@ -374,12 +427,18 @@ def calculate(temp_files, in_temp, stdout, stderr):
   # TODO: Move all __deps from src/library*.js to deps_info.json, and use that single source of info
   #       both here and in the JS compiler.
   deps_info = json.loads(open(shared.path_from_root('src', 'deps_info.json')).read())
+  added = set()
   def add_back_deps(need):
+    more = False
     for ident, deps in deps_info.iteritems():
-      if ident in need.undefs:
+      if ident in need.undefs and not ident in added:
+        added.add(ident)
+        more = True
         for dep in deps:
           need.undefs.add(dep)
           shared.Settings.EXPORTED_FUNCTIONS.append('_' + dep)
+    if more:
+      add_back_deps(need) # recurse to get deps of deps
   for symbols in symbolses:
     add_back_deps(symbols)
 

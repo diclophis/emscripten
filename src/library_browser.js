@@ -322,11 +322,6 @@ mergeInto(LibraryManager.library, {
 #endif
         // Set the background of the WebGL canvas to black
         canvas.style.backgroundColor = "black";
-
-        // Warn on context loss
-        canvas.addEventListener('webglcontextlost', function(event) {
-          alert('WebGL context lost. You will need to reload the page.');
-        }, false);
       }
       if (setInModule) {
         GLctx = Module.ctx = ctx;
@@ -430,11 +425,13 @@ mergeInto(LibraryManager.library, {
       });
     },
     safeSetTimeout: function(func, timeout) {
+      Module['noExitRuntime'] = true;
       return setTimeout(function() {
         if (!ABORT) func();
       }, timeout);
     },
     safeSetInterval: function(func, timeout) {
+      Module['noExitRuntime'] = true;
       return setInterval(function() {
         if (!ABORT) func();
       }, timeout);
@@ -476,7 +473,21 @@ mergeInto(LibraryManager.library, {
     },
 
     getMouseWheelDelta: function(event) {
-      return Math.max(-1, Math.min(1, event.type === 'DOMMouseScroll' ? event.detail : -event.wheelDelta));
+      var delta = 0;
+      switch (event.type) {
+        case 'DOMMouseScroll': 
+          delta = event.detail;
+          break;
+        case 'mousewheel': 
+          delta = -event.wheelDelta;
+          break;
+        case 'wheel': 
+          delta = event.deltaY;
+          break;
+        default:
+          throw 'unrecognized mouse wheel event: ' + event.type;
+      }
+      return Math.max(-1, Math.min(1, delta));
     },
 
     mouseX: 0,
@@ -686,15 +697,22 @@ mergeInto(LibraryManager.library, {
   emscripten_async_wget: function(url, file, onload, onerror) {
     var _url = Pointer_stringify(url);
     var _file = Pointer_stringify(file);
+    function doCallback(callback) {
+      if (callback) {
+        var stack = Runtime.stackSave();
+        Runtime.dynCall('vi', callback, [allocate(intArrayFromString(_file), 'i8', ALLOC_STACK)]);
+        Runtime.stackRestore(stack);
+      }
+    }
     FS.createPreloadedFile(
       PATH.dirname(_file),
       PATH.basename(_file),
       _url, true, true,
       function() {
-        if (onload) Runtime.dynCall('vi', onload, [file]);
+        doCallback(onload);
       },
       function() {
-        if (onerror) Runtime.dynCall('vi', onerror, [file]);
+        doCallback(onerror);
       }
     );
   },
@@ -725,7 +743,11 @@ mergeInto(LibraryManager.library, {
     http.onload = function http_onload(e) {
       if (http.status == 200) {
         FS.createDataFile( _file.substr(0, index), _file.substr(index + 1), new Uint8Array(http.response), true, true);
-        if (onload) Runtime.dynCall('vii', onload, [arg, file]);
+        if (onload) {
+          var stack = Runtime.stackSave();
+          Runtime.dynCall('vii', onload, [arg, allocate(intArrayFromString(_file), 'i8', ALLOC_STACK)]);
+          Runtime.stackRestore(stack);
+        }
       } else {
         if (onerror) Runtime.dynCall('vii', onerror, [arg, http.status]);
       }
@@ -738,8 +760,8 @@ mergeInto(LibraryManager.library, {
 
     // PROGRESS
     http.onprogress = function http_onprogress(e) {
-      if (e.lengthComputable || (e.lengthComputable === undefined && e.totalSize != 0)) {
-        var percentComplete = (e.position / e.totalSize)*100;
+      if (e.lengthComputable || (e.lengthComputable === undefined && e.total != 0)) {
+        var percentComplete = (e.loaded / e.total)*100;
         if (onprogress) Runtime.dynCall('vii', onprogress, [arg, percentComplete]);
       }
     };
@@ -886,6 +908,8 @@ mergeInto(LibraryManager.library, {
 
   emscripten_set_main_loop: function(func, fps, simulateInfiniteLoop, arg) {
     Module['noExitRuntime'] = true;
+
+    assert(!Browser.mainLoop.scheduler, 'there can only be one main loop function at once: call emscripten_cancel_main_loop to cancel the previous one, if you want to');
 
     Browser.mainLoop.runner = function Browser_mainLoop_runner() {
       if (ABORT) return;
@@ -1151,6 +1175,39 @@ mergeInto(LibraryManager.library, {
     var info = Browser.workers[id];
     if (!info) return -1;
     return info.awaited;
+  },
+
+  emscripten_get_preloaded_image_data: function(path, w, h) {
+    if (typeof path === "number") {
+      path = Pointer_stringify(path);
+    }
+
+    path = PATH.resolve(path);
+
+    var canvas = Module["preloadedImages"][path];
+    if (canvas) {
+      var ctx = canvas.getContext("2d");
+      var image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      var buf = _malloc(canvas.width * canvas.height * 4);
+
+      HEAPU8.set(image.data, buf);
+
+      {{{ makeSetValue('w', '0', 'canvas.width', 'i32') }}};
+      {{{ makeSetValue('h', '0', 'canvas.height', 'i32') }}};
+      return buf;
+    }
+
+    return 0;
+  },
+
+  emscripten_get_preloaded_image_data_from_FILE__deps: ['emscripten_get_preloaded_image_data'],
+  emscripten_get_preloaded_image_data_from_FILE: function(file, w, h) {
+    var stream = FS.getStreamFromPtr(file);
+    if (stream) {
+      return _emscripten_get_preloaded_image_data(stream.path, w, h);
+    }
+
+    return 0;
   }
 });
 

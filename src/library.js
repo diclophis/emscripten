@@ -762,12 +762,18 @@ LibraryManager.library = {
     // http://pubs.opengroup.org/onlinepubs/000095399/functions/crypt.html
     // TODO: Implement (probably compile from C).
     ___setErrNo(ERRNO_CODES.ENOSYS);
+#if ASSERTIONS
+    Runtime.warnOnce('crypt() returning an error as we do not support it');
+#endif
     return 0;
   },
   encrypt: function(block, edflag) {
     // void encrypt(char block[64], int edflag);
     // http://pubs.opengroup.org/onlinepubs/000095399/functions/encrypt.html
     // TODO: Implement (probably compile from C).
+#if ASSERTIONS
+    Runtime.warnOnce('encrypt() returning an error as we do not support it');
+#endif
     ___setErrNo(ERRNO_CODES.ENOSYS);
   },
   fpathconf__deps: ['__setErrNo', '$ERRNO_CODES'],
@@ -940,6 +946,9 @@ LibraryManager.library = {
     // It is possible to implement this using two device streams, but pipes make
     // little sense in a single-threaded environment, so we do not support them.
     ___setErrNo(ERRNO_CODES.ENOSYS);
+#if ASSERTIONS
+    Runtime.warnOnce('pipe() returning an error as we do not support them');
+#endif
     return -1;
   },
   pread__deps: ['$FS', '__setErrNo', '$ERRNO_CODES'],
@@ -1584,7 +1593,6 @@ LibraryManager.library = {
     return /^[+-]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?/.exec(text);
   },
 
-  // TODO: Document.
   _scanString__deps: ['_getFloat'],
   _scanString: function(format, get, unget, varargs) {
     if (!__scanString.whiteSpace) {
@@ -1726,6 +1734,7 @@ LibraryManager.library = {
         }
         var long_ = false;
         var half = false;
+        var quarter = false;
         var longLong = false;
         if (format[formatIndex] == 'l') {
           long_ = true;
@@ -1737,6 +1746,10 @@ LibraryManager.library = {
         } else if (format[formatIndex] == 'h') {
           half = true;
           formatIndex++;
+          if (format[formatIndex] == 'h') {
+            quarter = true;
+            formatIndex++;
+          }
         }
         var type = format[formatIndex];
         formatIndex++;
@@ -1795,19 +1808,20 @@ LibraryManager.library = {
         var text = buffer.join('');
         var argPtr = {{{ makeGetValue('varargs', 'argIndex', 'void*') }}};
         argIndex += Runtime.getAlignSize('void*', null, true);
+        var base = 10;
         switch (type) {
+          case 'X': case 'x':
+            base = 16;
           case 'd': case 'u': case 'i':
-            if (half) {
-              {{{ makeSetValue('argPtr', 0, 'parseInt(text, 10)', 'i16') }}};
+            if (quarter) {
+              {{{ makeSetValue('argPtr', 0, 'parseInt(text, base)', 'i8') }}};
+            } else if (half) {
+              {{{ makeSetValue('argPtr', 0, 'parseInt(text, base)', 'i16') }}};
             } else if (longLong) {
-              {{{ makeSetValue('argPtr', 0, 'parseInt(text, 10)', 'i64') }}};
+              {{{ makeSetValue('argPtr', 0, 'parseInt(text, base)', 'i64') }}};
             } else {
-              {{{ makeSetValue('argPtr', 0, 'parseInt(text, 10)', 'i32') }}};
+              {{{ makeSetValue('argPtr', 0, 'parseInt(text, base)', 'i32') }}};
             }
-            break;
-          case 'X':
-          case 'x':
-            {{{ makeSetValue('argPtr', 0, 'parseInt(text, 16)', 'i32') }}};
             break;
           case 'F':
           case 'f':
@@ -2788,34 +2802,6 @@ LibraryManager.library = {
     var stdin = {{{ makeGetValue(makeGlobalUse('_stdin'), '0', 'void*') }}};
     return _fscanf(stdin, format, varargs);
   },
-  sscanf__deps: ['_scanString'],
-  sscanf: function(s, format, varargs) {
-    // int sscanf(const char *restrict s, const char *restrict format, ... );
-    // http://pubs.opengroup.org/onlinepubs/000095399/functions/scanf.html
-    var index = 0;
-    function get() { return {{{ makeGetValue('s', 'index++', 'i8') }}}; };
-    function unget() { index--; };
-    return __scanString(format, get, unget, varargs);
-  },
-  snprintf__deps: ['_formatString', 'malloc'],
-  snprintf: function(s, n, format, varargs) {
-    // int snprintf(char *restrict s, size_t n, const char *restrict format, ...);
-    // http://pubs.opengroup.org/onlinepubs/000095399/functions/printf.html
-    var result = __formatString(format, varargs);
-    var limit = (n === undefined) ? result.length
-                                  : Math.min(result.length, Math.max(n - 1, 0));
-    if (s < 0) {
-      s = -s;
-      var buf = _malloc(limit+1);
-      {{{ makeSetValue('s', '0', 'buf', 'i8*') }}};
-      s = buf;
-    }
-    for (var i = 0; i < limit; i++) {
-      {{{ makeSetValue('s', 'i', 'result[i]', 'i8') }}};
-    }
-    if (limit < n || (n === undefined)) {{{ makeSetValue('s', 'i', '0', 'i8') }}};
-    return result.length;
-  },
   fprintf__deps: ['fwrite', '_formatString'],
   fprintf: function(stream, format, varargs) {
     // int fprintf(FILE *restrict stream, const char *restrict format, ...);
@@ -2833,16 +2819,6 @@ LibraryManager.library = {
     var stdout = {{{ makeGetValue(makeGlobalUse('_stdout'), '0', 'void*') }}};
     return _fprintf(stdout, format, varargs);
   },
-  sprintf__deps: ['snprintf'],
-  sprintf: function(s, format, varargs) {
-    // int sprintf(char *restrict s, const char *restrict format, ...);
-    // http://pubs.opengroup.org/onlinepubs/000095399/functions/printf.html
-    return _snprintf(s, undefined, format, varargs);
-  },
-  asprintf__deps: ['sprintf'],
-  asprintf: function(s, format, varargs) {
-    return _sprintf(-s, format, varargs);
-  },
   dprintf__deps: ['_formatString', 'write'],
   dprintf: function(fd, format, varargs) {
     var result = __formatString(format, varargs);
@@ -2854,14 +2830,10 @@ LibraryManager.library = {
 #if TARGET_X86
   // va_arg is just like our varargs
   vfprintf: 'fprintf',
-  vsnprintf: 'snprintf',
   vprintf: 'printf',
-  vsprintf: 'sprintf',
-  vasprintf: 'asprintf',
   vdprintf: 'dprintf',
   vscanf: 'scanf',
   vfscanf: 'fscanf',
-  vsscanf: 'sscanf',
 #endif
 
 #if TARGET_ASMJS_UNKNOWN_EMSCRIPTEN
@@ -2870,21 +2842,9 @@ LibraryManager.library = {
   vfprintf: function(s, f, va_arg) {
     return _fprintf(s, f, {{{ makeGetValue('va_arg', 0, '*') }}});
   },
-  vsnprintf__deps: ['snprintf'],
-  vsnprintf: function(s, n, format, va_arg) {
-    return _snprintf(s, n, format, {{{ makeGetValue('va_arg', 0, '*') }}});
-  },
   vprintf__deps: ['printf'],
   vprintf: function(format, va_arg) {
     return _printf(format, {{{ makeGetValue('va_arg', 0, '*') }}});
-  },
-  vsprintf__deps: ['sprintf'],
-  vsprintf: function(s, format, va_arg) {
-    return _sprintf(s, format, {{{ makeGetValue('va_arg', 0, '*') }}});
-  },
-  vasprintf__deps: ['asprintf'],
-  vasprintf: function(s, format, va_arg) {
-    return _asprintf(s, format, {{{ makeGetValue('va_arg', 0, '*') }}});
   },
   vdprintf__deps: ['dprintf'],
   vdprintf: function (fd, format, va_arg) {
@@ -2897,10 +2857,6 @@ LibraryManager.library = {
   vfscanf__deps: ['fscanf'],
   vfscanf: function(s, format, va_arg) {
     return _fscanf(s, format, {{{ makeGetValue('va_arg', 0, '*') }}});
-  },
-  vsscanf__deps: ['sscanf'],
-  vsscanf: function(s, format, va_arg) {
-    return _sscanf(s, format, {{{ makeGetValue('va_arg', 0, '*') }}});
   },
 #endif
 
@@ -3208,42 +3164,9 @@ LibraryManager.library = {
     {{{ makeStructuralReturn([makeGetTempDouble(0, 'i32'), makeGetTempDouble(1, 'i32')]) }}};
   },
 #endif
-  strtoll__deps: ['_parseInt64'],
-  strtoll: function(str, endptr, base) {
-    return __parseInt64(str, endptr, base, '-9223372036854775808', '9223372036854775807');  // LLONG_MIN, LLONG_MAX.
-  },
-  strtoll_l__deps: ['strtoll'],
-  strtoll_l: function(str, endptr, base) {
-    return _strtoll(str, endptr, base); // no locale support yet
-  },
-  strtol__deps: ['_parseInt'],
-  strtol: function(str, endptr, base) {
-    return __parseInt(str, endptr, base, -2147483648, 2147483647, 32);  // LONG_MIN, LONG_MAX.
-  },
-  strtol_l__deps: ['strtol'],
-  strtol_l: function(str, endptr, base) {
-    return _strtol(str, endptr, base); // no locale support yet
-  },
-  strtoul__deps: ['_parseInt'],
-  strtoul: function(str, endptr, base) {
-    return __parseInt(str, endptr, base, 0, 4294967295, 32, true);  // ULONG_MAX.
-  },
-  strtoul_l__deps: ['strtoul'],
-  strtoul_l: function(str, endptr, base) {
-    return _strtoul(str, endptr, base); // no locale support yet
-  },
-  strtoull__deps: ['_parseInt64'],
-  strtoull: function(str, endptr, base) {
-    return __parseInt64(str, endptr, base, 0, '18446744073709551615', true);  // ULONG_MAX.
-  },
-  strtoull_l__deps: ['strtoull'],
-  strtoull_l: function(str, endptr, base) {
-    return _strtoull(str, endptr, base); // no locale support yet
-  },
-
   environ: 'allocate(1, "i32*", ALLOC_STATIC)',
   __environ__deps: ['environ'],
-  __environ: '_environ',
+  __environ: 'environ',
   __buildEnvironment__deps: ['__environ'],
   __buildEnvironment: function(env) {
     // WARNING: Arbitrary limit!
@@ -3430,6 +3353,7 @@ LibraryManager.library = {
       return 0;
     } else {
       var size = Math.min(4095, absolute.path.length);  // PATH_MAX - 1.
+      if (resolved_name === 0) resolved_name = _malloc(size+1);
       for (var i = 0; i < size; i++) {
         {{{ makeSetValue('resolved_name', 'i', 'absolute.path.charCodeAt(i)', 'i8') }}};
       }
@@ -3464,9 +3388,20 @@ LibraryManager.library = {
   memcpy__sig: 'iiii',
   memcpy__deps: ['emscripten_memcpy_big'],
   memcpy: function(dest, src, num) {
+#if USE_TYPED_ARRAYS == 0
+    {{{ makeCopyValues('dest', 'src', 'num', 'null') }}};
+    return num;
+#endif
+#if USE_TYPED_ARRAYS == 1
+    {{{ makeCopyValues('dest', 'src', 'num', 'null') }}};
+    return num;
+#endif
+
     dest = dest|0; src = src|0; num = num|0;
     var ret = 0;
+#if USE_TYPED_ARRAYS
     if ((num|0) >= 4096) return _emscripten_memcpy_big(dest|0, src|0, num|0)|0;
+#endif
     ret = dest|0;
     if ((dest&3) == (src&3)) {
       while (dest & 3) {
@@ -3605,28 +3540,6 @@ LibraryManager.library = {
     return pdest|0;
   },
 
-  strlwr__deps:['tolower'],
-  strlwr: function(pstr){
-    var i = 0;
-    while(1) {
-      var x = {{{ makeGetValue('pstr', 'i', 'i8') }}};
-      if (x == 0) break;
-      {{{ makeSetValue('pstr', 'i', '_tolower(x)', 'i8') }}};
-      i++;
-    }
-  },
-
-  strupr__deps:['toupper'],
-  strupr: function(pstr){
-    var i = 0;
-    while(1) {
-      var x = {{{ makeGetValue('pstr', 'i', 'i8') }}};
-      if (x == 0) break;
-      {{{ makeSetValue('pstr', 'i', '_toupper(x)', 'i8') }}};
-      i++;
-    }
-  },
-
   strcat__asm: true,
   strcat__sig: 'iii',
   strcat__deps: ['strlen'],
@@ -3667,132 +3580,6 @@ LibraryManager.library = {
   // ctype.h
   // ==========================================================================
 
-  isascii: function(chr) {
-    return chr >= 0 && (chr & 0x80) == 0;
-  },
-  toascii: function(chr) {
-    return chr & 0x7F;
-  },
-  toupper: function(chr) {
-    if (chr >= {{{ charCode('a') }}} && chr <= {{{ charCode('z') }}}) {
-      return chr - {{{ charCode('a') }}} + {{{ charCode('A') }}};
-    } else {
-      return chr;
-    }
-  },
-  _toupper: 'toupper',
-  toupper_l__deps: ['toupper'],
-  toupper_l: function(str, endptr, base) {
-    return _toupper(str, endptr, base); // no locale support yet
-  },
-
-  tolower__asm: true,
-  tolower__sig: 'ii',
-  tolower: function(chr) {
-    chr = chr|0;
-    if ((chr|0) < {{{ charCode('A') }}}) return chr|0;
-    if ((chr|0) > {{{ charCode('Z') }}}) return chr|0;
-    return (chr - {{{ charCode('A') }}} + {{{ charCode('a') }}})|0;
-  },
-  _tolower: 'tolower',
-  tolower_l__deps: ['tolower'],
-  tolower_l: function(chr) {
-    return _tolower(chr); // no locale support yet
-  },
-
-  // The following functions are defined as macros in glibc.
-  islower: function(chr) {
-    return chr >= {{{ charCode('a') }}} && chr <= {{{ charCode('z') }}};
-  },
-  islower_l__deps: ['islower'],
-  islower_l: function(chr) {
-    return _islower(chr); // no locale support yet
-  },
-  isupper: function(chr) {
-    return chr >= {{{ charCode('A') }}} && chr <= {{{ charCode('Z') }}};
-  },
-  isupper_l__deps: ['isupper'],
-  isupper_l: function(chr) {
-    return _isupper(chr); // no locale support yet
-  },
-  isalpha: function(chr) {
-    return (chr >= {{{ charCode('a') }}} && chr <= {{{ charCode('z') }}}) ||
-           (chr >= {{{ charCode('A') }}} && chr <= {{{ charCode('Z') }}});
-  },
-  isalpha_l__deps: ['isalpha'],
-  isalpha_l: function(chr) {
-    return _isalpha(chr); // no locale support yet
-  },
-  isdigit: function(chr) {
-    return chr >= {{{ charCode('0') }}} && chr <= {{{ charCode('9') }}};
-  },
-  isdigit_l__deps: ['isdigit'],
-  isdigit_l: function(chr) {
-    return _isdigit(chr); // no locale support yet
-  },
-  isxdigit: function(chr) {
-    return (chr >= {{{ charCode('0') }}} && chr <= {{{ charCode('9') }}}) ||
-           (chr >= {{{ charCode('a') }}} && chr <= {{{ charCode('f') }}}) ||
-           (chr >= {{{ charCode('A') }}} && chr <= {{{ charCode('F') }}});
-  },
-  isxdigit_l__deps: ['isxdigit'],
-  isxdigit_l: function(chr) {
-    return _isxdigit(chr); // no locale support yet
-  },
-  isalnum: function(chr) {
-    return (chr >= {{{ charCode('0') }}} && chr <= {{{ charCode('9') }}}) ||
-           (chr >= {{{ charCode('a') }}} && chr <= {{{ charCode('z') }}}) ||
-           (chr >= {{{ charCode('A') }}} && chr <= {{{ charCode('Z') }}});
-  },
-  isalnum_l__deps: ['isalnum'],
-  isalnum_l: function(chr) {
-    return _isalnum(chr); // no locale support yet
-  },
-  ispunct: function(chr) {
-    return (chr >= {{{ charCode('!') }}} && chr <= {{{ charCode('/') }}}) ||
-           (chr >= {{{ charCode(':') }}} && chr <= {{{ charCode('@') }}}) ||
-           (chr >= {{{ charCode('[') }}} && chr <= {{{ charCode('`') }}}) ||
-           (chr >= {{{ charCode('{') }}} && chr <= {{{ charCode('~') }}});
-  },
-  ispunct_l__deps: ['ispunct'],
-  ispunct_l: function(chr) {
-    return _ispunct(chr); // no locale support yet
-  },
-  isspace: function(chr) {
-    return (chr == 32) || (chr >= 9 && chr <= 13);
-  },
-  isspace_l__deps: ['isspace'],
-  isspace_l: function(chr) {
-    return _isspace(chr); // no locale support yet
-  },
-  isblank: function(chr) {
-    return chr == {{{ charCode(' ') }}} || chr == {{{ charCode('\t') }}};
-  },
-  isblank_l__deps: ['isblank'],
-  isblank_l: function(chr) {
-    return _isblank(chr); // no locale support yet
-  },
-  iscntrl: function(chr) {
-    return (0 <= chr && chr <= 0x1F) || chr === 0x7F;
-  },
-  iscntrl_l__deps: ['iscntrl'],
-  iscntrl_l: function(chr) {
-    return _iscntrl(chr); // no locale support yet
-  },
-  isprint: function(chr) {
-    return 0x1F < chr && chr < 0x7F;
-  },
-  isprint_l__deps: ['isprint'],
-  isprint_l: function(chr) {
-    return _isprint(chr); // no locale support yet
-  },
-  isgraph: function(chr) {
-    return 0x20 < chr && chr < 0x7F;
-  },
-  isgraph_l__deps: ['isgraph'],
-  isgraph_l: function(chr) {
-    return _isgraph(chr); // no locale support yet
-  },
   // Lookup tables for glibc ctype implementation.
   __ctype_b_loc__deps: ['malloc'],
   __ctype_b_loc: function() {
@@ -4676,23 +4463,6 @@ LibraryManager.library = {
     {{{ makeSetValue('intpart', 0, 'Math.floor(x)', 'float') }}};
     return x - {{{ makeGetValue('intpart', 0, 'float') }}};
   },
-  frexp: function(x, exp_addr) {
-    var sig = 0, exp_ = 0;
-    if (x !== 0) {
-      var sign = 1;
-      if (x < 0) {
-        x = -x;
-        sign = -1;
-      }
-      var raw_exp = Math.log(x)/Math.log(2);
-      exp_ = Math.ceil(raw_exp);
-      if (exp_ === raw_exp) exp_ += 1;
-      sig = sign*x/Math.pow(2, exp_);
-    }
-    {{{ makeSetValue('exp_addr', 0, 'exp_', 'i32') }}};
-    return sig;
-  },
-  frexpf: 'frexp',
   finite: function(x) {
     return isFinite(x);
   },
@@ -5777,7 +5547,7 @@ LibraryManager.library = {
       pattern = pattern.replace(new RegExp('\\%'+pattern[i+1], 'g'), '');
     }
 
-    var matches = new RegExp('^'+pattern).exec(Pointer_stringify(buf))
+    var matches = new RegExp('^'+pattern, "i").exec(Pointer_stringify(buf))
     // Module['print'](Pointer_stringify(buf)+ ' is matched by '+((new RegExp('^'+pattern)).source)+' into: '+JSON.stringify(matches));
 
     function initDate() {
@@ -6090,15 +5860,15 @@ LibraryManager.library = {
     var i = 0;
     setjmpId = (setjmpId+1)|0;
     {{{ makeSetValueAsm('env', '0', 'setjmpId', 'i32') }}};
-    while ((i|0) < {{{ 2*MAX_SETJMPS }}}) {
-      if ({{{ makeGetValueAsm('table', '(i<<2)', 'i32') }}} == 0) {
-        {{{ makeSetValueAsm('table', '(i<<2)', 'setjmpId', 'i32') }}};
-        {{{ makeSetValueAsm('table', '(i<<2)+4', 'label', 'i32') }}};
+    while ((i|0) < {{{ MAX_SETJMPS }}}) {
+      if ({{{ makeGetValueAsm('table', '(i<<3)', 'i32') }}} == 0) {
+        {{{ makeSetValueAsm('table', '(i<<3)', 'setjmpId', 'i32') }}};
+        {{{ makeSetValueAsm('table', '(i<<3)+4', 'label', 'i32') }}};
         // prepare next slot
-        {{{ makeSetValueAsm('table', '(i<<2)+8', '0', 'i32') }}};
+        {{{ makeSetValueAsm('table', '(i<<3)+8', '0', 'i32') }}};
         return 0;
       }
-      i = (i+2)|0;
+      i = i+1|0;
     }
     {{{ makePrintChars('too many setjmps in a function call, build with a higher value for MAX_SETJMPS') }}};
     abort(0);
@@ -6112,12 +5882,12 @@ LibraryManager.library = {
     table = table|0;
     var i = 0, curr = 0;
     while ((i|0) < {{{ MAX_SETJMPS }}}) {
-      curr = {{{ makeGetValueAsm('table', '(i<<2)', 'i32') }}};
+      curr = {{{ makeGetValueAsm('table', '(i<<3)', 'i32') }}};
       if ((curr|0) == 0) break;
       if ((curr|0) == (id|0)) {
-        return {{{ makeGetValueAsm('table', '(i<<2)+4', 'i32') }}};
+        return {{{ makeGetValueAsm('table', '(i<<3)+4', 'i32') }}};
       }
-      i = (i+2)|0;
+      i = i+1|0;
     }
     return 0;
   },
@@ -6203,8 +5973,10 @@ LibraryManager.library = {
 
   raise__deps: ['$ERRNO_CODES', '__setErrNo'],
   raise: function(sig) {
-    // TODO:
     ___setErrNo(ERRNO_CODES.ENOSYS);
+#if ASSERTIONS
+    Runtime.warnOnce('raise() returning an error as we do not support it');
+#endif
     return -1;
   },
 

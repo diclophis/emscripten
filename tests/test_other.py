@@ -203,6 +203,12 @@ Options that are modified or new in %s include:
         (['--typed-arrays', '1'], lambda generated: 'IHEAPU = ' in generated, 'typed arrays 1 selected'),
         (['--typed-arrays', '2'], lambda generated: 'new Uint16Array' in generated and 'new Uint32Array' in generated, 'typed arrays 2 selected'),
         (['--llvm-opts', '1'], lambda generated: '_puts(' in generated, 'llvm opts requested'),
+        ([], lambda generated: '// The Module object' in generated, 'without opts, comments in shell code'),
+        (['-O2'], lambda generated: '// The Module object' not in generated, 'with opts, no comments in shell code'),
+        (['-O2', '-g2'], lambda generated: '// The Module object' not in generated, 'with -g2, no comments in shell code'),
+        (['-O2', '-g3'], lambda generated: '// The Module object' in generated, 'with -g3, yes comments in shell code'),
+        (['-O2', '-profiling'], lambda generated: '// The Module object' in generated or os.environ.get('EMCC_FAST_COMPILER') == '0', 'with -profiling, yes comments in shell code (in fastcomp)'),
+
       ]:
         print params, text
         self.clear()
@@ -349,9 +355,10 @@ f.close()
       except KeyError:
         postbuild = None
 
-      cmake_cases = ['target_js', 'target_html']
-      cmake_outputs = ['test_cmake.js', 'hello_world_gles.html']
-      for i in range(0, 2):
+      cmake_cases = ['target_js', 'target_html', 'target_library', 'target_library']
+      cmake_outputs = ['test_cmake.js', 'hello_world_gles.html', 'libtest_cmake.a', 'libtest_cmake.so']
+      cmake_arguments = ['', '', '-DBUILD_SHARED_LIBS=OFF', '-DBUILD_SHARED_LIBS=ON']
+      for i in range(0, len(cmake_cases)):
         for configuration in ['Debug', 'Release']:
           # CMake can be invoked in two ways, using 'emconfigure cmake', or by directly running 'cmake'.
           # Test both methods.
@@ -369,11 +376,11 @@ f.close()
               if invoke_method == 'cmake':
                 # Test invoking cmake directly.
                 cmd = ['cmake', '-DCMAKE_TOOLCHAIN_FILE='+path_from_root('cmake', 'Platform', 'Emscripten.cmake'),
-                                '-DCMAKE_BUILD_TYPE=' + configuration, '-G', generator, cmakelistsdir]
+                                '-DCMAKE_BUILD_TYPE=' + configuration, cmake_arguments[i], '-G', generator, cmakelistsdir]
               else:
                 # Test invoking via 'emconfigure cmake'
-                cmd = [emconfigure, 'cmake', '-DCMAKE_BUILD_TYPE=' + configuration, '-G', generator, cmakelistsdir]
-
+                cmd = [emconfigure, 'cmake', '-DCMAKE_BUILD_TYPE=' + configuration, cmake_arguments[i], '-G', generator, cmakelistsdir]
+							  
               ret = Popen(cmd, stdout=None if verbose_level >= 2 else PIPE, stderr=None if verbose_level >= 1 else PIPE).communicate()
               if len(ret) > 1 and ret[1] != None and len(ret[1].strip()) > 0:
                 logging.error(ret[1]) # If there were any errors, print them directly to console for diagnostics.
@@ -1027,9 +1034,92 @@ This pointer might make sense in another type signature: i: 0
     Building.emar('cr', lib_name, [a_name + '.o', b_name + '.o']) # libLIB.a with a and b
 
     # a is in the lib AND in an .o, so should be ignored in the lib. We do still need b from the lib though
-    Building.emcc(main_name, ['-L.', '-lLIB', a_name+'.o', c_name + '.o'], output_filename='a.out.js')
+    Building.emcc(main_name, [a_name+'.o', c_name + '.o', '-L.', '-lLIB'], output_filename='a.out.js')
 
     self.assertContained('result: 62', run_js(os.path.join(self.get_dir(), 'a.out.js')))
+
+  def test_link_group_asserts(self):
+    lib_src_name = os.path.join(self.get_dir(), 'lib.c')
+    open(lib_src_name, 'w').write('int x() { return 42; }')
+
+    main_name = os.path.join(self.get_dir(), 'main.c')
+    open(main_name, 'w').write(r'''
+      #include <stdio.h>
+      int x();
+      int main() {
+        printf("result: %d\n", x());
+        return 0;
+      }
+    ''')
+
+    Building.emcc(lib_src_name) # lib.c.o
+    lib_name = os.path.join(self.get_dir(), 'libLIB.a')
+    Building.emar('cr', lib_name, [lib_src_name + '.o']) # libLIB.a with lib.c.o
+
+    def test(lib_args, err_expected):
+      output = Popen([PYTHON, EMCC, main_name, '-o', 'a.out.js'] + lib_args, stdout=PIPE, stderr=PIPE).communicate()
+      if err_expected:
+        self.assertContained(err_expected, output[1])
+      else:
+        out_js = os.path.join(self.get_dir(), 'a.out.js')
+        assert os.path.exists(out_js), '\n'.join(output)
+        self.assertContained('result: 42', run_js(out_js))
+
+    test(['-Wl,--start-group', lib_name], '--start-group without matching --end-group')
+    test(['-Wl,--start-group', lib_name, '-Wl,--start-group'], 'Nested --start-group, missing --end-group?')
+    test(['-Wl,--end-group', lib_name, '-Wl,--start-group'], '--end-group without --start-group')
+    test(['-Wl,--start-group', lib_name, '-Wl,--end-group'], None)
+
+  def test_circular_libs(self):
+    def tmp_source(name, code):
+      file_name = os.path.join(self.get_dir(), name)
+      open(file_name, 'w').write(code)
+      return file_name
+
+    a = tmp_source('a.c', 'int z(); int x() { return z(); }')
+    b = tmp_source('b.c', 'int x(); int y() { return x(); } int z() { return 42; }')
+    c = tmp_source('c.c', 'int q() { return 0; }')
+    main = tmp_source('main.c', r'''
+      #include <stdio.h>
+      int y();
+      int main() {
+        printf("result: %d\n", y());
+        return 0;
+      }
+    ''')
+
+    Building.emcc(a) # a.c.o
+    Building.emcc(b) # b.c.o
+    Building.emcc(c) # c.c.o
+    lib_a = os.path.join(self.get_dir(), 'libA.a')
+    Building.emar('cr', lib_a, [a + '.o', c + '.o']) # libA.a with a.c.o,c.c.o
+    lib_b = os.path.join(self.get_dir(), 'libB.a')
+    Building.emar('cr', lib_b, [b + '.o', c + '.o']) # libB.a with b.c.o,c.c.o
+
+    args = ['-s', 'ERROR_ON_UNDEFINED_SYMBOLS=1', main, '-o', 'a.out.js']
+    libs_list = [lib_a, lib_b]
+
+    # lib_a does not satisfy any symbols from main, so it will not be included,
+    # and there will be an unresolved symbol.
+    output = Popen([PYTHON, EMCC] + args + libs_list, stdout=PIPE, stderr=PIPE).communicate()
+    self.assertContained('error: unresolved symbol: x', output[1])
+
+    # -Wl,--start-group and -Wl,--end-group around the libs will cause a rescan
+    # of lib_a after lib_b adds undefined symbol "x", so a.c.o will now be
+    # included (and the link will succeed).
+    libs = ['-Wl,--start-group'] + libs_list + ['-Wl,--end-group']
+    output = Popen([PYTHON, EMCC] + args + libs, stdout=PIPE, stderr=PIPE).communicate()
+    out_js = os.path.join(self.get_dir(), 'a.out.js')
+    assert os.path.exists(out_js), '\n'.join(output)
+    self.assertContained('result: 42', run_js(out_js))
+
+    # -( and -) should also work.
+    args = ['-s', 'ERROR_ON_UNDEFINED_SYMBOLS=1', main, '-o', 'a2.out.js']
+    libs = ['-Wl,-('] + libs_list + ['-Wl,-)']
+    output = Popen([PYTHON, EMCC] + args + libs, stdout=PIPE, stderr=PIPE).communicate()
+    out_js = os.path.join(self.get_dir(), 'a2.out.js')
+    assert os.path.exists(out_js), '\n'.join(output)
+    self.assertContained('result: 42', run_js(out_js))
 
   def test_redundant_link(self):
     lib = "int mult() { return 1; }"
@@ -1215,38 +1305,6 @@ This pointer might make sense in another type signature: i: 0
     Popen([PYTHON, EMCC, 'main.cpp', 'testa.cpp', 'testb.cpp', '-o', 'full.js', '-I.']).communicate()
 
     self.assertContained('TestA\nTestB\nTestA\n', run_js('main.js', engine=SPIDERMONKEY_ENGINE))
-
-  def test_js_libraries(self):
-    open(os.path.join(self.get_dir(), 'main.cpp'), 'w').write('''
-      #include <stdio.h>
-      extern "C" {
-        extern void printey();
-        extern int calcey(int x, int y);
-      }
-      int main() {
-        printey();
-        printf("*%d*\\n", calcey(10, 22));
-        return 0;
-      }
-    ''')
-    open(os.path.join(self.get_dir(), 'mylib1.js'), 'w').write('''
-      mergeInto(LibraryManager.library, {
-        printey: function() {
-          Module.print('hello from lib!');
-        }
-      });
-    ''')
-    open(os.path.join(self.get_dir(), 'mylib2.js'), 'w').write('''
-      mergeInto(LibraryManager.library, {
-        calcey: function(x, y) {
-          return x + y;
-        }
-      });
-    ''')
-
-    Popen([PYTHON, EMCC, os.path.join(self.get_dir(), 'main.cpp'), '--js-library', os.path.join(self.get_dir(), 'mylib1.js'),
-                                                                   '--js-library', os.path.join(self.get_dir(), 'mylib2.js')]).communicate()
-    self.assertContained('hello from lib!\n*32*\n', run_js(os.path.join(self.get_dir(), 'a.out.js')))
 
   def test_identical_basenames(self):
     # Issue 287: files in different dirs but with the same basename get confused as the same,
@@ -1879,24 +1937,20 @@ This pointer might make sense in another type signature: i: 0
     assert 'If you see this - the world is all right!' in output
 
   def test_embind(self):
-    def nonfc():
-      for args, fail in [
-        ([], True), # without --bind, we fail
-        (['--bind'], False),
-        (['--bind', '-O1'], False),
-        (['--bind', '-O2'], False),
-        (['--bind', '-O1', '-s', 'ASM_JS=0'], False),
-        (['--bind', '-O2', '-s', 'ASM_JS=0'], False)
-      ]:
-        print args, fail
-        self.clear()
-        try_delete(self.in_dir('a.out.js'))
-        Popen([PYTHON, EMCC, path_from_root('tests', 'embind', 'embind_test.cpp'), '--post-js', path_from_root('tests', 'embind', 'underscore-1.4.2.js'), '--post-js', path_from_root('tests', 'embind', 'imvu_test_adapter.js'), '--post-js', path_from_root('tests', 'embind', 'embind.test.js')] + args, stderr=PIPE if fail else None).communicate()
-        assert os.path.exists(self.in_dir('a.out.js')) == (not fail)
-        if not fail:
-          output = run_js(self.in_dir('a.out.js'), stdout=PIPE, stderr=PIPE, full_output=True)
-          assert "FAIL" not in output, output
-    nonfastcomp(nonfc)
+    for args, fail in [
+      ([], True), # without --bind, we fail
+      (['--bind'], False),
+      (['--bind', '-O1'], False),
+      (['--bind', '-O2'], False),
+    ]:
+      print args, fail
+      self.clear()
+      try_delete(self.in_dir('a.out.js'))
+      Popen([PYTHON, EMCC, path_from_root('tests', 'embind', 'embind_test.cpp'), '--post-js', path_from_root('tests', 'embind', 'underscore-1.4.2.js'), '--post-js', path_from_root('tests', 'embind', 'imvu_test_adapter.js'), '--post-js', path_from_root('tests', 'embind', 'embind.test.js')] + args, stderr=PIPE if fail else None).communicate()
+      assert os.path.exists(self.in_dir('a.out.js')) == (not fail)
+      if not fail:
+        output = run_js(self.in_dir('a.out.js'), stdout=PIPE, stderr=PIPE, full_output=True, assert_returncode=0)
+        assert "FAIL" not in output, output
 
   def test_llvm_nativizer(self):
     try:
@@ -2139,7 +2193,7 @@ void wakaw::Cm::RasterBase<wakaw::watwat::Polocator?>(unsigned int*, unsigned in
     test_js_closure_0 = open(path_from_root('tests', 'Module-exports', 'test.js')).read()
 
     # Check that test.js compiled with --closure 0 contains "module['exports'] = Module;"
-    assert "module['exports'] = Module;" in test_js_closure_0
+    assert ("module['exports'] = Module;" in test_js_closure_0) or ('module["exports"]=Module' in test_js_closure_0)
 
     # Check that main.js (which requires test.js) completes successfully when run in node.js
     # in order to check that the exports are indeed functioning correctly.
@@ -2295,15 +2349,17 @@ mergeInto(LibraryManager.library, {
 
     self.clear()
     os.mkdir(outdir)
-    process = Popen([PYTHON, EMCC, '-c', path_from_root('tests', 'hello_world.c'), '-o', outdir])
-    process.communicate()
-    assert(os.path.isfile(outdir + 'hello_world.o'))
+    process = Popen([PYTHON, EMCC, '-c', path_from_root('tests', 'hello_world.c'), '-o', outdir], stderr=PIPE)
+    out, err = process.communicate()
+    assert not err, err
+    assert os.path.isfile(outdir + 'hello_world.o')
 
     self.clear()
     os.mkdir(outdir)
-    process = Popen([PYTHON, EMCC, '-c', path_from_root('tests', 'hello_world.c'), '-o', outdir, '--default-obj-ext', 'obj'])
-    process.communicate()
-    assert(os.path.isfile(outdir + 'hello_world.obj'))
+    process = Popen([PYTHON, EMCC, '-c', path_from_root('tests', 'hello_world.c'), '-o', outdir, '--default-obj-ext', 'obj'], stderr=PIPE)
+    out, err = process.communicate()
+    assert not err, err
+    assert os.path.isfile(outdir + 'hello_world.obj')
 
   def test_doublestart_bug(self):
     open('code.cpp', 'w').write(r'''
@@ -2379,6 +2435,11 @@ int main() {
     try_delete('header.h.gch')
     err = Popen([PYTHON, EMCC, 'src.cpp', '-include', 'header.h', '-Xclang', '-print-stats'], stderr=PIPE).communicate()
     assert '*** PCH/Modules Loaded:\nModule: header.h.gch' not in err[1], err[1]
+
+    # with specified target via -o
+    try_delete('header.h.gch')
+    Popen([PYTHON, EMCC, '-xc++-header', 'header.h', '-o', 'my.gch']).communicate()
+    assert os.path.exists('my.gch')
 
   def test_warn_unaligned(self):
     if os.environ.get('EMCC_FAST_COMPILER') == '0': return self.skip('need fastcomp')
@@ -2787,4 +2848,47 @@ int main(int argc, char **argv) {
       assert sizes[-1] == 3 # default - let them alias
       assert sizes[0] == 7 # no aliasing, all unique, fat tables
       assert sizes[1] == 3 # aliased once more
+
+  def test_bad_export(self):
+    for m in ['', ' ']:
+      self.clear()
+      cmd = [PYTHON, EMCC, path_from_root('tests', 'hello_world.c'), '-s', 'EXPORTED_FUNCTIONS=["' + m + '_main"]']
+      print cmd
+      stdout, stderr = Popen(cmd, stderr=PIPE).communicate()
+      if m:
+        assert 'function requested to be exported, but not implemented: " _main"' in stderr, stderr
+      else:
+        self.assertContained('hello, world!', run_js('a.out.js'))
+
+  def test_no_dynamic_execution(self):
+    cmd = [PYTHON, EMCC, path_from_root('tests', 'hello_world.c'), '-O1', '-s', 'NO_DYNAMIC_EXECUTION=1']
+    stdout, stderr = Popen(cmd, stderr=PIPE).communicate()
+    self.assertContained('hello, world!', run_js('a.out.js'))
+    src = open('a.out.js').read()
+    assert 'eval(' not in src
+    assert 'eval.' not in src
+    assert 'new Function' not in src
+
+  def test_init_file_at_offset(self):
+    open('src.cpp', 'w').write(r'''
+      #include <stdio.h>
+      int main() {
+        int data = 0x12345678;
+        FILE *f = fopen("test.dat", "wb");
+        fseek(f, 100, SEEK_CUR);
+        fwrite(&data, 4, 1, f);
+        fclose(f);
+
+        int data2;
+        f = fopen("test.dat", "rb");
+        fread(&data2, 4, 1, f); // should read 0s, not that int we wrote at an offset
+        printf("read: %d\n", data2);
+        fseek(f, 0, SEEK_END);
+        int size = ftell(f); // should be 104, not 4
+        fclose(f);
+        printf("file size is %d\n", size);
+      }
+    ''')
+    Popen([PYTHON, EMCC, 'src.cpp']).communicate()
+    self.assertContained('read: 0\nfile size is 104\n', run_js('a.out.js'))
 

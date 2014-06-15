@@ -124,13 +124,20 @@ var PRECISE_I32_MUL = 1; // If enabled, i32 multiplication is done with full pre
 var PRECISE_F32 = 0; // 0: Use JS numbers for floating-point values. These are 64-bit and do not model C++
                      //    floats exactly, which are 32-bit.
                      // 1: Model C++ floats precisely, using Math.fround, polyfilling when necessary. This
-                     //    can be slow if the polyfill is used on heavy float32 computation.
+                     //    can be slow if the polyfill is used on heavy float32 computation. See note on
+                     //    browser support below.
                      // 2: Model C++ floats precisely using Math.fround if available in the JS engine, otherwise
                      //    use an empty polyfill. This will have much less of a speed penalty than using the full
                      //    polyfill in cases where engine support is not present. In addition, we can
                      //    remove the empty polyfill calls themselves on the client when generating html,
                      //    which should mean that this gives you the best of both worlds of 0 and 1, and is
                      //    therefore recommended.
+                     // XXX Note: To optimize float32-using code, we use the 'const' keyword in the emitted
+                     //           code. This allows us to avoid unnecessary calls to Math.fround, which would
+                     //           slow down engines not yet supporting that function. 'const' is present in
+                     //           all modern browsers, including Firefox, Chrome and Safari, but in IE is only
+                     //           present in IE11 and above. Therefore if you need to support legacy versions of
+                     //           IE, you should not enable PRECISE_F32 1 or 2.
 var SIMD = 0; // Whether to emit SIMD code ( https://github.com/johnmccutchan/ecmascript_simd )
 
 var CLOSURE_COMPILER = 0; // Whether closure compiling is being run on this output
@@ -316,6 +323,10 @@ var FS_LOG = 0; // Log all FS operations.  This is especially helpful when you'r
                 // so that you can create a virtual file system with all of the required files.
 var CASE_INSENSITIVE_FS = 0; // If set to nonzero, the provided virtual filesystem if treated case-insensitive, like
                              // Windows and OSX do. If set to 0, the VFS is case-sensitive, like on Linux.
+var MEMFS_APPEND_TO_TYPED_ARRAYS = 0; // If set to nonzero, MEMFS will always utilize typed arrays as the backing store 
+                                      // for appending data to files. The default behavior is to use typed arrays for files
+                                      // when the file size doesn't change after initial creation, and for files that do
+                                      // change size, use normal JS arrays instead.
 
 var USE_BSS = 1; // https://en.wikipedia.org/wiki/.bss
                  // When enabled, 0-initialized globals are sorted to the end of the globals list,
@@ -467,6 +478,9 @@ var HEADLESS = 0; // If 1, will include shim code that tries to 'fake' a browser
                   // very partial - it is hard to fake a whole browser! - so
                   // keep your expectations low for this to work.
 
+var DETERMINISTIC = 0; // If 1, we force Date.now(), Math.random, etc. to return deterministic
+                       // results. Good for comparing builds for debugging purposes (and nothing else)
+
 var BENCHMARK = 0; // If 1, will just time how long main() takes to execute, and not
                    // print out anything at all whatsoever. This is useful for benchmarking.
 
@@ -494,6 +508,11 @@ var JS_CHUNK_SIZE = 10240; // Used as a maximum size before breaking up expressi
 
 var EXPORT_NAME = 'Module'; // Global variable to export the module as for environments without a standardized module
                             // loading system (e.g. the browser and SM shell).
+
+var NO_DYNAMIC_EXECUTION = 0; // When enabled, we do not emit eval() and new Function(), which disables some functionality
+                              // (causing runtime errors if attempted to be used), but allows the emitted code to be
+                              // acceptable in places that disallow dynamic code execution (chrome packaged app, non-
+                              // privileged firefox app, etc.)
 
 var RUNNING_JS_OPTS = 0; // whether js opts will be run, after the main compiler
 

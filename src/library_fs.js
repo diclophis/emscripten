@@ -26,7 +26,13 @@ mergeInto(LibraryManager.library, {
     // This is set to false when the runtime is initialized, allowing you
     // to modify the filesystem freely before run() is called.
     ignorePermissions: true,
-    
+    trackingDelegate: {},
+    tracking: {
+      openFlags: {
+        READ: 1 << 0,
+        WRITE: 1 << 1
+      }
+    },
     ErrnoError: null, // set during init
     genericErrors: {},
 
@@ -713,6 +719,13 @@ mergeInto(LibraryManager.library, {
           throw new FS.ErrnoError(err);
         }
       }
+      try {
+        if (FS.trackingDelegate['willMovePath']) {
+          FS.trackingDelegate['willMovePath'](old_path, new_path);
+        }
+      } catch(e) {
+        console.log("FS.trackingDelegate['willMovePath']('"+old_path+"', '"+new_path+"') threw an exception: " + e.message);
+      }
       // remove the node from the lookup hash
       FS.hashRemoveNode(old_node);
       // do the underlying fs rename
@@ -724,6 +737,11 @@ mergeInto(LibraryManager.library, {
         // add the node back to the hash (in case node_ops.rename
         // changed its name)
         FS.hashAddNode(old_node);
+      }
+      try {
+        if (FS.trackingDelegate['onMovePath']) FS.trackingDelegate['onMovePath'](old_path, new_path);
+      } catch(e) {
+        console.log("FS.trackingDelegate['onMovePath']('"+old_path+"', '"+new_path+"') threw an exception: " + e.message);
       }
     },
     rmdir: function(path) {
@@ -741,8 +759,20 @@ mergeInto(LibraryManager.library, {
       if (FS.isMountpoint(node)) {
         throw new FS.ErrnoError(ERRNO_CODES.EBUSY);
       }
+      try {
+        if (FS.trackingDelegate['willDeletePath']) {
+          FS.trackingDelegate['willDeletePath'](path);
+        }
+      } catch(e) {
+        console.log("FS.trackingDelegate['willDeletePath']('"+path+"') threw an exception: " + e.message);
+      }
       parent.node_ops.rmdir(parent, name);
       FS.destroyNode(node);
+      try {
+        if (FS.trackingDelegate['onDeletePath']) FS.trackingDelegate['onDeletePath'](path);
+      } catch(e) {
+        console.log("FS.trackingDelegate['onDeletePath']('"+path+"') threw an exception: " + e.message);
+      }
     },
     readdir: function(path) {
       var lookup = FS.lookupPath(path, { follow: true });
@@ -769,8 +799,20 @@ mergeInto(LibraryManager.library, {
       if (FS.isMountpoint(node)) {
         throw new FS.ErrnoError(ERRNO_CODES.EBUSY);
       }
+      try {
+        if (FS.trackingDelegate['willDeletePath']) {
+          FS.trackingDelegate['willDeletePath'](path);
+        }
+      } catch(e) {
+        console.log("FS.trackingDelegate['willDeletePath']('"+path+"') threw an exception: " + e.message);
+      }
       parent.node_ops.unlink(parent, name);
       FS.destroyNode(node);
+      try {
+        if (FS.trackingDelegate['onDeletePath']) FS.trackingDelegate['onDeletePath'](path);
+      } catch(e) {
+        console.log("FS.trackingDelegate['onDeletePath']('"+path+"') threw an exception: " + e.message);
+      }
     },
     readlink: function(path) {
       var lookup = FS.lookupPath(path);
@@ -965,6 +1007,20 @@ mergeInto(LibraryManager.library, {
           Module['printErr']('read file: ' + path);
         }
       }
+      try {
+        if (FS.trackingDelegate['onOpenFile']) {
+          var trackingFlags = 0;
+          if ((flags & {{{ cDefine('O_ACCMODE') }}}) !== {{{ cDefine('O_WRONLY') }}}) {
+            trackingFlags |= FS.tracking.openFlags.READ;
+          }
+          if ((flags & {{{ cDefine('O_ACCMODE') }}}) !== {{{ cDefine('O_RDONLY') }}}) {
+            trackingFlags |= FS.tracking.openFlags.WRITE;
+          }
+          FS.trackingDelegate['onOpenFile'](path, trackingFlags);
+        }
+      } catch(e) {
+        console.log("FS.trackingDelegate['onOpenFile']('"+path+"', flags) threw an exception: " + e.message);
+      }
       return stream;
     },
     close: function(stream) {
@@ -1021,6 +1077,10 @@ mergeInto(LibraryManager.library, {
       if (!stream.stream_ops.write) {
         throw new FS.ErrnoError(ERRNO_CODES.EINVAL);
       }
+      if (stream.flags & {{{ cDefine('O_APPEND') }}}) {
+        // seek to the end before writing in append mode
+        FS.llseek(stream, 0, {{{ cDefine('SEEK_END') }}});
+      }
       var seeking = true;
       if (typeof position === 'undefined') {
         position = stream.position;
@@ -1028,12 +1088,13 @@ mergeInto(LibraryManager.library, {
       } else if (!stream.seekable) {
         throw new FS.ErrnoError(ERRNO_CODES.ESPIPE);
       }
-      if (stream.flags & {{{ cDefine('O_APPEND') }}}) {
-        // seek to the end before writing in append mode
-        FS.llseek(stream, 0, {{{ cDefine('SEEK_END') }}});
-      }
       var bytesWritten = stream.stream_ops.write(stream, buffer, offset, length, position, canOwn);
       if (!seeking) stream.position += bytesWritten;
+      try {
+        if (stream.path && FS.trackingDelegate['onWriteToFile']) FS.trackingDelegate['onWriteToFile'](stream.path);
+      } catch(e) {
+        console.log("FS.trackingDelegate['onWriteToFile']('"+path+"') threw an exception: " + e.message);
+      }
       return bytesWritten;
     },
     allocate: function(stream, offset, length) {
@@ -1419,6 +1480,7 @@ mergeInto(LibraryManager.library, {
           // WARNING: Can't read binary files in V8's d8 or tracemonkey's js, as
           //          read() will try to parse UTF8.
           obj.contents = intArrayFromString(Module['read'](obj.url), true);
+          obj.usedBytes = obj.contents.length;
         } catch (e) {
           success = false;
         }
@@ -1540,6 +1602,10 @@ mergeInto(LibraryManager.library, {
         node.contents = null;
         node.url = properties.url;
       }
+      // Add a function that defers querying the file size until it is asked the first time.
+      Object.defineProperty(node, "usedBytes", {
+          get: function() { return this.contents.length; }
+      });
       // override each stream op with one that tries to force load the lazy file first
       var stream_ops = {};
       var keys = Object.keys(node.stream_ops);

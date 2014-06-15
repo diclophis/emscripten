@@ -748,35 +748,36 @@ window.close = function() {
     self.btest('sdl_canvas_alpha.c', reference='sdl_canvas_alpha.png', reference_slack=9)
 
   def test_sdl_key(self):
-    open(os.path.join(self.get_dir(), 'pre.js'), 'w').write('''
-      Module.postRun = function() {
-        function doOne() {
-          Module._one();
+    for defines in [[], ['-DTEST_EMSCRIPTEN_SDL_SETEVENTHANDLER']]:
+      open(os.path.join(self.get_dir(), 'pre.js'), 'w').write('''
+        Module.postRun = function() {
+          function doOne() {
+            Module._one();
+            setTimeout(doOne, 1000/60);
+          }
           setTimeout(doOne, 1000/60);
         }
-        setTimeout(doOne, 1000/60);
-      }
 
-      function keydown(c) {
-        var event = document.createEvent("KeyboardEvent");
-        event.initKeyEvent("keydown", true, true, window,
-                           0, 0, 0, 0,
-                           c, c);
-        document.dispatchEvent(event);
-      }
+        function keydown(c) {
+          var event = document.createEvent("KeyboardEvent");
+          event.initKeyEvent("keydown", true, true, window,
+                             0, 0, 0, 0,
+                             c, c);
+          document.dispatchEvent(event);
+        }
 
-      function keyup(c) {
-        var event = document.createEvent("KeyboardEvent");
-        event.initKeyEvent("keyup", true, true, window,
-                           0, 0, 0, 0,
-                           c, c);
-        document.dispatchEvent(event);
-      }
-    ''')
-    open(os.path.join(self.get_dir(), 'sdl_key.c'), 'w').write(self.with_report_result(open(path_from_root('tests', 'sdl_key.c')).read()))
+        function keyup(c) {
+          var event = document.createEvent("KeyboardEvent");
+          event.initKeyEvent("keyup", true, true, window,
+                             0, 0, 0, 0,
+                             c, c);
+          document.dispatchEvent(event);
+        }
+      ''')
+      open(os.path.join(self.get_dir(), 'sdl_key.c'), 'w').write(self.with_report_result(open(path_from_root('tests', 'sdl_key.c')).read()))
 
-    Popen([PYTHON, EMCC, os.path.join(self.get_dir(), 'sdl_key.c'), '-o', 'page.html', '--pre-js', 'pre.js', '-s', '''EXPORTED_FUNCTIONS=['_main', '_one']''', '-s', 'NO_EXIT_RUNTIME=1']).communicate()
-    self.run_browser('page.html', '', '/report_result?223092870')
+      Popen([PYTHON, EMCC, os.path.join(self.get_dir(), 'sdl_key.c'), '-o', 'page.html'] + defines + ['--pre-js', 'pre.js', '-s', '''EXPORTED_FUNCTIONS=['_main', '_one']''', '-s', 'NO_EXIT_RUNTIME=1']).communicate()
+      self.run_browser('page.html', '', '/report_result?223092870')
 
   def test_sdl_key_proxy(self):
     open(os.path.join(self.get_dir(), 'pre.js'), 'w').write('''
@@ -1096,9 +1097,10 @@ keydown(100);keyup(100); // trigger the end
     shutil.move('test.html', 'third.html')
 
   def test_fs_idbfs_sync(self):
-    secret = str(time.time())
-    self.btest(path_from_root('tests', 'fs', 'test_idbfs_sync.c'), '1', force_c=True, args=['-DFIRST', '-DSECRET=\'' + secret + '\'', '-s', '''EXPORTED_FUNCTIONS=['_main', '_success']'''])
-    self.btest(path_from_root('tests', 'fs', 'test_idbfs_sync.c'), '1', force_c=True, args=['-DSECRET=\'' + secret + '\'', '-s', '''EXPORTED_FUNCTIONS=['_main', '_success']'''])
+    for mode in [[], ['-s', 'MEMFS_APPEND_TO_TYPED_ARRAYS=1']]:
+      secret = str(time.time())
+      self.btest(path_from_root('tests', 'fs', 'test_idbfs_sync.c'), '1', force_c=True, args=mode + ['-DFIRST', '-DSECRET=\'' + secret + '\'', '-s', '''EXPORTED_FUNCTIONS=['_main', '_success']'''])
+      self.btest(path_from_root('tests', 'fs', 'test_idbfs_sync.c'), '1', force_c=True, args=mode + ['-DSECRET=\'' + secret + '\'', '-s', '''EXPORTED_FUNCTIONS=['_main', '_success']'''])
 
   def test_sdl_pumpevents(self):
     # key events should be detected using SDL_PumpEvents
@@ -1300,7 +1302,7 @@ keydown(100);keyup(100); // trigger the end
       time.sleep(2)
 
   def test_glgears(self):
-    self.btest('hello_world_gles.c', reference='gears.png', reference_slack=1,
+    self.btest('hello_world_gles.c', reference='gears.png', reference_slack=2,
         args=['-DHAVE_BUILTIN_SINCOS'], outfile='something.html',
         message='You should see animating gears.')
 
@@ -1322,7 +1324,7 @@ keydown(100);keyup(100); // trigger the end
     self.btest('full_es2_sdlproc.c', '1', args=['-s', 'GL_TESTING=1', '-DHAVE_BUILTIN_SINCOS', '-s', 'FULL_ES2=1'])
 
   def test_glgears_deriv(self):
-    self.btest('hello_world_gles_deriv.c', reference='gears.png', reference_slack=1,
+    self.btest('hello_world_gles_deriv.c', reference='gears.png', reference_slack=2,
         args=['-DHAVE_BUILTIN_SINCOS'], outfile='something.html',
         message='You should see animating gears.')
     with open('something.html') as f:
@@ -1424,6 +1426,9 @@ keydown(100);keyup(100); // trigger the end
 
   def test_sdlglshader(self):
     self.btest('sdlglshader.c', reference='sdlglshader.png', args=['-O2', '--closure', '1', '-s', 'LEGACY_GL_EMULATION=1'])
+
+  def test_gl_glteximage(self):
+    self.btest('gl_teximage.c', '1')
 
   def test_gl_ps(self):
     # pointers and a shader
@@ -1553,7 +1558,7 @@ void *getBindBuffer() {
 
   def test_sdl_rotozoom(self):
     shutil.copyfile(path_from_root('tests', 'screenshot.png'), os.path.join(self.get_dir(), 'screenshot.png'))
-    self.btest('sdl_rotozoom.c', reference='sdl_rotozoom.png', args=['--preload-file', 'screenshot.png'])
+    self.btest('sdl_rotozoom.c', reference='sdl_rotozoom.png', args=['--preload-file', 'screenshot.png'], reference_slack=3)
 
   def test_sdl_gfx_primitives(self):
     self.btest('sdl_gfx_primitives.c', reference='sdl_gfx_primitives.png', reference_slack=1)

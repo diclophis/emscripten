@@ -326,7 +326,7 @@ def check_fastcomp():
         break
       d = os.path.dirname(d)
     if not seen:
-      logging.warning('did not see a source tree above LLVM_DIR, could not verify version numbers match')
+      logging.warning('did not see a source tree above the LLVM root directory (guessing based on directory of %s), could not verify version numbers match' % LLVM_COMPILER)
     return True
   except Exception, e:
     logging.warning('could not check fastcomp: %s' % str(e))
@@ -706,10 +706,8 @@ if USE_EMSDK:
                      path_from_root('system', 'include', 'compat'),
                      path_from_root('system', 'include'),
                      path_from_root('system', 'include', 'emscripten'),
-                     path_from_root('system', 'include', 'bsd'), # posix stuff
                      path_from_root('system', 'include', 'libc'),
                      path_from_root('system', 'include', 'gfx'),
-                     path_from_root('system', 'include', 'net'),
                      path_from_root('system', 'include', 'SDL'),
   ]
   
@@ -1144,63 +1142,131 @@ class Building:
     unresolved_symbols = set([func[1:] for func in Settings.EXPORTED_FUNCTIONS])
     resolved_symbols = set()
     temp_dirs = []
-    files = map(os.path.abspath, files)
+    def make_paths_absolute(f):
+      if f.startswith('-'): # skip flags
+        return f
+      else:
+        return os.path.abspath(f)
+    files = map(make_paths_absolute, files)
+    # Paths of already included object files from archives.
+    added_contents = set()
+    # Map of archive name to list of extracted object file paths.
+    ar_contents = {}
     has_ar = False
     for f in files:
-      has_ar = has_ar or Building.is_ar(f)
+      if not f.startswith('-'):
+        has_ar = has_ar or Building.is_ar(f)
+
+    # If we have only one archive or the force_archive_contents flag is set,
+    # then we will add every object file we see, regardless of whether it
+    # resolves any undefined symbols.
+    force_add_all = len(files) == 1 or force_archive_contents
+
+    # Considers an object file for inclusion in the link. The object is included
+    # if force_add=True or if the object provides a currently undefined symbol.
+    # If the object is included, the symbol tables are updated and the function
+    # returns True.
+    def consider_object(f, force_add=False):
+      new_symbols = Building.llvm_nm(f)
+      do_add = force_add or not unresolved_symbols.isdisjoint(new_symbols.defs)
+      if do_add:
+        logging.debug('adding object %s to link' % (f))
+        # Update resolved_symbols table with newly resolved symbols
+        resolved_symbols.update(new_symbols.defs)
+        # Update unresolved_symbols table by adding newly unresolved symbols and
+        # removing newly resolved symbols.
+        unresolved_symbols.update(new_symbols.undefs.difference(resolved_symbols))
+        unresolved_symbols.difference_update(new_symbols.defs)
+        actual_files.append(f)
+      return do_add
+
+    def get_archive_contents(f):
+      if f in ar_contents:
+        return ar_contents[f]
+
+      cwd = os.getcwd()
+      try:
+        temp_dir = os.path.join(EMSCRIPTEN_TEMP_DIR, 'ar_output_' + str(os.getpid()) + '_' + str(len(temp_dirs)))
+        temp_dirs.append(temp_dir)
+        safe_ensure_dirs(temp_dir)
+        os.chdir(temp_dir)
+        contents = filter(lambda x: len(x) > 0, Popen([LLVM_AR, 't', f], stdout=PIPE).communicate()[0].split('\n'))
+        if len(contents) == 0:
+          logging.debug('Archive %s appears to be empty (recommendation: link an .so instead of .a)' % f)
+        else:
+          for content in contents: # ar will silently fail if the directory for the file does not exist, so make all the necessary directories
+            dirname = os.path.dirname(content)
+            if dirname:
+              safe_ensure_dirs(dirname)
+          Popen([LLVM_AR, 'xo', f], stdout=PIPE).communicate() # if absolute paths, files will appear there. otherwise, in this directory
+          contents = map(lambda content: os.path.join(temp_dir, content), contents)
+          contents = filter(os.path.exists, map(os.path.abspath, contents))
+          contents = filter(Building.is_bitcode, contents)
+        ar_contents[f] = contents
+      finally:
+        os.chdir(cwd)
+
+      return contents
+
+    # Traverse a single archive. The object files are repeatedly scanned for
+    # newly satisfied symbols until no new symbols are found. Returns true if
+    # any object files were added to the link.
+    def consider_archive(f):
+      added_any_objects = False
+      loop_again = True
+      logging.debug('considering archive %s' % (f))
+      contents = get_archive_contents(f)
+      while loop_again: # repeatedly traverse until we have everything we need
+        loop_again = False
+        for content in contents:
+          if content in added_contents: continue
+          # Link in the .o if it provides symbols, *or* this is a singleton archive (which is apparently an exception in gcc ld)
+          if consider_object(content, force_add=force_add_all):
+            added_contents.add(content)
+            loop_again = True
+            added_any_objects = True
+      logging.debug('done running loop of archive %s' % (f))
+      return added_any_objects
+
+    current_archive_group = None
     for f in files:
-      if not Building.is_ar(f):
+      if f.startswith('-'):
+        if f in ['--start-group', '-(']:
+          assert current_archive_group is None, 'Nested --start-group, missing --end-group?'
+          current_archive_group = []
+        elif f in ['--end-group', '-)']:
+          assert current_archive_group is not None, '--end-group without --start-group'
+          # rescan the archives in the group until we don't find any more
+          # objects to link.
+          loop_again = True
+          logging.debug('starting archive group loop');
+          while loop_again:
+            loop_again = False
+            for archive in current_archive_group:
+              if consider_archive(archive):
+                loop_again = True
+          logging.debug('done with archive group loop');
+          current_archive_group = None
+        else:
+          logging.debug('Ignoring unsupported link flag: %s' % f)
+      elif not Building.is_ar(f):
         if Building.is_bitcode(f):
           if has_ar:
-            new_symbols = Building.llvm_nm(f)
-            resolved_symbols = resolved_symbols.union(new_symbols.defs)
-            unresolved_symbols = unresolved_symbols.union(new_symbols.undefs.difference(resolved_symbols)).difference(new_symbols.defs)
-          actual_files.append(f)
+            consider_object(f, force_add=True)
+          else:
+            # If there are no archives then we can simply link all valid bitcode
+            # files and skip the symbol table stuff.
+            actual_files.append(f)
       else:
         # Extract object files from ar archives, and link according to gnu ld semantics
         # (link in an entire .o from the archive if it supplies symbols still unresolved)
-        cwd = os.getcwd()
-        try:
-          temp_dir = os.path.join(EMSCRIPTEN_TEMP_DIR, 'ar_output_' + str(os.getpid()) + '_' + str(len(temp_dirs)))
-          temp_dirs.append(temp_dir)
-          safe_ensure_dirs(temp_dir)
-          os.chdir(temp_dir)
-          contents = filter(lambda x: len(x) > 0, Popen([LLVM_AR, 't', f], stdout=PIPE).communicate()[0].split('\n'))
-          #print >> sys.stderr, '  considering archive', f, ':', contents
-          if len(contents) == 0:
-            logging.debug('Archive %s appears to be empty (recommendation: link an .so instead of .a)' % f)
-          else:
-            for content in contents: # ar will silently fail if the directory for the file does not exist, so make all the necessary directories
-              dirname = os.path.dirname(content)
-              if dirname:
-                safe_ensure_dirs(dirname)
-            Popen([LLVM_AR, 'xo', f], stdout=PIPE).communicate() # if absolute paths, files will appear there. otherwise, in this directory
-            contents = map(lambda content: os.path.join(temp_dir, content), contents)
-            contents = filter(os.path.exists, map(os.path.abspath, contents))
-            added_contents = set()
-            added = True
-            #print >> sys.stderr, '  initial undef are now ', unresolved_symbols, '\n'
-            while added: # recursively traverse until we have everything we need
-              #print >> sys.stderr, '  running loop of archive including for', f
-              added = False
-              for content in contents:
-                if content in added_contents: continue 
-                new_symbols = Building.llvm_nm(content)
-                # Link in the .o if it provides symbols, *or* this is a singleton archive (which is apparently an exception in gcc ld)
-                #print >> sys.stderr, 'need', content, '?', unresolved_symbols, 'and we can supply', new_symbols.defs
-                #print >> sys.stderr, content, 'DEF', new_symbols.defs, '\n'
-                if new_symbols.defs.intersection(unresolved_symbols) or len(files) == 1 or force_archive_contents:
-                  if Building.is_bitcode(content):
-                    #print >> sys.stderr, '  adding object', content, '\n'
-                    resolved_symbols = resolved_symbols.union(new_symbols.defs)
-                    unresolved_symbols = unresolved_symbols.union(new_symbols.undefs.difference(resolved_symbols)).difference(new_symbols.defs)
-                    #print >> sys.stderr, '  undef are now ', unresolved_symbols, '\n'
-                    actual_files.append(content)
-                    added_contents.add(content)
-                    added = True
-            #print >> sys.stderr, '  done running loop of archive including for', f
-        finally:
-          os.chdir(cwd)
+        consider_archive(f)
+        # If we're inside a --start-group/--end-group section, add to the list
+        # so we can loop back around later.
+        if current_archive_group is not None:
+          current_archive_group.append(f)
+    assert current_archive_group is None, '--start-group without matching --end-group'
+
     try_delete(target)
 
     # Finish link
@@ -1358,16 +1424,19 @@ class Building:
     settings = Settings.serialize()
     args = settings + extra_args
     if WINDOWS:
-      args = ['@' + response_file.create_response_file(args, TEMP_DIR)]
+      rsp_file = response_file.create_response_file(args, TEMP_DIR)
+      args = ['@' + rsp_file]
     cmdline = [PYTHON, EMSCRIPTEN, filename + ('.o.ll' if append_ext else ''), '-o', filename + '.o.js'] + args
     if jsrun.TRACK_PROCESS_SPAWNS:
       logging.info('Executing emscripten.py compiler with cmdline "' + ' '.join(cmdline) + '"')
-    compiler_output = jsrun.timeout_run(Popen(cmdline, stdout=PIPE), None, 'Compiling')
-    #print compiler_output
+    jsrun.timeout_run(Popen(cmdline, stdout=PIPE), None, 'Compiling')
+
+    # Clean up .rsp file the compiler used after we are finished.
+    if WINDOWS:
+      try_delete(rsp_file)
 
     # Detect compilation crashes and errors
-    if compiler_output is not None and 'Traceback' in compiler_output and 'in test_' in compiler_output: print compiler_output; assert 0
-    assert os.path.exists(filename + '.o.js') and len(open(filename + '.o.js', 'r').read()) > 0, 'Emscripten failed to generate .js: ' + str(compiler_output)
+    assert os.path.exists(filename + '.o.js'), 'Emscripten failed to generate .js'
 
     return filename + '.o.js'
 
@@ -1650,12 +1719,17 @@ class JS:
       return '+0'
 
   @staticmethod
-  def make_coercion(value, sig, settings=None):
+  def make_coercion(value, sig, settings=None, ffi_arg=False, ffi_result=False):
     settings = settings or Settings
     if sig == 'i':
       return value + '|0'
     elif sig == 'f' and settings.get('PRECISE_F32'):
-      return 'Math_fround(' + value + ')'
+      if ffi_arg:
+        return '+Math_fround(' + value + ')'
+      elif ffi_result:
+        return 'Math_fround(+(' + value + '))'
+      else:
+        return 'Math_fround(' + value + ')'
     elif sig == 'd' or sig == 'f':
       return '+' + value
     else:
@@ -1831,7 +1905,11 @@ def unsuffixed_basename(name):
   return os.path.basename(unsuffixed(name))
 
 def safe_move(src, dst):
-  if os.path.abspath(src) == os.path.abspath(dst):
+  src = os.path.abspath(src)
+  dst = os.path.abspath(dst)
+  if os.path.isdir(dst):
+    dst = os.path.join(dst, os.path.basename(src))
+  if src == dst:
     return
   shutil.move(src, dst)
 

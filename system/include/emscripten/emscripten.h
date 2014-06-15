@@ -14,9 +14,37 @@
 extern "C" {
 #endif
 
+#include <stdio.h>
+
 #if !__EMSCRIPTEN__
 #include <SDL/SDL.h> /* for SDL_Delay in async_call */
 #endif
+
+
+/* Typedefs */
+
+/*
+ * Unaligned types, helpful to force LLVM to emit unaligned
+ * loads/stores in places in your code where SAFE_HEAP found
+ * an unaligned operation. (It's better to avoid unaligned
+ * operations, but if you are reading from a packed stream of
+ * bytes or such, these types may be useful.)
+ */
+
+typedef short __attribute__((aligned(1))) emscripten_align1_short;
+
+typedef int __attribute__((aligned(2))) emscripten_align2_int;
+typedef int __attribute__((aligned(1))) emscripten_align1_int;
+
+typedef float __attribute__((aligned(2))) emscripten_align2_float;
+typedef float __attribute__((aligned(1))) emscripten_align1_float;
+
+typedef double __attribute__((aligned(4))) emscripten_align4_double;
+typedef double __attribute__((aligned(2))) emscripten_align2_double;
+typedef double __attribute__((aligned(1))) emscripten_align1_double;
+
+
+/* Functions */
 
 /*
  * Convenient syntax for inline assembly/js. Allows stuff like
@@ -27,8 +55,8 @@ extern "C" {
  * does a function call to reach it). It supports newlines,
  *
  *    EM_ASM(
- *      window.alert('hai'));
- *      window.alert('bai'));
+ *      window.alert('hai');
+ *      window.alert('bai');
  *    )
  *
  * Notes: Double-quotes (") are not supported, but you can use
@@ -121,7 +149,11 @@ extern void emscripten_async_load_script(const char *script, void (*onload)(void
  *
  * If you want your main loop function to receive a void*
  * argument, use emscripten_set_main_loop_arg.
-
+ *
+ * There can be only *one* main loop function at a time. You
+ * can cancel the current one and set another, if you want to
+ * change it.
+ *
  * @simulate_infinite_loop If true, this function will throw an
  *    exception in order to stop execution of the caller. This
  *    will lead to the main loop being entered instead of code
@@ -248,7 +280,7 @@ void emscripten_get_canvas_size(int *width, int *height, int *isFullscreen);
 double emscripten_get_now(void);
 #else
 #include <time.h>
-double emscripten_get_now(void) {
+static inline double emscripten_get_now(void) {
   return (1000*clock())/(double)CLOCKS_PER_SEC;
 }
 #endif
@@ -484,6 +516,24 @@ int emscripten_get_compiler_setting(const char *name);
  * the debugger if it gets there.
  */
 void emscripten_debugger();
+
+/*
+ * Get preloaded image data and the size of the image.
+ *
+ * Returns pointer to loaded image or NULL.
+ * width/height of image are written to w/h if data is valid.
+ * Pointer should be free()'d
+ */
+char *emscripten_get_preloaded_image_data(const char *path, int *w, int *h);
+
+/*
+ * Get preloaded image data from a c FILE *.
+ *
+ * Returns pointer to loaded image or NULL.
+ * width/height of image are written to w/h if data is valid.
+ * Pointer should be free()'d
+ */
+char *emscripten_get_preloaded_image_data_from_FILE(FILE *file, int *w, int *h);
 
 
 /* ===================================== */

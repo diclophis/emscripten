@@ -17,6 +17,10 @@
 typedef std::string ministring;
 #endif
 
+// uncomment these out to get LLVM errs() debugging support
+//#include <llvm/Support/raw_ostream.h>
+//using namespace llvm;
+
 template <class T, class U> static bool contains(const T& container, const U& contained) {
   return container.count(contained);
 }
@@ -202,6 +206,7 @@ void Block::Render(bool InLoop) {
   if (Fused) {
     PrintDebug("Fusing Multiple to Simple\n");
     Parent->Next = Parent->Next->Next;
+    Fused->UseSwitch = false; // TODO: emit switches here
     Fused->RenderLoopPrefix();
 
     // When the Multiple has the same number of groups as we have branches,
@@ -319,11 +324,7 @@ void MultipleShape::RenderLoopPrefix() {
       }
     } else {
       if (Labeled) {
-        if (UseSwitch) {
-          PrintIndented("L%d: ", Id);
-        } else {
-          PrintIndented("L%d: do {\n", Id);
-        }
+        PrintIndented("L%d: do {\n", Id);
       } else {
         PrintIndented("do {\n");
       }
@@ -1096,7 +1097,7 @@ void Relooper::Calculate(Block *Entry) {
     // Remove unneeded breaks and continues.
     // A flow operation is trivially unneeded if the shape we naturally get to by normal code
     // execution is the same as the flow forces us to.
-    void RemoveUnneededFlows(Shape *Root, Shape *Natural=NULL, LoopShape *LastLoop=NULL) {
+    void RemoveUnneededFlows(Shape *Root, Shape *Natural=NULL, LoopShape *LastLoop=NULL, unsigned Depth=0) {
       BlockSet NaturalBlocks;
       FollowNaturalFlow(Natural, NaturalBlocks);
       Shape *Next = Root;
@@ -1107,7 +1108,7 @@ void Relooper::Calculate(Block *Entry) {
           if (Simple->Inner->BranchVar) LastLoop = NULL; // a switch clears out the loop (TODO: only for breaks, not continue)
 
           if (Simple->Next) {
-            if (!Simple->Inner->BranchVar && Simple->Inner->ProcessedBranchesOut.size() == 2) {
+            if (!Simple->Inner->BranchVar && Simple->Inner->ProcessedBranchesOut.size() == 2 && Depth < 20) {
               // If there is a next block, we already know at Simple creation time to make direct branches,
               // and we can do nothing more in general. But, we try to optimize the case of a break and
               // a direct: This would normally be  if (break?) { break; } ..  but if we
@@ -1143,6 +1144,7 @@ void Relooper::Calculate(Block *Entry) {
                   }
                 }
               }
+              Depth++; // this optimization increases depth, for us and all our next chain (i.e., until this call returns)
             }
             Next = Simple->Next;
           } else {
@@ -1167,11 +1169,11 @@ void Relooper::Calculate(Block *Entry) {
           }
         }, {
           for (IdShapeMap::iterator iter = Multiple->InnerMap.begin(); iter != Multiple->InnerMap.end(); iter++) {
-            RemoveUnneededFlows(iter->second, Multiple->Next, Multiple->Breaks ? NULL : LastLoop);
+            RemoveUnneededFlows(iter->second, Multiple->Next, Multiple->Breaks ? NULL : LastLoop, Depth+1);
           }
           Next = Multiple->Next;
         }, {
-          RemoveUnneededFlows(Loop->Inner, Loop->Inner, Loop);
+          RemoveUnneededFlows(Loop->Inner, Loop->Inner, Loop, Depth+1);
           Next = Loop->Next;
         });
       }

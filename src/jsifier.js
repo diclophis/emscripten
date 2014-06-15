@@ -370,7 +370,7 @@ function JSify(data, functionsOnly) {
 
     // name the function; overwrite if it's already named
     snippet = snippet.replace(/function(?:\s+([^(]+))?\s*\(/, 'function _' + ident + '(');
-    if (LIBRARY_DEBUG) {
+    if (LIBRARY_DEBUG && !LibraryManager.library[ident + '__asm']) {
       snippet = snippet.replace('{', '{ var ret = (function() { if (Runtime.debug) Module.printErr("[library call:' + ident + ': " + Array.prototype.slice.call(arguments).map(Runtime.prettyPrint) + "]"); ');
       snippet = snippet.substr(0, snippet.length-1) + '}).apply(this, arguments); if (Runtime.debug && typeof ret !== "undefined") Module.printErr("  [     return:" + Runtime.prettyPrint(ret)); return ret; \n}';
     }
@@ -1321,10 +1321,10 @@ function JSify(data, functionsOnly) {
       // vector load
       var native = getVectorNativeType(item.valueType);
       var base = getSIMDName(native);
-      return base + '32x4(' + makeGetValue(value,  0, native, 0, item.unsigned, 0, item.align) + ',' +
-                              makeGetValue(value,  4, native, 0, item.unsigned, 0, item.align) + ',' +
-                              makeGetValue(value,  8, native, 0, item.unsigned, 0, item.align) + ',' +
-                              makeGetValue(value, 12, native, 0, item.unsigned, 0, item.align) + ');';
+      return 'SIMD.' + base + '32x4(' + makeGetValue(value,  0, native, 0, item.unsigned, 0, item.align) + ',' +
+                                        makeGetValue(value,  4, native, 0, item.unsigned, 0, item.align) + ',' +
+                                        makeGetValue(value,  8, native, 0, item.unsigned, 0, item.align) + ',' +
+                                        makeGetValue(value, 12, native, 0, item.unsigned, 0, item.align) + ');';
     }
     var impl = item.ident ? getVarImpl(item.funcData, item.ident) : VAR_EMULATED;
     switch (impl) {
@@ -1395,7 +1395,7 @@ function JSify(data, functionsOnly) {
     }
     for (var i = 0; i < 4; i++) assert(mask[0] == 0 || mask == 1);
     i = 0;
-    return base + '32x4(' + mask.map(function(m) {
+    return 'SIMD.' + base + '32x4(' + mask.map(function(m) {
       return (m == 1 ? second : first) + '.' + simdLane[i++];
     }).join(',') + ')';
   }
@@ -1900,6 +1900,9 @@ function JSify(data, functionsOnly) {
     }
     if (PROXY_TO_WORKER) {
       print(read('proxyWorker.js'));
+    }
+    if (DETERMINISTIC) {
+      print(read('deterministic.js'));
     }
     if (RUNTIME_TYPE_INFO) {
       Types.cleanForRuntime();
