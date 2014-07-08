@@ -321,7 +321,7 @@ mergeInto(LibraryManager.library, {
         ctx = wrapper;
 #endif
         // Set the background of the WebGL canvas to black
-        canvas.style.backgroundColor = "black";
+        //canvas.style.backgroundColor = "black";
       }
       if (setInModule) {
         GLctx = Module.ctx = ctx;
