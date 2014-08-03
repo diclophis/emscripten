@@ -1308,7 +1308,7 @@ function JSify(data, functionsOnly) {
       return ret;
     }
     var catchTypeArray = item.catchables.map(finalizeLLVMParameter).map(function(element) { return asmCoercion(element, 'i32') }).join(',');
-    var ret = asmCoercion('___cxa_find_matching_catch(-1, -1' + (catchTypeArray.length > 0 ? ',' + catchTypeArray : '') +')', 'i32');
+    var ret = asmCoercion('___cxa_find_matching_catch(' + catchTypeArray +')', 'i32');
     if (USE_TYPED_ARRAYS == 2) {
       ret = makeVarDef(item.assignTo) + '$0 = ' + ret + '; ' + makeVarDef(item.assignTo) + '$1 = tempRet0;';
       item.assignTo = null;
@@ -1899,6 +1899,7 @@ function JSify(data, functionsOnly) {
       print('}');
     }
     if (PROXY_TO_WORKER) {
+      print(read('webGLWorker.js'));
       print(read('proxyWorker.js'));
     }
     if (DETERMINISTIC) {

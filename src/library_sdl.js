@@ -260,6 +260,16 @@ var LibrarySDL = {
       };
     },
 
+    checkPixelFormat: function(fmt) {
+#if ASSERTIONS
+      // Canvas screens are always RGBA.
+      var format = {{{ makeGetValue('fmt', C_STRUCTS.SDL_PixelFormat.format, 'i32') }}};
+      if (format != {{{ cDefine('SDL_PIXELFORMAT_RGBA8888') }}}) {
+        Runtime.warnOnce('Unsupported pixel format!');
+      }
+#endif
+    },
+
     // Load SDL color into a CSS-style color specification
     loadColorToCSSRGB: function(color) {
       var rgba = {{{ makeGetValue('color', '0', 'i32') }}};
@@ -307,7 +317,12 @@ var LibrarySDL = {
       {{{ makeSetValue('surf', C_STRUCTS.SDL_Surface.pitch, 'width * bpp', 'i32') }}};  // assuming RGBA or indexed for now,
                                                                                         // since that is what ImageData gives us in browsers
       {{{ makeSetValue('surf', C_STRUCTS.SDL_Surface.pixels, 'buffer', 'void*') }}};
-      {{{ makeSetValue('surf', C_STRUCTS.SDL_Surface.clip_rect, '0', 'i32*') }}};
+
+      {{{ makeSetValue('surf', C_STRUCTS.SDL_Surface.clip_rect+C_STRUCTS.SDL_Rect.x, '0', 'i32') }}};
+      {{{ makeSetValue('surf', C_STRUCTS.SDL_Surface.clip_rect+C_STRUCTS.SDL_Rect.y, '0', 'i32') }}};
+      {{{ makeSetValue('surf', C_STRUCTS.SDL_Surface.clip_rect+C_STRUCTS.SDL_Rect.w, 'Module["canvas"].width', 'i32') }}};
+      {{{ makeSetValue('surf', C_STRUCTS.SDL_Surface.clip_rect+C_STRUCTS.SDL_Rect.h, 'Module["canvas"].height', 'i32') }}};
+
       {{{ makeSetValue('surf', C_STRUCTS.SDL_Surface.refcount, '1', 'i32') }}};
 
       {{{ makeSetValue('pixelFormat', C_STRUCTS.SDL_PixelFormat.format, cDefine('SDL_PIXELFORMAT_RGBA8888'), 'i32') }}};
@@ -773,17 +788,23 @@ var LibrarySDL = {
         // to automatically query for events, query for joystick events.
         SDL.queryJoysticks();
       }
-      if (SDL.events.length === 0) return 0;
       if (ptr) {
-        SDL.makeCEvent(SDL.events.shift(), ptr);
+        while (SDL.events.length > 0) {
+          if (SDL.makeCEvent(SDL.events.shift(), ptr) !== false) return 1;
+        }
+        return 0;
+      } else {
+        // XXX: somewhat risky in that we do not check if the event is real or not (makeCEvent returns false) if no pointer supplied
+        return SDL.events.length > 0;
       }
-      return 1;
     },
 
+    // returns false if the event was determined to be irrelevant
     makeCEvent: function(event, ptr) {
       if (typeof event === 'number') {
-        // This is a pointer to a native C event that was SDL_PushEvent'ed
-        _memcpy(ptr, event, {{{ C_STRUCTS.SDL_KeyboardEvent.__size__ }}}); // XXX
+        // This is a pointer to a copy of a native C event that was SDL_PushEvent'ed
+        _memcpy(ptr, event, {{{ C_STRUCTS.SDL_KeyboardEvent.__size__ }}});
+        _free(event); // the copy is no longer needed
         return;
       }
 
@@ -868,7 +889,7 @@ var LibrarySDL = {
           var dx = x - lx;
           var dy = y - ly;
           if (touch['deviceID'] === undefined) touch.deviceID = SDL.TOUCH_DEFAULT_ID;
-          if (dx === 0 && dy === 0 && event.type === 'touchmove') return; // don't send these if nothing happened
+          if (dx === 0 && dy === 0 && event.type === 'touchmove') return false; // don't send these if nothing happened
           {{{ makeSetValue('ptr', C_STRUCTS.SDL_TouchFingerEvent.type, 'SDL.DOMEventToSDLEvent[event.type]', 'i32') }}};
           {{{ makeSetValue('ptr', C_STRUCTS.SDL_TouchFingerEvent.timestamp, '_SDL_GetTicks()', 'i32') }}};
           {{{ makeSetValue('ptr', C_STRUCTS.SDL_TouchFingerEvent.touchId, 'touch.deviceID', 'i64') }}};
@@ -1304,35 +1325,49 @@ var LibrarySDL = {
     return buf;
   },
 
+  SDL_SetVideoMode__deps: ['$GL'],
   SDL_SetVideoMode: function(width, height, depth, flags) {
     ['touchstart', 'touchend', 'touchmove', 'mousedown', 'mouseup', 'mousemove', 'DOMMouseScroll', 'mousewheel', 'wheel', 'mouseout'].forEach(function(event) {
       Module['canvas'].addEventListener(event, SDL.receiveEvent, true);
     });
 
+    var canvas = Module['canvas'];
+
     // (0,0) means 'use fullscreen' in native; in Emscripten, use the current canvas size.
     if (width == 0 && height == 0) {
-      var canvas = Module['canvas'];
       width = canvas.width;
       height = canvas.height;
     }
 
-    Browser.setCanvasSize(width, height, true);
-    // Free the old surface first.
+    if (!SDL.addedResizeListener) {
+      SDL.addedResizeListener = true;
+      Browser.resizeListeners.push(function(w, h) {
+        if (!SDL.settingVideoMode) {
+          SDL.receiveEvent({
+            type: 'resize',
+            w: w,
+            h: h
+          });
+        }
+      });
+    }
+
+    if (width !== canvas.width || height !== canvas.height) {
+      SDL.settingVideoMode = true; // SetVideoMode itself should not trigger resize events
+      Browser.setCanvasSize(width, height);
+      SDL.settingVideoMode = false;
+    }
+
+    // Free the old surface first if there is one
     if (SDL.screen) {
       SDL.freeSurface(SDL.screen);
       assert(!SDL.screen);
     }
+
+    if (SDL.GL) flags = flags | 0x04000000; // SDL_OPENGL - if we are using GL, then later calls to SetVideoMode may not mention GL, but we do need it. Once in GL mode, we never leave it.
+
     SDL.screen = SDL.makeSurface(width, height, flags, true, 'screen');
-    if (!SDL.addedResizeListener) {
-      SDL.addedResizeListener = true;
-      Browser.resizeListeners.push(function(w, h) {
-        SDL.receiveEvent({
-          type: 'resize',
-          w: w,
-          h: h
-        });
-      });
-    }
+
     return SDL.screen;
   },
 
@@ -1340,11 +1375,7 @@ var LibrarySDL = {
     return SDL.screen;
   },
 
-  SDL_QuitSubSystem: function(flags) {
-    Module.print('SDL_QuitSubSystem called (and ignored)');
-  },
-
-  SDL_Quit: function() {
+  SDL_AudioQuit: function() {
     for (var i = 0; i < SDL.numChannels; ++i) {
       if (SDL.channels[i].audio) {
         SDL.channels[i].audio.pause();
@@ -1353,6 +1384,19 @@ var LibrarySDL = {
     }
     if (SDL.music.audio) SDL.music.audio.pause();
     SDL.music.audio = undefined;
+  },
+
+  SDL_VideoQuit: function() {
+    Module.print('SDL_VideoQuit called (and ignored)');
+  },
+
+  SDL_QuitSubSystem: function(flags) {
+    Module.print('SDL_QuitSubSystem called (and ignored)');
+  },
+
+  SDL_Quit__deps: ['SDL_AudioQuit'],
+  SDL_Quit: function() {
+    _SDL_AudioQuit();
     Module.print('SDL_Quit called (and ignored)');
   },
 
@@ -1743,7 +1787,9 @@ var LibrarySDL = {
   },
 
   SDL_PushEvent: function(ptr) {
-    SDL.events.push(ptr); // XXX Should we copy it? Not clear from API
+    var copy = _malloc({{{ C_STRUCTS.SDL_KeyboardEvent.__size__ }}});
+    _memcpy(copy, ptr, {{{ C_STRUCTS.SDL_KeyboardEvent.__size__ }}});
+    SDL.events.push(copy);
     return 0;
   },
 
@@ -1761,9 +1807,12 @@ var LibrarySDL = {
           var event = SDL.events[index];
           var type = SDL.DOMEventToSDLEvent[event.type];
           if (from <= type && type <= to) {
-            SDL.makeCEvent(event, events);
-            SDL.events.splice(index, 1);
-            retrievedEventCount++;
+            if (SDL.makeCEvent(event, events) === false) {
+              index++;
+            } else {
+              SDL.events.splice(index, 1);
+              retrievedEventCount++;
+            }
           } else {
             index++;
           }
@@ -1814,13 +1863,46 @@ var LibrarySDL = {
   },
 
   SDL_MapRGB: function(fmt, r, g, b) {
-    // Canvas screens are always RGBA. We assume the machine is little-endian.
+    SDL.checkPixelFormat(fmt);
+    // We assume the machine is little-endian.
     return r&0xff|(g&0xff)<<8|(b&0xff)<<16|0xff000000;
   },
 
   SDL_MapRGBA: function(fmt, r, g, b, a) {
-    // Canvas screens are always RGBA. We assume the machine is little-endian.
+    SDL.checkPixelFormat(fmt);
+    // We assume the machine is little-endian.
     return r&0xff|(g&0xff)<<8|(b&0xff)<<16|(a&0xff)<<24;
+  },
+
+  SDL_GetRGB: function(pixel, fmt, r, g, b) {
+    SDL.checkPixelFormat(fmt);
+    // We assume the machine is little-endian.
+    if (r) {
+      {{{ makeSetValue('r', '0', 'pixel&0xff', 'i8') }}};
+    }
+    if (g) {
+      {{{ makeSetValue('g', '0', '(pixel>>8)&0xff', 'i8') }}};
+    }
+    if (b) {
+      {{{ makeSetValue('b', '0', '(pixel>>16)&0xff', 'i8') }}};
+    }
+  },
+
+  SDL_GetRGBA: function(pixel, fmt, r, g, b, a) {
+    SDL.checkPixelFormat(fmt);
+    // We assume the machine is little-endian.
+    if (r) {
+      {{{ makeSetValue('r', '0', 'pixel&0xff', 'i8') }}};
+    }
+    if (g) {
+      {{{ makeSetValue('g', '0', '(pixel>>8)&0xff', 'i8') }}};
+    }
+    if (b) {
+      {{{ makeSetValue('b', '0', '(pixel>>16)&0xff', 'i8') }}};
+    }
+    if (a) {
+      {{{ makeSetValue('a', '0', '(pixel>>24)&0xff', 'i8') }}};
+    }
   },
 
   SDL_GetAppState: function() {
@@ -1941,8 +2023,10 @@ var LibrarySDL = {
       } else {
         var imageData = surfData.ctx.getImageData(0, 0, surfData.width, surfData.height);
         if (raw.bpp == 4) {
+          // rgba
           imageData.data.set({{{ makeHEAPView('U8', 'raw.data', 'raw.data+raw.size') }}});
         } else if (raw.bpp == 3) {
+          // rgb
           var pixels = raw.size/3;
           var data = imageData.data;
           var sourcePtr = raw.data;
@@ -1951,6 +2035,19 @@ var LibrarySDL = {
             data[destPtr++] = {{{ makeGetValue('sourcePtr++', 0, 'i8', null, 1) }}};
             data[destPtr++] = {{{ makeGetValue('sourcePtr++', 0, 'i8', null, 1) }}};
             data[destPtr++] = {{{ makeGetValue('sourcePtr++', 0, 'i8', null, 1) }}};
+            data[destPtr++] = 255;
+          }
+        } else if (raw.bpp == 1) {
+          // grayscale
+          var pixels = raw.size;
+          var data = imageData.data;
+          var sourcePtr = raw.data;
+          var destPtr = 0;
+          for (var i = 0; i < pixels; i++) {
+            var value = {{{ makeGetValue('sourcePtr++', 0, 'i8', null, 1) }}};
+            data[destPtr++] = value;
+            data[destPtr++] = value;
+            data[destPtr++] = value;
             data[destPtr++] = 255;
           }
         } else {
@@ -2878,7 +2975,9 @@ var LibrarySDL = {
     return _emscripten_GetProcAddress(name_);
   },
 
-  SDL_GL_SwapBuffers: function() {},
+  SDL_GL_SwapBuffers: function() {
+    if (Browser.doSwapBuffers) Browser.doSwapBuffers(); // in workers, this is used to send out a buffered frame
+  },
 
   // SDL 2
 
@@ -2933,6 +3032,8 @@ var LibrarySDL = {
   SDL_ClearError: function() {},
 
   SDL_getenv: 'getenv',
+
+  SDL_putenv: 'putenv',
 
   // TODO
 

@@ -41,6 +41,26 @@ mergeInto(LibraryManager.library, {
             Module['setStatus']('');
           }
         }
+      },
+      runIter: function(func) {
+        if (ABORT) return;
+        if (Module['preMainLoop']) {
+          var preRet = Module['preMainLoop']();
+          if (preRet === false) {
+            return; // |return false| skips a frame
+          }
+        }
+        try {
+          func();
+        } catch (e) {
+          if (e instanceof ExitStatus) {
+            return;
+          } else {
+            if (e && typeof e === 'object' && e.stack) Module.printErr('exception thrown: ' + [e, e.stack]);
+            throw e;
+          }
+        }
+        if (Module['postMainLoop']) Module['postMainLoop']();
       }
     },
     isFullScreen: false,
@@ -51,7 +71,7 @@ mergeInto(LibraryManager.library, {
     init: function() {
       if (!Module["preloadPlugins"]) Module["preloadPlugins"] = []; // needs to exist even in workers
 
-      if (Browser.initted || ENVIRONMENT_IS_WORKER) return;
+      if (Browser.initted) return;
       Browser.initted = true;
 
       try {
@@ -196,6 +216,12 @@ mergeInto(LibraryManager.library, {
       // Canvas event setup
 
       var canvas = Module['canvas'];
+      function pointerLockChange() {
+        Browser.pointerLock = document['pointerLockElement'] === canvas ||
+                              document['mozPointerLockElement'] === canvas ||
+                              document['webkitPointerLockElement'] === canvas ||
+                              document['msPointerLockElement'] === canvas;
+      }
       if (canvas) {
         // forced aspect ratio can be enabled by defining 'forcedAspectRatio' on Module
         // Module['forcedAspectRatio'] = 4 / 3;
@@ -212,12 +238,6 @@ mergeInto(LibraryManager.library, {
                                  function(){}; // no-op if function does not exist
         canvas.exitPointerLock = canvas.exitPointerLock.bind(document);
 
-        function pointerLockChange() {
-          Browser.pointerLock = document['pointerLockElement'] === canvas ||
-                                document['mozPointerLockElement'] === canvas ||
-                                document['webkitPointerLockElement'] === canvas ||
-                                document['msPointerLockElement'] === canvas;
-        }
 
         document.addEventListener('pointerlockchange', pointerLockChange, false);
         document.addEventListener('mozpointerlockchange', pointerLockChange, false);
@@ -236,95 +256,45 @@ mergeInto(LibraryManager.library, {
     },
 
     createContext: function(canvas, useWebGL, setInModule, webGLContextAttributes) {
-#if !USE_TYPED_ARRAYS
-      if (useWebGL) {
-        Module.print('(USE_TYPED_ARRAYS needs to be enabled for WebGL)');
-        return null;
-      }
-#endif
+      if (useWebGL && Module.ctx && canvas == Module.canvas) return Module.ctx; // no need to recreate GL context if it's already been created for this canvas.
+
       var ctx;
-      var errorInfo = '?';
-      function onContextCreationError(event) {
-        errorInfo = event.statusMessage || errorInfo;
-      }
-      try {
-        if (useWebGL) {
-          var contextAttributes = {
-            antialias: false,
-            alpha: false
-          };
-
-          if (webGLContextAttributes) {
-            for (var attribute in webGLContextAttributes) {
-              contextAttributes[attribute] = webGLContextAttributes[attribute];
-            }
-          }
-
-#if GL_TESTING
-          contextAttributes.preserveDrawingBuffer = true;
-#endif
-
-          canvas.addEventListener('webglcontextcreationerror', onContextCreationError, false);
-          try {
-            ['experimental-webgl', 'webgl'].some(function(webglId) {
-              return ctx = canvas.getContext(webglId, contextAttributes);
-            });
-          } finally {
-            canvas.removeEventListener('webglcontextcreationerror', onContextCreationError, false);
-          }
-        } else {
-          ctx = canvas.getContext('2d');
-        }
-        if (!ctx) throw ':(';
-      } catch (e) {
-        Module.print('Could not create canvas: ' + [errorInfo, e]);
-        return null;
-      }
+      var contextHandle;
       if (useWebGL) {
-#if GL_DEBUG
-        // Useful to debug native webgl apps: var Module = { printErr: function(x) { console.log(x) } };
-        var tempCtx = ctx;
-        var wrapper = {};
-        for (var prop in tempCtx) {
-          (function(prop) {
-            switch (typeof tempCtx[prop]) {
-              case 'function': {
-                wrapper[prop] = function gl_wrapper() {
-                  if (GL.debug) {
-                    var printArgs = Array.prototype.slice.call(arguments).map(Runtime.prettyPrint);
-                    Module.printErr('[gl_f:' + prop + ':' + printArgs + ']');
-                  }
-                  var ret = tempCtx[prop].apply(tempCtx, arguments);
-                  if (GL.debug && typeof ret != 'undefined') {
-                    Module.printErr('[     gl:' + prop + ':return:' + Runtime.prettyPrint(ret) + ']');
-                  }
-                  return ret;
-                }
-                break;
-              }
-              case 'number': case 'string': {
-                wrapper.__defineGetter__(prop, function() {
-                  //Module.printErr('[gl_g:' + prop + ':' + tempCtx[prop] + ']');
-                  return tempCtx[prop];
-                });
-                wrapper.__defineSetter__(prop, function(value) {
-                  if (GL.debug) {
-                    Module.printErr('[gl_s:' + prop + ':' + value + ']');
-                  }
-                  tempCtx[prop] = value;
-                });
-                break;
-              }
-            }
-          })(prop);
+        // For GLES2/desktop GL compatibility, adjust a few defaults to be different to WebGL defaults, so that they align better with the desktop defaults.
+        var contextAttributes = {
+          antialias: false,
+          alpha: false
+        };
+
+        if (webGLContextAttributes) {
+          for (var attribute in webGLContextAttributes) {
+            contextAttributes[attribute] = webGLContextAttributes[attribute];
+          }
         }
-        ctx = wrapper;
+#if GL_TESTING
+        contextAttributes.preserveDrawingBuffer = true;
 #endif
+
+        contextHandle = GL.createContext(canvas, contextAttributes);
+        ctx = GL.getContext(contextHandle).GLctx;
         // Set the background of the WebGL canvas to black
+<<<<<<< HEAD
         //canvas.style.backgroundColor = "black";
+=======
+        canvas.style.backgroundColor = "black";
+      } else {
+        ctx = canvas.getContext('2d');
+>>>>>>> upstream/incoming
       }
+
+      if (!ctx) return null;
+
       if (setInModule) {
-        GLctx = Module.ctx = ctx;
+        if (!useWebGL) assert(typeof GLctx === 'undefined', 'cannot set in module if GLctx is used, but we are a non-GL context that would replace it');
+
+        Module.ctx = ctx;
+        if (useWebGL) GL.makeContextCurrent(contextHandle);
         Module.useWebGL = useWebGL;
         Browser.moduleContextCreatedCallbacks.forEach(function(callback) { callback() });
         Browser.init();
@@ -395,20 +365,36 @@ mergeInto(LibraryManager.library, {
       canvasContainer.requestFullScreen();
     },
 
+    nextRAF: 0,
+
+    fakeRequestAnimationFrame: function(func) {
+      // try to keep 60fps between calls to here
+      var now = Date.now();
+      if (Browser.nextRAF === 0) {
+        Browser.nextRAF = now + 1000/60;
+      } else {
+        while (now + 2 >= Browser.nextRAF) { // fudge a little, to avoid timer jitter causing us to do lots of delay:0
+          Browser.nextRAF += 1000/60;
+        }
+      }
+      var delay = Math.max(Browser.nextRAF - now, 0);
+      setTimeout(func, delay);
+    },
+
     requestAnimationFrame: function requestAnimationFrame(func) {
-      //if (typeof window === 'undefined') { // Provide fallback to setTimeout if window is undefined (e.g. in Node.js)
-      //  setTimeout(func, 1000/60);
-      //} else {
+      if (typeof window === 'undefined') { // Provide fallback to setTimeout if window is undefined (e.g. in Node.js)
+        Browser.fakeRequestAnimationFrame(func);
+      } else {
         if (!window.requestAnimationFrame) {
           window.requestAnimationFrame = window['requestAnimationFrame'] ||
                                          window['mozRequestAnimationFrame'] ||
                                          window['webkitRequestAnimationFrame'] ||
                                          window['msRequestAnimationFrame'] ||
                                          window['oRequestAnimationFrame'] ||
-                                         window['setTimeout'];
+                                         Browser.fakeRequestAnimationFrame;
         }
         window.requestAnimationFrame(func);
-      //}
+      }
     },
 
     // generic abort-aware wrapper for an async callback
@@ -694,6 +680,27 @@ mergeInto(LibraryManager.library, {
     }
   },
 
+#if ASYNCIFY
+  emscripten_wget__deps: ['emscripten_async_resume'],
+  emscripten_wget: function(url, file) {
+    var _url = Pointer_stringify(url);
+    var _file = Pointer_stringify(file);
+    asm.setAsync();
+    Module['noExitRuntime'] = true;
+    FS.createPreloadedFile(
+      PATH.dirname(_file),
+      PATH.basename(_file),
+      _url, true, true,
+      _emscripten_async_resume,
+      _emscripten_async_resume
+    );
+  },
+#else
+  emscripten_wget: function(url, file) {
+    throw 'Please compile your program with -s ASYNCIFY=1 in order to use asynchronous operations like emscripten_wget';
+  },
+#endif
+
   emscripten_async_wget: function(url, file, onload, onerror) {
     var _url = Pointer_stringify(url);
     var _file = Pointer_stringify(file);
@@ -954,28 +961,13 @@ mergeInto(LibraryManager.library, {
         Browser.mainLoop.method = ''; // just warn once per call to set main loop
       }
 
-      if (Module['preMainLoop']) {
-        Module['preMainLoop']();
-      }
-
-      try {
+      Browser.mainLoop.runIter(function() {
         if (typeof arg !== 'undefined') {
           Runtime.dynCall('vi', func, [arg]);
         } else {
           Runtime.dynCall('v', func);
         }
-      } catch (e) {
-        if (e instanceof ExitStatus) {
-          return;
-        } else {
-          if (e && typeof e === 'object' && e.stack) Module.printErr('exception thrown: ' + [e, e.stack]);
-          throw e;
-        }
-      }
-
-      if (Module['postMainLoop']) {
-        Module['postMainLoop']();
-      }
+      });
 
       if (Browser.mainLoop.shouldPause) {
         // catch pauses from the main loop itself
@@ -1058,6 +1050,11 @@ mergeInto(LibraryManager.library, {
   emscripten_exit_with_live_runtime: function() {
     Module['noExitRuntime'] = true;
     throw 'SimulateInfiniteLoop';
+  },
+
+  emscripten_force_exit: function(status) {
+    Module['noExitRuntime'] = false;
+    Module['exit'](status);
   },
 
   emscripten_hide_mouse: function() {

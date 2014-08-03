@@ -48,6 +48,8 @@ mergeInto(LibraryManager.library, {
       path = PATH.resolve(FS.cwd(), path);
       opts = opts || {};
 
+      if (!path) return { path: '', node: null };
+
       var defaults = {
         follow_mount: true,
         recurse_count: 0
@@ -309,7 +311,10 @@ mergeInto(LibraryManager.library, {
       return 0;
     },
     mayLookup: function(dir) {
-      return FS.nodePermissions(dir, 'x');
+      var err = FS.nodePermissions(dir, 'x');
+      if (err) return err;
+      if (!dir.node_ops.lookup) return ERRNO_CODES.EACCES;
+      return 0;
     },
     mayCreate: function(dir, name) {
       try {
@@ -607,6 +612,9 @@ mergeInto(LibraryManager.library, {
       var lookup = FS.lookupPath(path, { parent: true });
       var parent = lookup.node;
       var name = PATH.basename(path);
+      if (!name || name === '.' || name === '..') {
+        throw new FS.ErrnoError(ERRNO_CODES.EINVAL);
+      }
       var err = FS.mayCreate(parent, name);
       if (err) {
         throw new FS.ErrnoError(err);
@@ -638,8 +646,14 @@ mergeInto(LibraryManager.library, {
       return FS.mknod(path, mode, dev);
     },
     symlink: function(oldpath, newpath) {
+      if (!PATH.resolve(oldpath)) {
+        throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
+      }
       var lookup = FS.lookupPath(newpath, { parent: true });
       var parent = lookup.node;
+      if (!parent) {
+        throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
+      }
       var newname = PATH.basename(newpath);
       var err = FS.mayCreate(parent, newname);
       if (err) {
@@ -665,6 +679,7 @@ mergeInto(LibraryManager.library, {
       } catch (e) {
         throw new FS.ErrnoError(ERRNO_CODES.EBUSY);
       }
+      if (!old_dir || !new_dir) throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
       // need to be part of the same mount
       if (old_dir.mount !== new_dir.mount) {
         throw new FS.ErrnoError(ERRNO_CODES.EXDEV);
@@ -817,6 +832,9 @@ mergeInto(LibraryManager.library, {
     readlink: function(path) {
       var lookup = FS.lookupPath(path);
       var link = lookup.node;
+      if (!link) {
+        throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
+      }
       if (!link.node_ops.readlink) {
         throw new FS.ErrnoError(ERRNO_CODES.EINVAL);
       }
@@ -825,6 +843,9 @@ mergeInto(LibraryManager.library, {
     stat: function(path, dontFollow) {
       var lookup = FS.lookupPath(path, { follow: !dontFollow });
       var node = lookup.node;
+      if (!node) {
+        throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
+      }
       if (!node.node_ops.getattr) {
         throw new FS.ErrnoError(ERRNO_CODES.EPERM);
       }
@@ -932,6 +953,9 @@ mergeInto(LibraryManager.library, {
       });
     },
     open: function(path, flags, mode, fd_start, fd_end) {
+      if (path === "") {
+        throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
+      }
       flags = typeof flags === 'string' ? FS.modeStringToFlags(flags) : flags;
       mode = typeof mode === 'undefined' ? 438 /* 0666 */ : mode;
       if ((flags & {{{ cDefine('O_CREAT') }}})) {
@@ -954,6 +978,7 @@ mergeInto(LibraryManager.library, {
         }
       }
       // perhaps we need to create the node
+      var created = false;
       if ((flags & {{{ cDefine('O_CREAT') }}})) {
         if (node) {
           // if O_CREAT and O_EXCL are set, error out if the node already exists
@@ -963,6 +988,7 @@ mergeInto(LibraryManager.library, {
         } else {
           // node doesn't exist, try to create it
           node = FS.mknod(path, mode, 0);
+          created = true;
         }
       }
       if (!node) {
@@ -972,10 +998,14 @@ mergeInto(LibraryManager.library, {
       if (FS.isChrdev(node.mode)) {
         flags &= ~{{{ cDefine('O_TRUNC') }}};
       }
-      // check permissions
-      var err = FS.mayOpen(node, flags);
-      if (err) {
-        throw new FS.ErrnoError(err);
+      // check permissions, if this is not a file we just created now (it is ok to
+      // create and write to a file with read-only permissions; it is read-only
+      // for later use)
+      if (!created) {
+        var err = FS.mayOpen(node, flags);
+        if (err) {
+          throw new FS.ErrnoError(err);
+        }
       }
       // do truncation if necessary
       if ((flags & {{{ cDefine('O_TRUNC')}}})) {
@@ -1190,6 +1220,8 @@ mergeInto(LibraryManager.library, {
     },
     createDefaultDirectories: function() {
       FS.mkdir('/tmp');
+      FS.mkdir('/home');
+      FS.mkdir('/home/web_user');
     },
     createDefaultDevices: function() {
       // create /dev
@@ -1207,6 +1239,21 @@ mergeInto(LibraryManager.library, {
       TTY.register(FS.makedev(6, 0), TTY.default_tty1_ops);
       FS.mkdev('/dev/tty', FS.makedev(5, 0));
       FS.mkdev('/dev/tty1', FS.makedev(6, 0));
+      // setup /dev/[u]random
+      var random_device;
+      if (typeof crypto !== 'undefined') {
+        // for modern web browsers
+        var randomBuffer = new Uint8Array(1);
+        random_device = function() { crypto.getRandomValues(randomBuffer); return randomBuffer[0]; };
+      } else if (ENVIRONMENT_IS_NODE) {
+        // for nodejs
+        random_device = function() { return require('crypto').randomBytes(1)[0]; };
+      } else {
+        // default for ES5 platforms
+        random_device = function() { return Math.floor(Math.random()*256); };
+      }
+      FS.createDevice('/dev', 'random', random_device);
+      FS.createDevice('/dev', 'urandom', random_device);
       // we're not going to emulate the actual shm device,
       // just create the tmp dirs that reside in it commonly
       FS.mkdir('/dev/shm');
@@ -1511,61 +1558,61 @@ mergeInto(LibraryManager.library, {
         this.getter = getter;
       }
       LazyUint8Array.prototype.cacheLength = function LazyUint8Array_cacheLength() {
-          // Find length
-          var xhr = new XMLHttpRequest();
-          xhr.open('HEAD', url, false);
-          xhr.send(null);
-          if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
-          var datalength = Number(xhr.getResponseHeader("Content-length"));
-          var header;
-          var hasByteServing = (header = xhr.getResponseHeader("Accept-Ranges")) && header === "bytes";
+        // Find length
+        var xhr = new XMLHttpRequest();
+        xhr.open('HEAD', url, false);
+        xhr.send(null);
+        if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
+        var datalength = Number(xhr.getResponseHeader("Content-length"));
+        var header;
+        var hasByteServing = (header = xhr.getResponseHeader("Accept-Ranges")) && header === "bytes";
 #if SMALL_XHR_CHUNKS
-          var chunkSize = 1024; // Chunk size in bytes
+        var chunkSize = 1024; // Chunk size in bytes
 #else
-          var chunkSize = 1024*1024; // Chunk size in bytes
+        var chunkSize = 1024*1024; // Chunk size in bytes
 #endif
 
-          if (!hasByteServing) chunkSize = datalength;
+        if (!hasByteServing) chunkSize = datalength;
 
-          // Function to get a range from the remote URL.
-          var doXHR = (function(from, to) {
-            if (from > to) throw new Error("invalid range (" + from + ", " + to + ") or no bytes requested!");
-            if (to > datalength-1) throw new Error("only " + datalength + " bytes available! programmer error!");
+        // Function to get a range from the remote URL.
+        var doXHR = (function(from, to) {
+          if (from > to) throw new Error("invalid range (" + from + ", " + to + ") or no bytes requested!");
+          if (to > datalength-1) throw new Error("only " + datalength + " bytes available! programmer error!");
 
-            // TODO: Use mozResponseArrayBuffer, responseStream, etc. if available.
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', url, false);
-            if (datalength !== chunkSize) xhr.setRequestHeader("Range", "bytes=" + from + "-" + to);
+          // TODO: Use mozResponseArrayBuffer, responseStream, etc. if available.
+          var xhr = new XMLHttpRequest();
+          xhr.open('GET', url, false);
+          if (datalength !== chunkSize) xhr.setRequestHeader("Range", "bytes=" + from + "-" + to);
 
-            // Some hints to the browser that we want binary data.
-            if (typeof Uint8Array != 'undefined') xhr.responseType = 'arraybuffer';
-            if (xhr.overrideMimeType) {
-              xhr.overrideMimeType('text/plain; charset=x-user-defined');
-            }
+          // Some hints to the browser that we want binary data.
+          if (typeof Uint8Array != 'undefined') xhr.responseType = 'arraybuffer';
+          if (xhr.overrideMimeType) {
+            xhr.overrideMimeType('text/plain; charset=x-user-defined');
+          }
 
-            xhr.send(null);
-            if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
-            if (xhr.response !== undefined) {
-              return new Uint8Array(xhr.response || []);
-            } else {
-              return intArrayFromString(xhr.responseText || '', true);
-            }
-          });
-          var lazyArray = this;
-          lazyArray.setDataGetter(function(chunkNum) {
-            var start = chunkNum * chunkSize;
-            var end = (chunkNum+1) * chunkSize - 1; // including this byte
-            end = Math.min(end, datalength-1); // if datalength-1 is selected, this is the last block
-            if (typeof(lazyArray.chunks[chunkNum]) === "undefined") {
-              lazyArray.chunks[chunkNum] = doXHR(start, end);
-            }
-            if (typeof(lazyArray.chunks[chunkNum]) === "undefined") throw new Error("doXHR failed!");
-            return lazyArray.chunks[chunkNum];
-          });
+          xhr.send(null);
+          if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
+          if (xhr.response !== undefined) {
+            return new Uint8Array(xhr.response || []);
+          } else {
+            return intArrayFromString(xhr.responseText || '', true);
+          }
+        });
+        var lazyArray = this;
+        lazyArray.setDataGetter(function(chunkNum) {
+          var start = chunkNum * chunkSize;
+          var end = (chunkNum+1) * chunkSize - 1; // including this byte
+          end = Math.min(end, datalength-1); // if datalength-1 is selected, this is the last block
+          if (typeof(lazyArray.chunks[chunkNum]) === "undefined") {
+            lazyArray.chunks[chunkNum] = doXHR(start, end);
+          }
+          if (typeof(lazyArray.chunks[chunkNum]) === "undefined") throw new Error("doXHR failed!");
+          return lazyArray.chunks[chunkNum];
+        });
 
-          this._length = datalength;
-          this._chunkSize = chunkSize;
-          this.lengthKnown = true;
+        this._length = datalength;
+        this._chunkSize = chunkSize;
+        this.lengthKnown = true;
       }
       if (typeof XMLHttpRequest !== 'undefined') {
         if (!ENVIRONMENT_IS_WORKER) throw 'Cannot do synchronous binary XHRs outside webworkers in modern browsers. Use --embed-file or --preload-file in emcc';

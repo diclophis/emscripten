@@ -231,6 +231,9 @@ var LABEL_FUNCTION_FILTERS = []; // Filters for function label debug.
                                  // When the array is empty, the filter is disabled.
 var EXCEPTION_DEBUG = 0; // Print out exceptions in emscriptened code. Does not work in asm.js mode
 
+var DEMANGLE_SUPPORT = 0; // If 1, build in libcxxabi's full c++ demangling code, to allow stackTrace()
+                          // to emit fully proper demangled c++ names
+
 var LIBRARY_DEBUG = 0; // Print out when we enter a library call (library*.js). You can also unset
                        // Runtime.debug at runtime for logging to cease, and can set it when you
                        // want it back. A simple way to set it in C++ is
@@ -288,6 +291,21 @@ var DISABLE_EXCEPTION_CATCHING = 0; // Disables generating code to actually catc
 
 var EXCEPTION_CATCHING_WHITELIST = [];  // Enables catching exception in the listed functions only, if
                                         // DISABLE_EXCEPTION_CATCHING = 2 is set
+
+// For more explanations of this option, please visit
+// https://github.com/kripken/emscripten/wiki/Asyncify
+var ASYNCIFY = 0; // Whether to enable asyncify transformation
+                  // This allows to inject some async functions to the C code that appear to be sync
+                  // e.g. emscripten_sleep
+var ASYNCIFY_FUNCTIONS = ['emscripten_sleep', // Functions that call any funcion in the list, directly or indirectly
+                          'emscripten_wget']; // will be transfromed
+var ASYNCIFY_WHITELIST = ['qsort',   // Functions in this list are never considered async, even if they appear in ASYNCIFY_FUNCTIONS
+                          'trinkle', // In the asyncify transformation, any function that calls a function pointer is considered async 
+                          '__toread', // This whitelist is useful when a function is known to be sync
+                          '__uflow',  // currently this link contains some functions in libc
+                          '__fwritex', 
+                          'MUSL_vfprintf']; 
+                                                                                                    
 
 var EXECUTION_TIMEOUT = -1; // Throw an exception after X seconds - useful to debug infinite loops
 var CHECK_OVERFLOWS = 0; // Add code that checks for overflows in integer math operations.
@@ -422,9 +440,14 @@ var RUNTIME_LINKED_LIBS = []; // If this is a main file (BUILD_AS_SHARED_LIB == 
                               //       linked libraries can break things.
 var BUILD_AS_WORKER = 0; // If set to 1, this is a worker library, a special kind of library
                          // that is run in a worker. See emscripten.h
+
 var PROXY_TO_WORKER = 0; // If set to 1, we build the project into a js file that will run
                          // in a worker, and generate an html file that proxies input and
                          // output to/from it.
+var PROXY_TO_WORKER_FILENAME = ''; // If set, the script file name the main thread loads.
+                                   // Useful if your project doesn't run the main emscripten-
+                                   // generated script immediately but does some setup before
+
 var LINKABLE = 0; // If set to 1, this file can be linked with others, either as a shared
                   // library or as the main file that calls a shared library. To enable that,
                   // we will not internalize all symbols and cull the unused ones, in other
@@ -531,6 +554,13 @@ var DEBUG_TAGS_SHOWING = [];
   //    unparsedFunctions
   //    metadata
   //    legalizer
+
+// For internal use only
+var ORIGINAL_EXPORTED_FUNCTIONS = [];
+var CORRECT_OVERFLOWS_LINES = [];
+var CORRECT_SIGNS_LINES = [];
+var CORRECT_ROUNDINGS_LINES = [];
+var SAFE_HEAP_LINES = [];
 
 // The list of defines (C_DEFINES) was moved into struct_info.json in the same directory.
 // That file is automatically parsed by tools/gen_struct_info.py.

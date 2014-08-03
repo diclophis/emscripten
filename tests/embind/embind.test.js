@@ -8,15 +8,12 @@ module({
             cm.setDelayFunction(undefined);
 
             if (typeof INVOKED_FROM_EMSCRIPTEN_TEST_RUNNER === "undefined") { // TODO: Enable this to work in Emscripten runner as well!
-                cm._mallocDebug(2);
                 assert.equal(0, cm.count_emval_handles());
-                cm._mallocAssertAllMemoryFree();
             }
         });
         this.tearDown(function() {
             cm.flushPendingDeletes();
             if (typeof INVOKED_FROM_EMSCRIPTEN_TEST_RUNNER === "undefined") { // TODO: Enable this to work in Emscripten runner as well!
-                cm._mallocAssertAllMemoryFree();
                 assert.equal(0, cm.count_emval_handles());
             }
         });
@@ -28,35 +25,6 @@ module({
         test("temp test", function() {
         });
     });
-
-    if (typeof INVOKED_FROM_EMSCRIPTEN_TEST_RUNNER === "undefined") { // TODO: Enable this to work in Emscripten runner as well!
-
-    BaseFixture.extend("leak testing", function() {
-        test("no memory allocated at start of test", function() {
-            cm._mallocAssertAllMemoryFree();
-        });
-        test("assert when memory is allocated", function() {
-            var ptr = cm._malloc(42);
-            assert.throws(cm._MemoryAllocationError, function() {
-                cm._mallocAssertAllMemoryFree();
-            });
-            cm._free(ptr);
-        });
-        test("allocated memory counts down again for free", function() {
-            var ptr = cm._malloc(42);
-            cm._free(ptr);
-            cm._mallocAssertAllMemoryFree();
-        });
-        test("free without malloc throws MemoryAllocationError", function() {
-            var ptr = cm._malloc(42);
-            cm._free(ptr);
-            assert.throws(cm._MemoryAllocationError, function() {
-                cm._free(ptr);
-            });
-        });
-    });
-
-    }
 
     BaseFixture.extend("access to base class members", function() {
         test("method name in derived class silently overrides inherited name", function() {
@@ -601,6 +569,18 @@ module({
             var c = new cm.BigClass();
             var m = cm.embind_test_accept_big_class_instance(c);
             assert.equal(11, m);
+            c.delete();
+        });
+
+        test("can pass unique_ptr", function() {
+            var p = cm.embind_test_return_unique_ptr(42);
+            var m = cm.embind_test_accept_unique_ptr(p);
+            assert.equal(42, m);
+        });
+
+        test("can pass unique_ptr to constructor", function() {
+            var c = new cm.embind_test_construct_class_with_unique_ptr(42);
+            assert.equal(42, c.getValue());
             c.delete();
         });
 
@@ -1580,8 +1560,6 @@ module({
             };
 
             var impl = cm.AbstractClass.implement(new MyImplementation);
-            // TODO: remove .implement() as a public API. It interacts poorly with Class.extend.
-            //assert.equal(expected, impl.optionalMethod(expected));
             assert.equal(expected, cm.callOptionalMethod(impl, expected));
             impl.delete();
         });
@@ -1589,8 +1567,6 @@ module({
         test("if not implemented then optional method runs default", function() {
             var impl = cm.AbstractClass.implement({});
             assert.equal("optionalfoo", impl.optionalMethod("foo"));
-            // TODO: remove .implement() as a public API. It interacts poorly with Class.extend.
-            //assert.equal("optionalfoo", cm.callOptionalMethod(impl, "foo"));
             impl.delete();
         });
 
@@ -1759,8 +1735,6 @@ module({
             instance.delete();
             assert.equal("optionaljs_optional_123", result);
         });
-
-        // TODO: deriving from classes with constructors?
 
         test("instanceof", function() {
             var instance = new Empty;
