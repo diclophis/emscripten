@@ -160,7 +160,7 @@ static void pop_arg(union arg *arg, int type, va_list *ap)
 
 static void out(FILE *f, const char *s, size_t l)
 {
-	__fwritex((void *)s, l, f);
+	if (!(f->flags & F_ERR)) __fwritex((void *)s, l, f);
 }
 
 static void pad(FILE *f, char c, int w, int l, int fl)
@@ -207,7 +207,8 @@ typedef char compiler_defines_long_double_incorrectly[9-(int)sizeof(long double)
 
 static int fmt_fp(FILE *f, long double y, int w, int p, int fl, int t)
 {
-	uint32_t big[(LDBL_MAX_EXP+LDBL_MANT_DIG)/9+1];
+	uint32_t big[(LDBL_MANT_DIG+28)/29 + 1          // mantissa expansion
+		+ (LDBL_MAX_EXP+LDBL_MANT_DIG+28+8)/9]; // exponent expansion
 	uint32_t *a, *d, *r, *z;
 	int e2=0, e, i, j, l;
 	char buf[9+LDBL_MANT_DIG/4], *s;
@@ -307,13 +308,13 @@ static int fmt_fp(FILE *f, long double y, int w, int p, int fl, int t)
 			*d = x % 1000000000;
 			carry = x / 1000000000;
 		}
-		if (!z[-1] && z>a) z--;
 		if (carry) *--a = carry;
+		while (z>a && !z[-1]) z--;
 		e2-=sh;
 	}
 	while (e2<0) {
 		uint32_t carry=0, *b;
-		int sh=MIN(9,-e2);
+		int sh=MIN(9,-e2), need=1+(p+LDBL_MANT_DIG/3+8)/9;
 		for (d=a; d<z; d++) {
 			uint32_t rm = *d & (1<<sh)-1;
 			*d = (*d>>sh) + carry;
@@ -323,7 +324,7 @@ static int fmt_fp(FILE *f, long double y, int w, int p, int fl, int t)
 		if (carry) *z++ = carry;
 		/* Avoid (slow!) computation past requested precision */
 		b = (t|32)=='f' ? r : a;
-		if (z-b > 2+p/9) z = b+2+p/9;
+		if (z-b > need) z = b+need;
 		e2+=sh;
 	}
 
@@ -355,15 +356,15 @@ static int fmt_fp(FILE *f, long double y, int w, int p, int fl, int t)
 				*d = *d + i;
 				while (*d > 999999999) {
 					*d--=0;
+					if (d<a) *--a=0;
 					(*d)++;
 				}
-				if (d<a) a=d;
 				for (i=10, e=9*(r-a); *a>=i; i*=10, e++);
 			}
 		}
 		if (z>d+1) z=d+1;
-		for (; !z[-1] && z>a; z--);
 	}
+	for (; z>a && !z[-1]; z--);
 	
 	if ((t|32)=='g') {
 		if (!p) p++;
@@ -530,7 +531,6 @@ static int printf_core(FILE *f, const char *fmt, va_list *ap, union arg *nl_arg,
 		/* Check validity of argument type (nl/normal) */
 		if (st==NOARG) {
 			if (argpos>=0) return -1;
-			else if (!f) continue;
 		} else {
 			if (argpos>=0) nl_type[argpos]=st, arg=nl_arg[argpos];
 			else if (f) pop_arg(&arg, st, ap);
@@ -572,7 +572,7 @@ static int printf_core(FILE *f, const char *fmt, va_list *ap, union arg *nl_arg,
 			if (0) {
 		case 'o':
 			a = fmt_o(arg.i, z);
-			if ((fl&ALT_FORM) && arg.i) prefix+=5, pl=1;
+			if ((fl&ALT_FORM) && p<z-a+1) p=z-a+1;
 			} if (0) {
 		case 'd': case 'i':
 			pl=1;
@@ -652,19 +652,25 @@ static int printf_core(FILE *f, const char *fmt, va_list *ap, union arg *nl_arg,
 	return 1;
 }
 
-//int vfprintf(FILE *restrict f, const char *restrict fmt, va_list ap)
-int MUSL_vfprintf(FILE *restrict f, const char *restrict fmt, va_list ap) /// XXX Emscripten: Only use musl-specific vfprintf when called from within sprintf.
+int vfprintf(FILE *restrict f, const char *restrict fmt, va_list ap)
 {
 	va_list ap2;
 	int nl_type[NL_ARGMAX+1] = {0};
 	union arg nl_arg[NL_ARGMAX+1];
 	unsigned char internal_buf[80], *saved_buf = 0;
+	int olderr;
 	int ret;
 
+	/* the copy allows passing va_list* even if va_list is an array */
 	va_copy(ap2, ap);
-	if (printf_core(0, fmt, &ap2, nl_arg, nl_type) < 0) return -1;
+	if (printf_core(0, fmt, &ap2, nl_arg, nl_type) < 0) {
+		va_end(ap2);
+		return -1;
+	}
 
 	FLOCK(f);
+	olderr = f->flags & F_ERR;
+	if (f->mode < 1) f->flags &= ~F_ERR;
 	if (!f->buf_size) {
 		saved_buf = f->buf;
 		f->wpos = f->wbase = f->buf = internal_buf;
@@ -679,6 +685,8 @@ int MUSL_vfprintf(FILE *restrict f, const char *restrict fmt, va_list ap) /// XX
 		f->buf_size = 0;
 		f->wpos = f->wbase = f->wend = 0;
 	}
+	if (f->flags & F_ERR) ret = -1;
+	f->flags |= olderr;
 	FUNLOCK(f);
 	va_end(ap2);
 	return ret;

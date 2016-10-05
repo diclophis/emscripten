@@ -1,5 +1,7 @@
 mergeInto(LibraryManager.library, {
+#if NO_FILESYSTEM == 0
   $PATH__deps: ['$FS'],
+#endif
   $PATH: {
     // split a filename into [root, dir, basename, ext], unix version
     // 'root' is just a slash, or nothing.
@@ -85,7 +87,7 @@ mergeInto(LibraryManager.library, {
         if (typeof path !== 'string') {
           throw new TypeError('Arguments to path.resolve must be strings');
         } else if (!path) {
-          continue;
+          return ''; // an invalid portion invalidates the whole thing
         }
         resolvedPath = path + '/' + resolvedPath;
         resolvedAbsolute = path.charAt(0) === '/';
