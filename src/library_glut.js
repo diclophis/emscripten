@@ -295,23 +295,23 @@ var LibraryGLUT = {
     // Ignore arguments
     GLUT.initTime = Date.now();
 
-    var isTouchDevice = 'ontouchstart' in document.documentElement;
+    //var isTouchDevice = 'ontouchstart' in document.documentElement;
 
     window.addEventListener("keydown", GLUT.onKeydown, true);
     window.addEventListener("keyup", GLUT.onKeyup, true);
-    if (isTouchDevice) {
+    //if (isTouchDevice) {
       window.addEventListener("touchmove", GLUT.onMousemove, true);
       window.addEventListener("touchstart", GLUT.onMouseButtonDown, true);
       window.addEventListener("touchend", GLUT.onMouseButtonUp, true);
-    } else {
+    //} else {
       window.addEventListener("mousemove", GLUT.onMousemove, true);
       window.addEventListener("mousedown", GLUT.onMouseButtonDown, true);
       window.addEventListener("mouseup", GLUT.onMouseButtonUp, true);
       // IE9, Chrome, Safari, Opera
-      window.addEventListener("mousewheel", GLUT.onMouseWheel, true);
+      //window.addEventListener("mousewheel", GLUT.onMouseWheel, true);
       // Firefox
-      window.addEventListener("DOMMouseScroll", GLUT.onMouseWheel, true);
-    }
+      //window.addEventListener("DOMMouseScroll", GLUT.onMouseWheel, true);
+    //}
 
     Browser.resizeListeners.push(function(width, height) {
       if (GLUT.reshapeFunc) {
@@ -397,7 +397,16 @@ var LibraryGLUT = {
   },
 
   glutDisplayFunc: function(func) {
+    GLUT.CACHE_V = 'v';
     GLUT.displayFunc = func;
+    GLUT.xyz = function() {
+      Runtime.dynCall(GLUT.CACHE_V, GLUT.displayFunc);
+    };
+    GLUT.abc = function() {
+      GLUT.requestedAnimationFrame = false;
+      //Browser.mainLoop.runIter(GLUT.xyz);
+      GLUT.xyz();
+    };
   },
 
   glutKeyboardFunc: function(func) {
@@ -485,14 +494,10 @@ var LibraryGLUT = {
   glutSwapBuffers: function() {},
 
   glutPostRedisplay: function() {
+
     if (GLUT.displayFunc && !GLUT.requestedAnimationFrame) {
       GLUT.requestedAnimationFrame = true;
-      Browser.requestAnimationFrame(function() {
-        GLUT.requestedAnimationFrame = false;
-        Browser.mainLoop.runIter(function() {
-          Runtime.dynCall('v', GLUT.displayFunc);
-        });
-      });
+      Browser.requestAnimationFrame(GLUT.abc);
     }
   },
 

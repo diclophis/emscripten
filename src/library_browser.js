@@ -278,14 +278,8 @@ mergeInto(LibraryManager.library, {
 
         contextHandle = GL.createContext(canvas, contextAttributes);
         ctx = GL.getContext(contextHandle).GLctx;
-        // Set the background of the WebGL canvas to black
-<<<<<<< HEAD
-        //canvas.style.backgroundColor = "black";
-=======
-        canvas.style.backgroundColor = "black";
       } else {
         ctx = canvas.getContext('2d');
->>>>>>> upstream/incoming
       }
 
       if (!ctx) return null;
@@ -382,19 +376,7 @@ mergeInto(LibraryManager.library, {
     },
 
     requestAnimationFrame: function requestAnimationFrame(func) {
-      if (typeof window === 'undefined') { // Provide fallback to setTimeout if window is undefined (e.g. in Node.js)
-        Browser.fakeRequestAnimationFrame(func);
-      } else {
-        if (!window.requestAnimationFrame) {
-          window.requestAnimationFrame = window['requestAnimationFrame'] ||
-                                         window['mozRequestAnimationFrame'] ||
-                                         window['webkitRequestAnimationFrame'] ||
-                                         window['msRequestAnimationFrame'] ||
-                                         window['oRequestAnimationFrame'] ||
-                                         Browser.fakeRequestAnimationFrame;
-        }
-        window.requestAnimationFrame(func);
-      }
+      window.requestAnimationFrame(func);
     },
 
     // generic abort-aware wrapper for an async callback
@@ -525,7 +507,7 @@ mergeInto(LibraryManager.library, {
 #endif
 
         if (event.type === 'touchstart' || event.type === 'touchend' || event.type === 'touchmove') {
-          var touch = event.touch;
+          var touch = event.touches[0];
           if (touch === undefined) {
             return; // the "touch" property is only defined in SDL
 
@@ -537,6 +519,10 @@ mergeInto(LibraryManager.library, {
           adjustedY = adjustedY * (ch / rect.height);
 
           var coords = { x: adjustedX, y: adjustedY };
+
+          Browser.mouseX = coords.x;
+          Browser.mouseY = coords.y;
+
           
           if (event.type === 'touchstart') {
             Browser.lastTouches[touch.identifier] = coords;
