@@ -1,3 +1,5 @@
+.. _community:
+
 =========
 Community
 =========
@@ -15,12 +17,10 @@ The best ways to contact us for support are the *mailing list* and the *IRC* cha
 - Mailing list: `emscripten-discuss <http://groups.google.com/group/emscripten-discuss>`_
 - IRC: **#emscripten** on `irc.mozilla.org <https://wiki.mozilla.org/IRC>`_ 
 
+Emscripten also has a presence on social media:
 
-Emscripten also has an *unofficial* presence on social media:
-
-- `Google+ page <https://plus.google.com/100622854474489221138>`_
 - `#emscripten <https://twitter.com/hashtag/emscripten>`_ (Emscripten Hashtag on Twitter)   
-- `@kripken <https://twitter.com/kripken>`_ (Emscripten Developer Account on Twitter)
+- `@kripken <https://twitter.com/kripken>`_ (an Emscripten developer's account on Twitter, mentions Emscripten updates)
 
 
 Report a bug
@@ -39,7 +39,7 @@ Get the latest official Emscripten news on the blogs: `Developer blog (azakai) <
 
 In addition, other interesting blogs and demos are regularly shared on Twitter by the development team `(@kripken) <https://twitter.com/kripken>`_ and the broader community `(#emscripten) <https://twitter.com/hashtag/emscripten>`_. 
 
-.. todo :: **HamishW** At some point in future would be nice to actually display RSS feeds from above links here. Perhaps including @kripen in feed. In this case would need a dedicated blogs link as well.
+.. todo :: **HamishW** At some point in future would be nice to actually display RSS feeds from above links here. Perhaps including @kripken in feed. In this case would need a dedicated blogs link as well.
 
 
 Contribute

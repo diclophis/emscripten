@@ -42,6 +42,9 @@ mergeInto(LibraryManager.library, {
       } catch (e) {
         return callback(e);
       }
+      if (!req) {
+        return callback("Unable to connect to IndexedDB");
+      }
       req.onupgradeneeded = function(e) {
         var db = e.target.result;
         var transaction = e.target.transaction;
@@ -54,7 +57,9 @@ mergeInto(LibraryManager.library, {
           fileStore = db.createObjectStore(IDBFS.DB_STORE_NAME);
         }
 
-        fileStore.createIndex('timestamp', 'timestamp', { unique: false });
+        if (!fileStore.indexNames.contains('timestamp')) {
+          fileStore.createIndex('timestamp', 'timestamp', { unique: false });
+        }
       };
       req.onsuccess = function() {
         db = req.result;
@@ -63,8 +68,9 @@ mergeInto(LibraryManager.library, {
         IDBFS.dbs[name] = db;
         callback(null, db);
       };
-      req.onerror = function() {
+      req.onerror = function(e) {
         callback(this.error);
+        e.preventDefault();
       };
     },
     getLocalSet: function(mount, callback) {
@@ -107,7 +113,10 @@ mergeInto(LibraryManager.library, {
         if (err) return callback(err);
 
         var transaction = db.transaction([IDBFS.DB_STORE_NAME], 'readonly');
-        transaction.onerror = function() { callback(this.error); };
+        transaction.onerror = function(e) {
+          callback(this.error);
+          e.preventDefault();
+        };
 
         var store = transaction.objectStore(IDBFS.DB_STORE_NAME);
         var index = store.index('timestamp');
@@ -157,6 +166,7 @@ mergeInto(LibraryManager.library, {
           return callback(new Error('node type not supported'));
         }
 
+        FS.chmod(path, entry.mode);
         FS.utime(path, entry.timestamp, entry.timestamp);
       } catch (e) {
         return callback(e);
@@ -183,17 +193,26 @@ mergeInto(LibraryManager.library, {
     loadRemoteEntry: function(store, path, callback) {
       var req = store.get(path);
       req.onsuccess = function(event) { callback(null, event.target.result); };
-      req.onerror = function() { callback(this.error); };
+      req.onerror = function(e) {
+        callback(this.error);
+        e.preventDefault();
+      };
     },
     storeRemoteEntry: function(store, path, entry, callback) {
       var req = store.put(entry, path);
       req.onsuccess = function() { callback(null); };
-      req.onerror = function() { callback(this.error); };
+      req.onerror = function(e) {
+        callback(this.error);
+        e.preventDefault();
+      };
     },
     removeRemoteEntry: function(store, path, callback) {
       var req = store.delete(path);
       req.onsuccess = function() { callback(null); };
-      req.onerror = function() { callback(this.error); };
+      req.onerror = function(e) {
+        callback(this.error);
+        e.preventDefault();
+      };
     },
     reconcile: function(src, dst, callback) {
       var total = 0;
@@ -241,7 +260,10 @@ mergeInto(LibraryManager.library, {
         }
       };
 
-      transaction.onerror = function() { done(this.error); };
+      transaction.onerror = function(e) {
+        done(this.error);
+        e.preventDefault();
+      };
 
       // sort paths in ascending order so directory entries are created
       // before the files inside them

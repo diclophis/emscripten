@@ -1,6 +1,8 @@
-=======
+.. _html5-h:
+
+========
 html5.h
-=======
+========
 
 The C++ APIs in `html5.h <https://github.com/kripken/emscripten/blob/master/system/include/emscripten/html5.h>`_ define the Emscripten low-level glue bindings to interact with HTML5 events from native code. 
 
@@ -74,7 +76,7 @@ The ``userData`` parameter is a user-defined value that is passed (unchanged) to
 
 The ``useCapture`` parameter  maps to ``useCapture`` in `EventTarget.addEventListener <https://developer.mozilla.org/en-US/docs/Web/API/EventTarget.addEventListener>`_. It indicates whether or not to initiate *capture*: if ``true`` the callback will be invoked only for the DOM capture and target phases; if ``false`` the callback will be triggered during the target and bubbling phases. See `DOM Level 3 Events <http://www.w3.org/TR/2003/NOTE-DOM-Level-3-Events-20031107/events.html#Events-phases>`_ for a more detailed explanation.
 
-Most functions return the result using the type :c:data:`EMSCRIPTEN_RESULT`. Non-zero and positive values denote success. Negative values signal failure. None of the functions fail or abort by throwing a JavaScript or C++ exception. If a particular browser does not support the given feature, the value :c:data:`EMSCRIPTEN_RESULT_NOT_SUPPORTED` will be returned at the time the callback is registered.
+Most functions return the result using the type :c:data:`EMSCRIPTEN_RESULT`. Zero and positive values denote success. Negative values signal failure. None of the functions fail or abort by throwing a JavaScript or C++ exception. If a particular browser does not support the given feature, the value :c:data:`EMSCRIPTEN_RESULT_NOT_SUPPORTED` will be returned at the time the callback is registered.
 
 	
 Callback functions
@@ -85,7 +87,7 @@ When the event occurs the callback is invoked with the relevant event "type" (fo
 	typedef EM_BOOL (*em_someevent_callback_func) // Callback function. Return true if event is "consumed".
 		(
 		int eventType, // The type of event.
-		const EmscriptenSomeEvent *keyEvent, // Information about the event.
+		const EmscriptenSomeEvent *someEvent, // Information about the event.
 		void *userData // User data passed from the registration function.
 		);
 
@@ -128,8 +130,17 @@ General types
 
 .. c:macro:: EM_BOOL
 
-	This is the Emscripten type for a ``bool``.  
+	This is the Emscripten type for a ``bool``. 
+	Possible values:
 	
+	.. c:macro:: EM_TRUE
+
+		This is the Emscripten value for ``true``. 
+
+	.. c:macro:: EM_FALSE
+
+		This is the Emscripten value for ``false``. 
+
 	
 .. c:macro:: EM_UTF8
 
@@ -145,7 +156,7 @@ Most functions in this API return a result of type :c:data:`EMSCRIPTEN_RESULT`. 
 	
 .. c:macro:: EMSCRIPTEN_RESULT
 
-	This type is used to return the result of most functions in this API.  Positive values denote success, while zero and negative values signal failure. Possible values are listed below.
+	This type is used to return the result of most functions in this API. Zero and positive values denote success, while negative values signal failure. Possible values are listed below.
 	
 	
 	.. c:macro:: EMSCRIPTEN_RESULT_SUCCESS
@@ -278,7 +289,7 @@ Struct
 	
 		A system and implementation dependent numeric code identifying the unmodified value of the pressed key; this is usually the same as ``keyCode``.
 		
-		.. warning:: This attribute is deprecated, you should use the field ``key`` instead, if available.
+		.. warning:: This attribute is deprecated, you should use the field ``key`` instead, if available. Note thought that while this field is deprecated, the cross-browser support for ``which`` may be better than for the other fields, so experimentation is recommended. Read issue https://github.com/kripken/emscripten/issues/2817 for more information.
 
 		
 Callback functions
@@ -332,6 +343,8 @@ Defines
 	EMSCRIPTEN_EVENT_MOUSEUP
 	EMSCRIPTEN_EVENT_DBLCLICK
 	EMSCRIPTEN_EVENT_MOUSEMOVE
+	EMSCRIPTEN_EVENT_MOUSEENTER
+	EMSCRIPTEN_EVENT_MOUSELEAVE
 			 
     Emscripten mouse events.
 
@@ -341,7 +354,7 @@ Struct
 
 .. c:type:: EmscriptenMouseEvent
 
-	The event structure passed in `mouse events <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#interface-MouseEvent>`_: `click <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-click>`_, `mousedown <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-mousedown>`_, `mouseup <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-mouseup>`_, `dblclick <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-dblclick>`_ and `mousemove <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-mousemove>`_.
+	The event structure passed in `mouse events <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#interface-MouseEvent>`_: `click <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-click>`_, `mousedown <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-mousedown>`_, `mouseup <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-mouseup>`_, `dblclick <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-dblclick>`_, `mousemove <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-mousemove>`_, `mouseenter <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-mouseenter>`_ and `mouseleave <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-mouseleave>`_.
 	
 
 	.. c:member:: double timestamp;
@@ -385,6 +398,11 @@ Struct
 	
 		If pointer lock is active, these two extra fields give relative mouse movement since the last event.
   
+	.. c:member:: long targetX
+		 long targetY
+	
+		These fields give the mouse coordinates mapped relative to the coordinate space of the target DOM element receiving the input events (Emscripten-specific extension).
+
 		
 	.. c:member:: long canvasX
 		 long canvasY
@@ -408,11 +426,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_mouse_callback_func)(int eventType, const EmscriptenMouseEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_mouse_callback_func)(int eventType, const EmscriptenMouseEvent *mouseEvent, void *userData);
 	
 	:param int eventType: The type of :c:data:`mouse event <EMSCRIPTEN_EVENT_CLICK>`.
-	:param keyEvent: Information about the mouse event that occurred.
-	:type keyEvent: const EmscriptenMouseEvent*
+	:param mouseEvent: Information about the mouse event that occurred.
+	:type mouseEvent: const EmscriptenMouseEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -427,6 +445,8 @@ Functions
 	EMSCRIPTEN_RESULT emscripten_set_mouseup_callback(const char *target, void *userData, EM_BOOL useCapture, em_mouse_callback_func callback)
 	EMSCRIPTEN_RESULT emscripten_set_dblclick_callback(const char *target, void *userData, EM_BOOL useCapture, em_mouse_callback_func callback)
 	EMSCRIPTEN_RESULT emscripten_set_mousemove_callback(const char *target, void *userData, EM_BOOL useCapture, em_mouse_callback_func callback)
+	EMSCRIPTEN_RESULT emscripten_set_mouseenter_callback(const char *target, void *userData, EM_BOOL useCapture, em_mouse_callback_func callback)
+	EMSCRIPTEN_RESULT emscripten_set_mouseleave_callback(const char *target, void *userData, EM_BOOL useCapture, em_mouse_callback_func callback)
 
 	Registers a callback function for receiving browser-generated `mouse input events <https://developer.mozilla.org/en/DOM/MouseEvent>`_.
 
@@ -490,7 +510,9 @@ Struct
 		double deltaY
 		double deltaZ
 	
-		Movement of the wheel on each of the axis.
+		Movement of the wheel on each of the axis. Note that these values may be fractional, so you should avoid simply casting them to integer, or it might result
+		in scroll values of 0. The positive Y scroll direction is when scrolling the page downwards (page CSS pixel +Y direction), which corresponds to scrolling
+		the mouse wheel downwards (away from the screen) on Windows, Linux, and also on OSX when the 'natural scroll' option is disabled.
 		
 	.. c:member:: unsigned long deltaMode
 	
@@ -506,11 +528,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_wheel_callback_func)(int eventType, const EmscriptenWheelEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_wheel_callback_func)(int eventType, const EmscriptenWheelEvent *wheelEvent, void *userData);
 	
 	:param int eventType: The type of wheel event (:c:data:`EMSCRIPTEN_EVENT_WHEEL`).
-	:param keyEvent: Information about the wheel event that occurred.
-	:type keyEvent: const EmscriptenWheelEvent*
+	:param wheelEvent: Information about the wheel event that occurred.
+	:type wheelEvent: const EmscriptenWheelEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -520,7 +542,7 @@ Callback functions
 Functions
 --------- 
 		
-.. c:function:: EMSCRIPTEN_RESULT EMSCRIPTEN_RESULT emscripten_set_wheel_callback(const char *target, void *userData, EM_BOOL useCapture, em_wheel_callback_func callback)
+.. c:function:: EMSCRIPTEN_RESULT emscripten_set_wheel_callback(const char *target, void *userData, EM_BOOL useCapture, em_wheel_callback_func callback)
 	  	
 	Registers a callback function for receiving browser-generated `mousewheel events <http://www.w3.org/TR/DOM-Level-3-Events/#event-type-wheel>`_.
 
@@ -588,11 +610,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_ui_callback_func)(int eventType, const EmscriptenUiEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_ui_callback_func)(int eventType, const EmscriptenUiEvent *uiEvent, void *userData);
 	
 	:param int eventType: The type of UI event (:c:data:`EMSCRIPTEN_EVENT_RESIZE`).
-	:param keyEvent: Information about the UI event that occurred.
-	:type keyEvent: const EmscriptenUiEvent*
+	:param uiEvent: Information about the UI event that occurred.
+	:type uiEvent: const EmscriptenUiEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -605,6 +627,11 @@ Functions
 	EMSCRIPTEN_RESULT emscripten_set_scroll_callback(const char *target, void *userData, EM_BOOL useCapture, em_ui_callback_func callback)
 		
 	Registers a callback function for receiving DOM element `resize <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-resize>`_ and `scroll <https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#event-type-scroll>`_ events.
+	
+	.. note:: 
+	
+		- For the ``resize`` callback, pass in target = 0 to get ``resize`` events from the ``Window`` object. 
+		- The DOM3 Events specification only requires that the ``Window`` object sends resize events. It is valid to register a ``resize`` callback on other DOM elements, but the browser is not required to fire ``resize`` events for these.
 
 	:param target: |target-parameter-doc|
 	:type target: const char*
@@ -661,11 +688,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_focus_callback_func)(int eventType, const EmscriptenFocusEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_focus_callback_func)(int eventType, const EmscriptenFocusEvent *focusEvent, void *userData);
 	
 	:param int eventType: The type of focus event (:c:data:`EMSCRIPTEN_EVENT_BLUR`).
-	:param keyEvent: Information about the focus event that occurred.
-	:type keyEvent: const EmscriptenFocusEvent*
+	:param focusEvent: Information about the focus event that occurred.
+	:type focusEvent: const EmscriptenFocusEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -745,11 +772,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_deviceorientation_callback_func)(int eventType, const EmscriptenDeviceOrientationEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_deviceorientation_callback_func)(int eventType, const EmscriptenDeviceOrientationEvent *deviceOrientationEvent, void *userData);
 	
 	:param int eventType: The type of orientation event (:c:data:`EMSCRIPTEN_EVENT_DEVICEORIENTATION`).
-	:param keyEvent: Information about the orientation event that occurred.
-	:type keyEvent: const EmscriptenDeviceOrientationEvent*
+	:param deviceOrientationEvent: Information about the orientation event that occurred.
+	:type deviceOrientationEvent: const EmscriptenDeviceOrientationEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -836,11 +863,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_devicemotion_callback_func)(int eventType, const EmscriptenDeviceMotionEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_devicemotion_callback_func)(int eventType, const EmscriptenDeviceMotionEvent *deviceMotionEvent, void *userData);
 	
 	:param int eventType: The type of devicemotion event (:c:data:`EMSCRIPTEN_EVENT_DEVICEMOTION`).
-	:param keyEvent: Information about the devicemotion event that occurred.
-	:type keyEvent: const EmscriptenDeviceMotionEvent*
+	:param deviceMotionEvent: Information about the devicemotion event that occurred.
+	:type deviceMotionEvent: const EmscriptenDeviceMotionEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -931,11 +958,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_orientationchange_callback_func)(int eventType, const EmscriptenOrientationChangeEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_orientationchange_callback_func)(int eventType, const EmscriptenOrientationChangeEvent *orientationChangeEvent, void *userData);
 	
 	:param int eventType: The type of orientationchange event (:c:data:`EMSCRIPTEN_EVENT_ORIENTATIONCHANGE`).
-	:param keyEvent: Information about the orientationchange event that occurred.
-	:type keyEvent: const EmscriptenOrientationChangeEvent*
+	:param orientationChangeEvent: Information about the orientationchange event that occurred.
+	:type orientationChangeEvent: const EmscriptenOrientationChangeEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -993,6 +1020,66 @@ Defines
 			 
     Emscripten `fullscreenchange <https://dvcs.w3.org/hg/fullscreen/raw-file/tip/Overview.html>`_ event.
 
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_SCALE
+
+	An enum-like type which specifies how the Emscripten runtime should treat the CSS size of the target element when displaying it in fullscreen mode via calls to functions
+	:c:func:`emscripten_request_fullscreen_strategy` and :c:func:`emscripten_enter_soft_fullscreen`.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_SCALE_DEFAULT
+
+    Specifies that the DOM element should not be resized by Emscripten runtime when transitioning between fullscreen and windowed modes. The browser will be responsible for 
+    scaling the DOM element to the fullscreen size. The proper browser behavior in this mode is to stretch the element to fit the full display ignoring aspect ratio, but at the
+    time of writing, browsers implement different behavior here. See the discussion at https://github.com/kripken/emscripten/issues/2556 for more information.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_SCALE_STRETCH
+
+	Specifies that the Emscripten runtime should explicitly stretch the CSS size of the target element to cover the whole screen when transitioning to fullscreen mode. This
+	will change the aspect ratio of the displayed content.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_SCALE_ASPECT
+
+	Specifies that the Emscripten runtime should explicitly scale the CSS size of the target element to cover the whole screen, while adding either vertical or horizontal
+	black letterbox padding to preserve the aspect ratio of the content. The aspect ratio that is used here is the render target size of the canvas element. To change the 
+	desired aspect ratio, call :c:func:`emscripten_set_canvas_size` before entering fullscreen mode.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_CANVAS_SCALE
+
+	An enum-like type which specifies how the Emscripten runtime should treat the pixel size (render target resolution) of the target canvas element when displaying it in 
+	fullscreen mode via calls to functions :c:func:`emscripten_request_fullscreen_strategy` and :c:func:`emscripten_enter_soft_fullscreen`. To better understand the
+	underlying distinction between the CSS size of a canvas element versus the render target size of a canvas element, see https://www.khronos.org/webgl/wiki/HandlingHighDPI.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_CANVAS_SCALE_NONE
+
+	Specifies that the Emscripten runtime should not do any changes to the render target resolution of the target canvas element that is displayed in fullscreen mode. Use
+	this mode when your application is set up to render to a single fixed resolution that cannot be changed under any condition.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_CANVAS_SCALE_STDDEF
+
+	Specifies that the Emscripten runtime should resize the render target of the canvas element to match 1:1 with the CSS size of the element in fullscreen mode. On high DPI
+	displays (`window.devicePixelRatio` > 1), the CSS size is not the same as the physical screen resolution of the device. Call :c:func:`emscripten_get_device_pixel_ratio`
+	to obtain the pixel ratio between CSS pixels and actual device pixels of the screen. Use this mode when you want to render to a pixel resolution that is DPI-independent.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_CANVAS_SCALE_HIDEF
+
+	Specifies that the Emscripten runtime should resize the canvas render target size to match 1:1 with the physical screen resolution on the device. This corresponds to high
+	definition displays on retina iOS and other mobile and desktop devices with high DPI. Use this mode to match and render 1:1 to the native display resolution.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_FILTERING
+
+	An enum-like type that specifies what kind of image filtering algorithm to apply to the element when it is presented in fullscreen mode.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_FILTERING_DEFAULT
+
+	Specifies that the image filtering mode should not be changed from the existing setting in the CSS style.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_FILTERING_NEAREST
+
+	Applies a CSS style to the element that displays the content using a nearest-neighbor image filtering algorithm in fullscreen mode.
+
+.. c:macro:: EMSCRIPTEN_FULLSCREEN_FILTERING_BILINEAR
+
+	Applies a CSS style to the element that displays the content using a bilinear image filtering algorithm in fullscreen mode. This is the default browser behavior.
+
 Struct
 ------
 
@@ -1036,6 +1123,31 @@ Struct
 	
 		The size of the whole screen, in pixels.
 
+.. c:type:: EmscriptenFullscreenStrategy
+
+	The options structure that is passed in to functions :c:func:`emscripten_request_fullscreen_strategy` and :c:func:`emscripten_enter_soft_fullscreen` to configure how the target
+	element should be displayed in fullscreen mode.
+
+	.. c:member:: EMSCRIPTEN_FULLSCREEN_SCALE scaleMode
+
+		Specifies the rule how the CSS size (the displayed size) of the target element is resized when displayed in fullscreen mode.
+
+	.. c:member:: EMSCRIPTEN_FULLSCREEN_CANVAS_SCALE canvasResolutionScaleMode
+
+		Specifies how the render target size (the pixel resolution) of the target element is adjusted when displayed in fullscreen mode.
+
+	.. c:member:: EMSCRIPTEN_FULLSCREEN_FILTERING filteringMode
+
+		Specifies the image filtering algorithm to apply to the element in fullscreen mode.
+
+	.. c:member:: em_canvasresized_callback_func canvasResizedCallback
+
+		If nonzero, points to a user-provided callback function which will be called whenever either the CSS or the canvas render target size changes. Use this callback to reliably
+		obtain information about canvas resize events.
+
+	.. c:member:: void *canvasResizedCallbackUserData
+
+		Stores a custom data field which will be passed to all calls to the user-provided callback function.
 		
 Callback functions
 ------------------
@@ -1046,11 +1158,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_fullscreenchange_callback_func)(int eventType, const EmscriptenFullscreenChangeEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_fullscreenchange_callback_func)(int eventType, const EmscriptenFullscreenChangeEvent *fullscreenChangeEvent, void *userData);
 	
 	:param int eventType: The type of fullscreen event (:c:data:`EMSCRIPTEN_EVENT_FULLSCREENCHANGE`).
-	:param keyEvent: Information about the fullscreen event that occurred.
-	:type keyEvent: const EmscriptenFullscreenChangeEvent*
+	:param fullscreenChangeEvent: Information about the fullscreen event that occurred.
+	:type fullscreenChangeEvent: const EmscriptenFullscreenChangeEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -1089,6 +1201,8 @@ Functions
 	
 	.. note:: This function can be called anywhere, but for web security reasons its associated *request* can only be raised inside the event handler for a user-generated event (for example a key, mouse or touch press/release). This has implications for porting and the value of ``deferUntilInEventHandler``  — see :ref:`web-security-functions-html5-api` for more information.
 
+	.. note:: This function only performs a fullscreen request without changing any parameters of the DOM element that is to be displayed in fullscreen mode. At the time of writing, there are differences in how browsers present elements in fullscreen mode. For more information, read the discussion at https://github.com/kripken/emscripten/issues/2556. To display an element in fullscreen mode in a way that is consistent across browsers, prefer calling the function :c:func:`emscripten_request_fullscreen_strategy` instead. This function is best called only in scenarios where the preconfigured presets defined by :c:func:`emscripten_request_fullscreen_strategy` conflict with the developer's use case in some way.
+
 	:param target: |target-parameter-doc|
 	:type target: const char*
 	:param EM_BOOL deferUntilInEventHandler: If ``true`` requests made outside of a user-generated event handler are automatically deferred until the user next presses a keyboard or mouse button. If ``false`` the request will fail if called outside of a user-generated event handler.
@@ -1096,15 +1210,33 @@ Functions
 	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
 	:rtype: **EMSCRIPTEN_RESULT**
 	
+.. c:function:: EMSCRIPTEN_RESULT emscripten_request_fullscreen_strategy(const char *target, EM_BOOL deferUntilInEventHandler, const EmscriptenFullscreenStrategy *fullscreenStrategy)
+
+	Requests the given target element to transition to full screen mode, using a custom presentation mode for the element. This function is otherwise the same as :c:func:`emscripten_request_fullscreen`, but this function adds options to control how resizing and aspect ratio, and ensures that the behavior is consistent across browsers.
+
+	.. note:: This function makes changes to the DOM to satisfy consistent presentation across browsers. These changes have been designed to intrude as little as possible, and the changes are cleared once windowed browsing is restored. If any of these changes are conflicting, see the function :c:func:`emscripten_request_fullscreen` instead, which performs a bare fullscreen request without any modifications to the DOM.
+
+	:param fullscreenStrategy: [in] Points to a configuration structure filled by the caller which specifies display options for the fullscreen mode.
+	:type fullscreenStrategy: const EmscriptenFullscreenStrategy*
 
 .. c:function:: EMSCRIPTEN_RESULT emscripten_exit_fullscreen(void)
 
-	Returns back to windowed browsing mode.
+	Returns back to windowed browsing mode from a proper fullscreen mode.
+
+	Do not call this function to attempt to return to windowed browsing mode from a soft fullscreen mode, or vice versa.
 
 	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
 	:rtype: |EMSCRIPTEN_RESULT|
 
+.. c:function:: EMSCRIPTEN_RESULT emscripten_enter_soft_fullscreen(const char *target, const EmscriptenFullscreenStrategy *fullscreenStrategy)
 
+	Enters a "soft" fullscreen mode, where the given target element is displayed in the whole client area of the page and all other elements are hidden, but does not actually request fullscreen mode for the browser. This function is useful in cases where the actual Fullscreen API is not desirable or needed, for example in packaged apps for Firefox OS, where applications essentially already cover the whole screen.
+
+	Pressing the esc button does not automatically exit the soft fullscreen mode. To return to windowed presentation mode, manually call the function :c:func:`emscripten_exit_soft_fullscreen`.
+
+.. c:function:: EMSCRIPTEN_RESULT emscripten_exit_soft_fullscreen()
+
+	Returns back to windowed browsing mode from a soft fullscreen mode. Do not call this function to attempt to return to windowed browsing mode from a real fullscreen mode, or vice versa.
 
 Pointerlock 
 ===========
@@ -1114,8 +1246,11 @@ Defines
 
 .. c:macro:: EMSCRIPTEN_EVENT_POINTERLOCKCHANGE
 			 
-    Emscripten `pointerlockchange <http://www.w3.org/TR/pointerlock/#pointerlockchange-and-pointerlockerror-events>`_ events.
-	
+    Emscripten `pointerlockchange <http://www.w3.org/TR/pointerlock/#pointerlockchange-and-pointerlockerror-events>`_ event.
+
+.. c:macro:: EMSCRIPTEN_EVENT_POINTERLOCKERROR
+
+    Emscripten `pointerlockerror <http://www.w3.org/TR/pointerlock/#pointerlockchange-and-pointerlockerror-events>`_ event.
 
 Struct
 ------
@@ -1151,11 +1286,25 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_pointerlockchange_callback_func)(int eventType, const EmscriptenPointerlockChangeEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_pointerlockchange_callback_func)(int eventType, const EmscriptenPointerlockChangeEvent *pointerlockChangeEvent, void *userData);
 	
 	:param int eventType: The type of pointerlockchange event (:c:data:`EMSCRIPTEN_EVENT_POINTERLOCKCHANGE`).
-	:param keyEvent: Information about the pointerlockchange event that occurred.
-	:type keyEvent: const EmscriptenPointerlockChangeEvent*
+	:param pointerlockChangeEvent: Information about the pointerlockchange event that occurred.
+	:type pointerlockChangeEvent: const EmscriptenPointerlockChangeEvent*
+	:param void* userData: The ``userData`` originally passed to the registration function.
+	:returns: |callback-handler-return-value-doc|
+	:rtype: |EM_BOOL|
+
+.. c:type:: em_pointerlockerror_callback_func
+
+	Function pointer for the :c:func:`pointerlockerror event callback functions <emscripten_set_pointerlockerror_callback>`, defined as:
+
+	.. code-block:: cpp
+
+		typedef EM_BOOL (*em_pointerlockerror_callback_func)(int eventType, const void *reserved, void *userData);
+
+	:param int eventType: The type of pointerlockerror event (:c:data:`EMSCRIPTEN_EVENT_POINTERLOCKERROR`).
+	:param const void* reserved: Reserved for future use; pass in 0.
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -1176,6 +1325,20 @@ Functions
 	:param void* userData: |userData-parameter-doc|
 	:param EM_BOOL useCapture: |useCapture-parameter-doc|
 	:param em_pointerlockchange_callback_func callback: |callback-function-parameter-doc|
+	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
+	:rtype: |EMSCRIPTEN_RESULT|
+
+
+
+.. c:function:: EMSCRIPTEN_RESULT emscripten_set_pointerlockerror_callback(const char *target, void *userData, EM_BOOL useCapture, em_pointerlockerror_callback_func callback)
+
+	Registers a callback function for receiving the `pointerlockerror <http://www.w3.org/TR/pointerlock/#pointerlockchange-and-pointerlockerror-events>`_ event.
+
+	:param target: |target-parameter-doc|
+	:type target: const char*
+	:param void* userData: |userData-parameter-doc|
+	:param EM_BOOL useCapture: |useCapture-parameter-doc|
+	:param em_pointerlockerror_callback_func callback: |callback-function-parameter-doc|
 	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
 	:rtype: |EMSCRIPTEN_RESULT|
 
@@ -1269,11 +1432,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_visibilitychange_callback_func)(int eventType, const EmscriptenVisibilityChangeEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_visibilitychange_callback_func)(int eventType, const EmscriptenVisibilityChangeEvent *visibilityChangeEvent, void *userData);
 	
 	:param int eventType: The type of ``visibilitychange`` event (:c:data:`EMSCRIPTEN_VISIBILITY_HIDDEN`).
-	:param keyEvent: Information about the ``visibilitychange`` event that occurred.
-	:type keyEvent: const EmscriptenVisibilityChangeEvent*
+	:param visibilityChangeEvent: Information about the ``visibilitychange`` event that occurred.
+	:type visibilityChangeEvent: const EmscriptenVisibilityChangeEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -1351,10 +1514,15 @@ Struct
 	
 		Specifies whether this touch point is still above the original target on which it was initially pressed.		
 		
+	.. c:member:: long targetX
+		 long targetY
+	
+		These fields give the touch coordinates mapped relative to the coordinate space of the target DOM element receiving the input events (Emscripten-specific extension).
+
 	.. c:member:: long canvasX
 		long canvasY
 	
-		The touch coordinates mapped to the Emscripten canvas client area, in pixels.		
+		The touch coordinates mapped to the Emscripten canvas client area, in pixels (Emscripten-specific extension).
 
 
 		
@@ -1390,11 +1558,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_touch_callback_func)(int eventType, const EmscriptenTouchEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_touch_callback_func)(int eventType, const EmscriptenTouchEvent *touchEvent, void *userData);
 	
 	:param int eventType: The type of touch event (:c:data:`EMSCRIPTEN_EVENT_TOUCHSTART`).
-	:param keyEvent: Information about the touch event that occurred.
-	:type keyEvent: const EmscriptenTouchEvent*
+	:param touchEvent: Information about the touch event that occurred.
+	:type touchEvent: const EmscriptenTouchEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -1498,11 +1666,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_gamepad_callback_func)(int eventType, const EmscriptenGamepadEvent *keyEvent, void *userData)
+		typedef EM_BOOL (*em_gamepad_callback_func)(int eventType, const EmscriptenGamepadEvent *gamepadEvent, void *userData)
 	
 	:param int eventType: The type of gamepad event (:c:data:`EMSCRIPTEN_EVENT_GAMEPADCONNECTED`).
-	:param keyEvent: Information about the gamepad event that occurred.
-	:type keyEvent: const EmscriptenGamepadEvent*
+	:param gamepadEvent: Information about the gamepad event that occurred.
+	:type gamepadEvent: const EmscriptenGamepadEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|		
@@ -1591,11 +1759,11 @@ Callback functions
 
 	.. code-block:: cpp
 
-		typedef EM_BOOL (*em_battery_callback_func)(int eventType, const EmscriptenBatteryEvent *keyEvent, void *userData);
+		typedef EM_BOOL (*em_battery_callback_func)(int eventType, const EmscriptenBatteryEvent *batteryEvent, void *userData);
 	
 	:param int eventType: The type of ``batterymanager`` event (:c:data:`EMSCRIPTEN_EVENT_BATTERYCHARGINGCHANGE`).
-	:param keyEvent: Information about the ``batterymanager`` event that occurred.
-	:type keyEvent: const EmscriptenBatteryEvent*
+	:param batteryEvent: Information about the ``batterymanager`` event that occurred.
+	:type batteryEvent: const EmscriptenBatteryEvent*
 	:param void* userData: The ``userData`` originally passed to the registration function.
 	:returns: |callback-handler-return-value-doc|
 	:rtype: |EM_BOOL|
@@ -1611,7 +1779,6 @@ Functions
 	Registers a callback function for receiving the `batterymanager <http://www.w3.org/TR/battery-status/#batterymanager-interface>`_ events: ``chargingchange`` and ``levelchange``.
 
 	:param void* userData: |userData-parameter-doc|
-	:param EM_BOOL useCapture: |useCapture-parameter-doc|
 	:param em_battery_callback_func callback: |callback-function-parameter-doc|
 	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
 	:rtype: |EMSCRIPTEN_RESULT|	
@@ -1713,6 +1880,69 @@ Defines
 			 
     Emscripten `WebGL context <http://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15.2>`_ events.
 
+.. c:type:: EMSCRIPTEN_WEBGL_CONTEXT_HANDLE
+
+	Represents a handle to an Emscripten WebGL context object. The value 0 denotes an invalid/no context (this is a typedef to an ``int``).
+	
+	
+Struct
+------
+
+.. c:type:: EmscriptenWebGLContextAttributes
+
+	Specifies `WebGL context creation parameters <http://www.khronos.org/registry/webgl/specs/latest/1.0/#5.2>`_. 
+		
+	.. c:member:: EM_BOOL alpha
+	
+		If ``true``, request an alpha channel for the context. If you create an alpha channel, you can blend the canvas rendering with the underlying web page contents. Default value: ``true``.
+	
+	.. c:member:: EM_BOOL depth
+	
+		If ``true``, request a depth buffer of at least 16 bits. If ``false``, no depth buffer will be initialized. Default value: ``true``.
+
+	.. c:member:: EM_BOOL stencil
+
+		If ``true``, request a stencil buffer of at least 8 bits. If ``false``, no stencil buffer will be initialized. Default value: ``false``.
+
+	.. c:member:: EM_BOOL antialias
+
+		If ``true``, antialiasing will be initialized with a browser-specified algorithm and quality level. If ``false``, antialiasing is disabled. Default value: ``true``.
+
+
+	.. c:member:: EM_BOOL premultipliedAlpha
+
+		If ``true``, the alpha channel of the rendering context will be treated as representing premultiplied alpha values. If ``false``, the alpha channel represents non-premultiplied alpha. Default value: ``true``.
+
+	
+	.. c:member:: EM_BOOL preserveDrawingBuffer
+
+		If ``true``, the contents of the drawing buffer are preserved between consecutive ``requestAnimationFrame()`` calls. If ``false``, color, depth and stencil are cleared at the beginning of each ``requestAnimationFrame()``. Generally setting this to ``false`` gives better performance. Default value: ``false``.
+  
+  
+	.. c:member:: EM_BOOL preferLowPowerToHighPerformance
+
+		If ``true``, hints the browser to initialize a low-power GPU rendering context. If ``false``, prefers to initialize a high-performance rendering context. Default value: ``false``.
+
+	.. c:member:: EM_BOOL failIfMajorPerformanceCaveat	
+ 
+		If ``true``, requests context creation to abort if the browser is only able to create a context that does not give good hardware-accelerated performance. Default value: ``false``.
+
+
+	.. c:member:: int majorVersion
+		int minorVersion
+	
+		Emscripten-specific extensions which specify the WebGL context version to initialize.
+
+		For example, pass in ``majorVersion=1``, ``minorVersion=0`` to request a WebGL 1.0 context, and ``majorVersion=2``, ``minorVersion=0`` to request a WebGL 2.0 context.
+
+		Default value: ``majorVersion=1``, ``minorVersion=0``
+
+  
+	.. c:member:: EM_BOOL enableExtensionsByDefault	
+
+		If ``true``, all GLES2-compatible non-performance-impacting WebGL extensions will automatically be enabled for you after the context has been created. If ``false``, no extensions are enabled by default, and you need to manually call :c:func:`emscripten_webgl_enable_extension` to enable each extension that you want to use. Default value: ``true``.
+
+
 	
 Callback functions
 ------------------
@@ -1753,7 +1983,6 @@ Functions
 	:rtype: |EMSCRIPTEN_RESULT|
 
 
-
 .. c:function:: EM_BOOL emscripten_is_webgl_context_lost(const char *target)
 
 	Queries the given canvas element for whether its WebGL context is in a lost state.
@@ -1764,6 +1993,104 @@ Functions
 	:rtype: |EM_BOOL|
 
 	
+.. c:function:: void emscripten_webgl_init_context_attributes(EmscriptenWebGLContextAttributes *attributes)
+
+	Populates all fields of the given :c:type:`EmscriptenWebGLContextAttributes` structure to their default values for use with WebGL 1.0.
+	
+	Call this function as a forward-compatible way to ensure that if there are new fields added to the ``EmscriptenWebGLContextAttributes`` structure in the future, that they also will get default-initialized without having to change any code.
+ 
+	:param attributes: The structure to be populated.
+	:type attributes: EmscriptenWebGLContextAttributes*
+
+
+
+.. c:function:: EMSCRIPTEN_WEBGL_CONTEXT_HANDLE emscripten_webgl_create_context(const char *target, const EmscriptenWebGLContextAttributes *attributes)
+
+	Creates and returns a new `WebGL context <http://www.khronos.org/registry/webgl/specs/latest/1.0/#2.1>`_.
+	
+	.. note:: 
+	
+		- A successful call to this function will not immediately make that rendering context active. Call :c:func:`emscripten_webgl_make_context_current` after creating a context to activate it.
+		- This function will try to initialize the context version that was *exactly* requested. It will not e.g. initialize a newer backwards-compatible version or similar. 
+
+	:param target: The DOM canvas element in which to initialize the WebGL context. If 0 is passed, the element specified by ``Module.canvas`` will be used.
+	:type target: const char*
+	:param attributes: The attributes of the requested context version.
+	:type attributes: const EmscriptenWebGLContextAttributes*
+	:returns: On success, a strictly positive value that represents a handle to the created context. On failure, a negative number that can be cast to an |EMSCRIPTEN_RESULT| field to get the reason why the context creation failed.
+	:rtype: |EMSCRIPTEN_WEBGL_CONTEXT_HANDLE|
+
+	
+.. c:function:: EMSCRIPTEN_RESULT emscripten_webgl_make_context_current(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context)
+
+	Activates the given WebGL context for rendering. After calling this function, all OpenGL functions (``glBindBuffer()``, ``glDrawArrays()``, etc.) can be applied to the given GL context.
+
+	:param EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context: The WebGL context to activate.
+	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
+	:rtype: |EMSCRIPTEN_RESULT|
+
+	
+.. c:function:: EMSCRIPTEN_WEBGL_CONTEXT_HANDLE emscripten_webgl_get_current_context()
+
+	Returns the currently active WebGL rendering context, or 0 if no context is active. Calling any WebGL functions when there is no active rendering context is undefined and may throw a JavaScript exception.
+
+	:returns: The currently active WebGL rendering context, or 0 if no context is active.
+	:rtype: |EMSCRIPTEN_WEBGL_CONTEXT_HANDLE|
+	
+	
+.. c:function:: EMSCRIPTEN_RESULT emscripten_webgl_destroy_context(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context)
+
+	Deletes the given WebGL context. If that context was active, then the no context is set to active.
+
+	:param EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context: The WebGL context to delete.
+	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
+	:rtype: |EMSCRIPTEN_RESULT|
+
+
+.. c:function:: EM_BOOL emscripten_webgl_enable_extension(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context, const char *extension)
+
+	Enables the given extension on the given context.
+
+	:param EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context: The WebGL context on which the extension is to be enabled.
+	:param extension: A string identifying the `WebGL extension <http://www.khronos.org/registry/webgl/extensions/>`_. For example "OES_texture_float".
+	:type extension: const char*
+	:returns: EM_TRUE if the given extension is supported by the context, and EM_FALSE if the extension was not available. 
+	:rtype: |EM_BOOL|
+ 
+	.. comment : **HamishW** Are EM_TRUE, EM_FALSE defined?
+
+
+CSS
+===
+
+Functions
+---------
+
+
+.. c:function:: EMSCRIPTEN_RESULT emscripten_set_element_css_size(const char * target, double width, double height)
+
+	Resizes the CSS width and height of the element specified by ``target`` on the Emscripten web page.
+
+	:param target: Element to resize. If 0 is passed, the element specified by ``Module.canvas`` will be used.
+	:type target: const char*
+	:param double width: New width of the element.
+	:param double height: New height of the element.
+	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
+	:rtype: |EMSCRIPTEN_RESULT|
+
+
+.. c:function:: EMSCRIPTEN_RESULT emscripten_get_element_css_size(const char * target, double * width, double * height)
+
+	Gets the current CSS width and height of the element specified by ``target``.
+
+	:param target: Element to get size of. If 0 is passed, the element specified by ``Module.canvas`` will be used.
+	:type target: const char*
+	:param double* width: Width of the element.
+	:param double* height: Height of the element.
+	:returns: :c:data:`EMSCRIPTEN_RESULT_SUCCESS`, or one of the other result values.
+	:rtype: |EMSCRIPTEN_RESULT|
+
+	
 	
 .. COMMENT (not rendered): Section below is automated copy and replace text.
 
@@ -1771,6 +2098,8 @@ Functions
 	
 .. |EMSCRIPTEN_RESULT| replace:: :c:type:`EMSCRIPTEN_RESULT`
 .. |EM_BOOL| replace:: :c:type:`EM_BOOL`
+.. |EMSCRIPTEN_WEBGL_CONTEXT_HANDLE| replace:: :c:type:`EMSCRIPTEN_WEBGL_CONTEXT_HANDLE`
+
 
 .. COMMENT (not rendered): Following values are common to many functions, and currently only updated in one place (here).
 .. COMMENT (not rendered): These can be properly replaced if required either wholesale or on an individual basis.

@@ -1,6 +1,22 @@
 
 // proxy to/from worker
 
+if (typeof Module === 'undefined') {
+  console.warn('no Module object defined - cannot proxy canvas rendering and input events, etc.');
+  Module = {
+    print: function(x) {
+      console.log(x);
+    },
+    printErr: function(x) {
+      console.log(x);
+    },
+    canvas: {
+      addEventListener: function() {},
+      getBoundingClientRect: function() { return { bottom: 0, height: 0, left: 0, right: 0, top: 0, width: 0 } },
+    },
+  };
+}
+
 // utils
 
 function FPSTracker(text) {
@@ -71,6 +87,10 @@ window.requestAnimationFrame = window.requestAnimationFrame || window.mozRequest
 
 // end render
 
+// IDBStore
+
+var IDBStore = {{{ IDBStore.js }}};
+
 // Frame throttling
 
 var frameId = 0;
@@ -82,7 +102,14 @@ var worker = new Worker('{{{ filename }}}.js');
 WebGLClient.prefetch();
 
 setTimeout(function() {
-  worker.postMessage({ target: 'worker-init', width: Module.canvas.width, height: Module.canvas.height, preMain: true });
+  worker.postMessage({
+    target: 'worker-init',
+    width: Module.canvas.width,
+    height: Module.canvas.height,
+    boundingClientRect: cloneObject(Module.canvas.getBoundingClientRect()),
+    URL: document.URL,
+    currentScriptUrl: '{{{ filename }}}.js',
+    preMain: true });
 }, 0); // delay til next frame, to make sure html is ready
 
 var workerResponded = false;
@@ -136,6 +163,10 @@ worker.onmessage = function worker_onmessage(event) {
           }
           break;
         }
+        case 'setObjectProperty': {
+          Module.canvas[data.object][data.property] = data.value;
+          break;
+        }
         default: throw 'eh?';
       }
       break;
@@ -168,9 +199,51 @@ worker.onmessage = function worker_onmessage(event) {
       img.src = data.src;
       break;
     }
-    default: throw 'what?';
+    case 'IDBStore': {
+      switch (data.method) {
+        case 'loadBlob': {
+          IDBStore.getFile(data.db, data.id, function(error, blob) {
+            worker.postMessage({
+              target: 'IDBStore',
+              method: 'response',
+              blob: error ? null : blob
+            });
+          });
+          break;
+        }
+        case 'storeBlob': {
+          IDBStore.setFile(data.db, data.id, data.blob, function(error) {
+            worker.postMessage({
+              target: 'IDBStore',
+              method: 'response',
+              error: !!error
+            });
+          });
+          break;
+        }
+      }
+      break;
+    }
+    case 'custom': {
+      if (Module['onCustomMessage']) {
+        Module['onCustomMessage'](event);
+      } else {
+        throw 'Custom message received but client Module.onCustomMessage not implemented.';
+      }
+      break;
+    }
+    case 'setimmediate': {
+      worker.postMessage({target: 'setimmediate'});
+      break;
+    }
+    default: throw 'what? ' + data.target;
   }
 };
+
+function postCustomMessage(data, options) {
+  options = options || {};
+  worker.postMessage({ target: 'custom', userData: data, preMain: options.preMain });
+}
 
 function cloneObject(event) {
   var ret = {};
@@ -182,10 +255,23 @@ function cloneObject(event) {
   return ret;
 };
 
+// Only prevent default on backspace/tab because we don't want unexpected navigation.
+// Do not prevent default on the rest as we need the keypress event.
+function shouldPreventDefault(event) {
+  if (event.type === 'keydown' && event.keyCode !== 8 /* backspace */ && event.keyCode !== 9 /* tab */) {
+    return false; // keypress, back navigation
+  } else {
+    return true; // NO keypress, NO back navigation
+  }
+};
+
 ['keydown', 'keyup', 'keypress', 'blur', 'visibilitychange'].forEach(function(event) {
   document.addEventListener(event, function(event) {
     worker.postMessage({ target: 'document', event: cloneObject(event) });
-    event.preventDefault();
+    
+    if (shouldPreventDefault(event)) {
+      event.preventDefault();
+    }
   });
 });
 

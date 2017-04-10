@@ -14,15 +14,39 @@ var LibraryOpenAL = {
     QUEUE_INTERVAL: 25,
     QUEUE_LOOKAHEAD: 100,
 
+    newSrcId: 1,
+
+#if OPENAL_DEBUG
+    //This function is slow and used only for debugging purposes
+    srcIdBySrc: function srcIdBySrc(src) {
+      var idx = 0;
+      for (var srcId in AL.currentContext.src) {
+        if (AL.currentContext.src[srcId] == src) {
+          idx = srcId;
+          break;
+        }
+      }
+      return idx;
+    },
+#endif
+
     updateSources: function updateSources(context) {
-      for (var i = 0; i < context.src.length; i++) {
-        AL.updateSource(context.src[i]);
+      // If we are animating using the requestAnimationFrame method, then the main loop does not run when in the background.
+      // To give a perfect glitch-free audio stop when switching from foreground to background, we need to avoid updating
+      // audio altogether when in the background, so detect that case and kill audio buffer streaming if so.
+      if (Browser.mainLoop.timingMode == 1/*EM_TIMING_RAF*/ && document['visibilityState'] != 'visible') return;
+
+      for (var srcId in context.src) {
+        AL.updateSource(context.src[srcId]);
       }
     },
 
     updateSource: function updateSource(src) {
+      // See comment on updateSources above.
+      if (Browser.mainLoop.timingMode == 1/*EM_TIMING_RAF*/ && document['visibilityState'] != 'visible') return;
+
 #if OPENAL_DEBUG
-      var idx = AL.currentContext.src.indexOf(src);
+      var idx = AL.srcIdBySrc(src);
 #endif
       if (src.state !== 0x1012 /* AL_PLAYING */) {
         return;
@@ -34,8 +58,10 @@ var LibraryOpenAL = {
       for (var i = src.buffersPlayed; i < src.queue.length; i++) {
         var entry = src.queue[i];
 
-        var startOffset = startTime - currentTime;
-        var endTime = startTime + entry.buffer.duration;
+        var startOffset = (startTime - currentTime) / src.playbackRate;
+        var endTime;
+        if (entry.src) endTime = startTime + entry.src.duration; // n.b. entry.src.duration already factors in playbackRate, so no divide by src.playbackRate on it.
+        else endTime = startTime + entry.buffer.duration / src.playbackRate;
 
         // Clean up old buffers.
         if (currentTime >= endTime) {
@@ -60,6 +86,8 @@ var LibraryOpenAL = {
           entry.src = AL.currentContext.ctx.createBufferSource();
           entry.src.buffer = entry.buffer;
           entry.src.connect(src.gain);
+          entry.src.playbackRate.value = src.playbackRate;
+          entry.src.duration = entry.buffer.duration / src.playbackRate;
           if (typeof(entry.src.start) !== 'undefined') {
             entry.src.start(startTime, offset);
           } else if (typeof(entry.src.noteOn) !== 'undefined') {
@@ -85,7 +113,7 @@ var LibraryOpenAL = {
 
     setSourceState: function setSourceState(src, state) {
 #if OPENAL_DEBUG
-      var idx = AL.currentContext.src.indexOf(src);
+      var idx = AL.srcIdBySrc(src);
 #endif
       if (state === 0x1012 /* AL_PLAYING */) {
         if (src.state !== 0x1013 /* AL_PAUSED */) {
@@ -223,10 +251,14 @@ var LibraryOpenAL = {
 
       var gain = ctx.createGain();
       gain.connect(ctx.destination);
+      // Extend the Web Audio API AudioListener object with a few tracking values of our own.
+      ctx.listener._position = [0, 0, 0];
+      ctx.listener._velocity = [0, 0, 0];
+      ctx.listener._orientation = [0, 0, 0, 0, 0, 0];
       var context = {
         ctx: ctx,
         err: 0,
-        src: [],
+        src: {},
         buf: [],
         interval: setInterval(function() { AL.updateSources(context); }, AL.QUEUE_INTERVAL),
         gain: gain
@@ -282,6 +314,12 @@ var LibraryOpenAL = {
       }
       {{{ makeSetValue('data', '0', '0', 'i32') }}};
       break;
+    case 0x20003 /* ALC_MAX_AUXILIARY_SENDS */:
+      if (!device) {
+        AL.currentContext.err = 0xA001 /* ALC_INVALID_DEVICE */;
+        return 0;
+      }
+      {{{ makeSetValue('data', '0', '1', 'i32') }}};
     default:
 #if OPENAL_DEBUG
       console.log("alcGetIntegerv with param " + param + " not implemented yet");
@@ -299,7 +337,7 @@ var LibraryOpenAL = {
       return;
     }
     for (var i = 0; i < count; ++i) {
-      var sourceIdx = {{{ makeGetValue('sources', 'i*4', 'i32') }}} - 1;
+      var sourceIdx = {{{ makeGetValue('sources', 'i*4', 'i32') }}};
       delete AL.currentContext.src[sourceIdx];
     }
   },
@@ -314,10 +352,14 @@ var LibraryOpenAL = {
     for (var i = 0; i < count; ++i) {
       var gain = AL.currentContext.ctx.createGain();
       gain.connect(AL.currentContext.gain);
-      AL.currentContext.src.push({
+      AL.currentContext.src[AL.newSrcId] = {
         state: 0x1011 /* AL_INITIAL */,
         queue: [],
         loop: false,
+        playbackRate: 1,
+        _position: [0, 0, 0],
+        _velocity: [0, 0, 0],
+        _direction: [0, 0, 0],
         get refDistance() {
           return this._refDistance || 1;
         },
@@ -340,24 +382,30 @@ var LibraryOpenAL = {
           if (this.panner) this.panner.rolloffFactor = val;
         },
         get position() {
-          return this._position || [0, 0, 0];
+          return this._position;
         },
         set position(val) {
-          this._position = val;
+          this._position[0] = val[0];
+          this._position[1] = val[1];
+          this._position[2] = val[2];
           if (this.panner) this.panner.setPosition(val[0], val[1], val[2]);
         },
         get velocity() {
-          return this._velocity || [0, 0, 0];
+          return this._velocity;
         },
         set velocity(val) {
-          this._velocity = val;
+          this._velocity[0] = val[0];
+          this._velocity[1] = val[1];
+          this._velocity[2] = val[2];
           if (this.panner) this.panner.setVelocity(val[0], val[1], val[2]);
         },
         get direction() {
-          return this._direction || [0, 0, 0];
+          return this._direction;
         },
         set direction(val) {
-          this._direction = val;
+          this._direction[0] = val[0];
+          this._direction[1] = val[1];
+          this._direction[2] = val[2];
           if (this.panner) this.panner.setOrientation(val[0], val[1], val[2]);
         },
         get coneOuterGain() {
@@ -385,8 +433,9 @@ var LibraryOpenAL = {
         panner: null,
         buffersPlayed: 0,
         bufferPosition: 0
-      });
-      {{{ makeSetValue('sources', 'i*4', 'AL.currentContext.src.length', 'i32') }}};
+      };
+      {{{ makeSetValue('sources', 'i*4', 'AL.newSrcId', 'i32') }}};
+      AL.newSrcId++;
     }
   },
 
@@ -395,7 +444,7 @@ var LibraryOpenAL = {
       return false;
     }
 
-    if (!AL.currentContext.src[sourceId - 1]) {
+    if (!AL.currentContext.src[sourceId]) {
       return false;
     } else {
       return true;
@@ -409,7 +458,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alSourcei called with an invalid source");
@@ -440,11 +489,11 @@ var LibraryOpenAL = {
       if (value === 1 /* AL_TRUE */) {
         if (src.panner) {
           src.panner = null;
-            
+
           // Disconnect from the panner.
           src.gain.disconnect();
 
-          src.gain.connect(AL.currentContext.ctx.destination);
+          src.gain.connect(AL.currentContext.gain);
         }
       } else if (value === 0 /* AL_FALSE */) {
         if (!src.panner) {
@@ -456,7 +505,7 @@ var LibraryOpenAL = {
           panner.rolloffFactor = src.rolloffFactor;
           panner.setPosition(src.position[0], src.position[1], src.position[2]);
           panner.setVelocity(src.velocity[0], src.velocity[1], src.velocity[2]);
-          panner.connect(AL.currentContext.ctx.destination);
+          panner.connect(AL.currentContext.gain);
 
           // Disconnect from the default source.
           src.gain.disconnect();
@@ -483,7 +532,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alSourcef called with an invalid source");
@@ -493,9 +542,35 @@ var LibraryOpenAL = {
     }
     switch (param) {
     case 0x1003 /* AL_PITCH */:
-#if OPENAL_DEBUG
-      console.log("alSourcef was called with 0x1003 /* AL_PITCH */, but Web Audio does not support static pitch changes");
-#endif
+      if (value <= 0) {
+        AL.currentContext.err = 0xA003 /* AL_INVALID_VALUE */;
+        return;
+      }
+      src.playbackRate = value;
+
+      if (src.state === 0x1012 /* AL_PLAYING */) {
+        // update currently playing entry
+        var entry = src.queue[src.buffersPlayed];
+        var currentTime = AL.currentContext.ctx.currentTime;
+        var oldrate = entry.src.playbackRate.value;
+        var offset = currentTime - src.bufferPosition;
+        // entry.src.duration is expressed after factoring in playbackRate, so when changing playback rate, need
+        // to recompute/rescale the rate to the new playback speed.
+        entry.src.duration = (entry.src.duration - offset) * oldrate / src.playbackRate;
+        entry.src.playbackRate.value = src.playbackRate;
+        src.bufferPosition = currentTime;
+
+        // stop other buffers
+        for (var k = src.buffersPlayed + 1; k < src.queue.length; k++) {
+          var entry = src.queue[k];
+          if (entry.src) {
+            entry.src.stop();
+            entry.src = null;
+          }
+        }
+        // update the source to reschedule buffers with the new playbackRate
+        AL.updateSource(src);
+      }
       break;
     case 0x100A /* AL_GAIN */:
       src.gain.gain.value = value;
@@ -531,6 +606,11 @@ var LibraryOpenAL = {
     }
   },
 
+  alSource3i: ['alSource3f'],
+  alSource3i: function(source, param, v1, v2, v3) {
+    _alSource3f(source, param, v1, v2, v3);
+  },
+
   alSource3f: function(source, param, v1, v2, v3) {
     if (!AL.currentContext) {
 #if OPENAL_DEBUG
@@ -538,7 +618,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alSource3f called with an invalid source");
@@ -548,13 +628,19 @@ var LibraryOpenAL = {
     }
     switch (param) {
     case 0x1004 /* AL_POSITION */:
-      src.position = [v1, v2, v3];
+      src.position[0] = v1;
+      src.position[1] = v2;
+      src.position[2] = v3;
       break;
     case 0x1005 /* AL_DIRECTION */:
-      src.direction = [v1, v2, v3];
+      src.direction[0] = v1;
+      src.direction[1] = v2;
+      src.direction[2] = v3;
       break;
     case 0x1006 /* AL_VELOCITY */:
-      src.velocity = [v1, v2, v3];
+      src.velocity[0] = v1;
+      src.velocity[1] = v2;
+      src.velocity[2] = v3;
       break;
     default:
 #if OPENAL_DEBUG
@@ -580,7 +666,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alSourceQueueBuffers called with an invalid source");
@@ -615,7 +701,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alSourceUnqueueBuffers called with an invalid source");
@@ -669,8 +755,8 @@ var LibraryOpenAL = {
 
       // Make sure the buffer is no longer in use.
       var buffer = AL.currentContext.buf[bufferIdx];
-      for (var j = 0; j < AL.currentContext.src.length; ++j) {
-        var src = AL.currentContext.src[j];
+      for (var srcId in AL.currentContext.src) {
+        var src = AL.currentContext.src[srcId];
         if (!src) {
           continue;
         }
@@ -748,6 +834,14 @@ var LibraryOpenAL = {
       bytes = 2;
       channels = 2;
       break;
+    case 0x10010 /* AL_FORMAT_MONO_FLOAT32 */:
+      bytes = 4;
+      channels = 1;
+      break;
+    case 0x10011 /* AL_FORMAT_STEREO_FLOAT32 */:
+      bytes = 4;
+      channels = 2;
+      break;
     default:
 #if OPENAL_DEBUG
       console.error("alBufferData called with invalid format " + format);
@@ -775,6 +869,9 @@ var LibraryOpenAL = {
         case 2:
           var val = {{{ makeGetValue('data', '2*(i*channels+j)', 'i16') }}};
           buf[j][i] = val/32768;
+          break;
+        case 4:
+          buf[j][i] = {{{ makeGetValue('data', '4*(i*channels+j)', 'float') }}};
           break;
         }
       }
@@ -816,7 +913,6 @@ var LibraryOpenAL = {
     }
   },
 
-  alSourcePlay__deps: ['setSourceState'],
   alSourcePlay: function(source) {
     if (!AL.currentContext) {
 #if OPENAL_DEBUG
@@ -824,7 +920,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alSourcePlay called with an invalid source");
@@ -835,7 +931,6 @@ var LibraryOpenAL = {
     AL.setSourceState(src, 0x1012 /* AL_PLAYING */);
   },
 
-  alSourceStop__deps: ['setSourceState'],
   alSourceStop: function(source) {
     if (!AL.currentContext) {
 #if OPENAL_DEBUG
@@ -843,7 +938,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alSourceStop called with an invalid source");
@@ -854,7 +949,27 @@ var LibraryOpenAL = {
     AL.setSourceState(src, 0x1014 /* AL_STOPPED */);
   },
 
-  alSourcePause__deps: ['setSourceState'],
+  alSourceRewind: function(source) {
+    if (!AL.currentContext) {
+#if OPENAL_DEBUG
+      console.error("alSourceRewind called without a valid context");
+#endif
+      return;
+    }
+    var src = AL.currentContext.src[source];
+    if (!src) {
+#if OPENAL_DEBUG
+      console.error("alSourceRewind called with an invalid source");
+#endif
+      AL.currentContext.err = 0xA001 /* AL_INVALID_NAME */;
+      return;
+    }
+    // Stop the source first to clear the source queue
+    AL.setSourceState(src, 0x1014 /* AL_STOPPED */);
+    // Now set the state of AL_INITIAL according to the specification
+    AL.setSourceState(src, 0x1011 /* AL_INITIAL */);
+  },
+
   alSourcePause: function(source) {
     if (!AL.currentContext) {
 #if OPENAL_DEBUG
@@ -862,7 +977,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alSourcePause called with an invalid source");
@@ -880,7 +995,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alGetSourcei called with an invalid source");
@@ -906,6 +1021,9 @@ var LibraryOpenAL = {
       break;
     case 0x1002 /* AL_CONE_OUTER_ANGLE */:
       {{{ makeSetValue('value', '0', 'src.coneOuterAngle', 'i32') }}};
+      break;
+    case 0x1007 /* AL_LOOPING */:
+      {{{ makeSetValue('value', '0', 'src.loop', 'i32') }}};
       break;
     case 0x1009 /* AL_BUFFER */:
       if (!src.queue.length) {
@@ -942,6 +1060,42 @@ var LibraryOpenAL = {
     }
   },
 
+  alGetSourceiv__deps: ['alGetSourcei'],
+  alGetSourceiv: function(source, param, values) {
+    if (!AL.currentContext) {
+#if OPENAL_DEBUG
+      console.error("alGetSourceiv called without a valid context");
+#endif
+      return;
+    }
+    var src = AL.currentContext.src[source];
+    if (!src) {
+#if OPENAL_DEBUG
+      console.error("alGetSourceiv called with an invalid source");
+#endif
+      AL.currentContext.err = 0xA001 /* AL_INVALID_NAME */;
+      return;
+    }
+    switch (param) {
+    case 0x202 /* AL_SOURCE_RELATIVE */:
+    case 0x1001 /* AL_CONE_INNER_ANGLE */:
+    case 0x1002 /* AL_CONE_OUTER_ANGLE */:
+    case 0x1007 /* AL_LOOPING */:
+    case 0x1009 /* AL_BUFFER */:
+    case 0x1010 /* AL_SOURCE_STATE */:
+    case 0x1015 /* AL_BUFFERS_QUEUED */:
+    case 0x1016 /* AL_BUFFERS_PROCESSED */:
+      _alGetSourcei(source, param, values);
+      break;
+    default:
+#if OPENAL_DEBUG
+      console.error("alGetSourceiv with param " + param + " not implemented yet");
+#endif
+      AL.currentContext.err = 0xA002 /* AL_INVALID_ENUM */;
+      break;
+    }
+  },
+
   alGetSourcef: function(source, param, value) {
     if (!AL.currentContext) {
 #if OPENAL_DEBUG
@@ -949,7 +1103,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alGetSourcef called with an invalid source");
@@ -958,8 +1112,9 @@ var LibraryOpenAL = {
       return;
     }
     switch (param) {
-    // case 0x1003 /* AL_PITCH */:
-    //   break;
+     case 0x1003 /* AL_PITCH */:
+      {{{ makeSetValue('value', '0', 'src.playbackRate', 'float') }}}
+      break;
     case 0x100A /* AL_GAIN */:
       {{{ makeSetValue('value', '0', 'src.gain.gain.value', 'float') }}}
       break;
@@ -997,6 +1152,7 @@ var LibraryOpenAL = {
     }
   },
 
+  alGetSourcefv__deps: ['alGetSourcef'],
   alGetSourcefv: function(source, param, values) {
     if (!AL.currentContext) {
 #if OPENAL_DEBUG
@@ -1004,7 +1160,7 @@ var LibraryOpenAL = {
 #endif
       return;
     }
-    var src = AL.currentContext.src[source - 1];
+    var src = AL.currentContext.src[source];
     if (!src) {
 #if OPENAL_DEBUG
       console.error("alGetSourcefv called with an invalid source");
@@ -1013,6 +1169,21 @@ var LibraryOpenAL = {
       return;
     }
     switch (param) {
+    case 0x1003 /* AL_PITCH */:
+    case 0x100A /* AL_GAIN */:
+    case 0x100D /* AL_MIN_GAIN */:
+    case 0x100E /* AL_MAX_GAIN */:
+    case 0x1023 /* AL_MAX_DISTANCE */:
+    case 0x1021 /* AL_ROLLOFF_FACTOR */:
+    case 0x1022 /* AL_CONE_OUTER_GAIN */:
+    case 0x1001 /* AL_CONE_INNER_ANGLE */:
+    case 0x1002 /* AL_CONE_OUTER_ANGLE */:
+    case 0x1020 /* AL_REFERENCE_DISTANCE */:
+    case 0x1024 /* AL_SEC_OFFSET */:
+    case 0x1025 /* AL_SAMPLE_OFFSET */:
+    case 0x1026 /* AL_BYTE_OFFSET */:
+      _alGetSourcef(source, param, values);
+      break;
     case 0x1004 /* AL_POSITION */:
       var position = src.position;
       {{{ makeSetValue('values', '0', 'position[0]', 'float') }}}
@@ -1048,7 +1219,7 @@ var LibraryOpenAL = {
     }
   },
 
-  alGetListenerf: function(pname, values) {
+  alGetListenerf: function(pname, value) {
     if (!AL.currentContext) {
 #if OPENAL_DEBUG
       console.error("alGetListenerf called without a valid context");
@@ -1057,7 +1228,7 @@ var LibraryOpenAL = {
     }
     switch (pname) {
     case 0x100A /* AL_GAIN */:
-      {{{ makeSetValue('value', '0', 'AL.currentContext.gain.gain', 'float') }}}
+      {{{ makeSetValue('value', '0', 'AL.currentContext.gain.gain.value', 'float') }}}
       break;
     default:
 #if OPENAL_DEBUG
@@ -1078,19 +1249,19 @@ var LibraryOpenAL = {
     }
     switch (pname) {
     case 0x1004 /* AL_POSITION */:
-      var position = AL.currentContext.ctx.listener._position || [0,0,0];
+      var position = AL.currentContext.ctx.listener._position;
       {{{ makeSetValue('values', '0', 'position[0]', 'float') }}}
       {{{ makeSetValue('values', '4', 'position[1]', 'float') }}}
       {{{ makeSetValue('values', '8', 'position[2]', 'float') }}}
       break;
     case 0x1006 /* AL_VELOCITY */:
-      var velocity = AL.currentContext.ctx.listener._velocity || [0,0,0];
+      var velocity = AL.currentContext.ctx.listener._velocity;
       {{{ makeSetValue('values', '0', 'velocity[0]', 'float') }}}
       {{{ makeSetValue('values', '4', 'velocity[1]', 'float') }}}
       {{{ makeSetValue('values', '8', 'velocity[2]', 'float') }}}
       break;
     case 0x100F /* AL_ORIENTATION */:
-      var orientation = AL.currentContext.ctx.listener._orientation || [0,0,0,0,0,0];
+      var orientation = AL.currentContext.ctx.listener._orientation;
       {{{ makeSetValue('values', '0', 'orientation[0]', 'float') }}}
       {{{ makeSetValue('values', '4', 'orientation[1]', 'float') }}}
       {{{ makeSetValue('values', '8', 'orientation[2]', 'float') }}}
@@ -1133,7 +1304,7 @@ var LibraryOpenAL = {
     }
     switch (param) {
     case 0x100A /* AL_GAIN */:
-      AL.currentContext.gain.value = value;
+      AL.currentContext.gain.gain.value = value;
       break;
     default:
 #if OPENAL_DEBUG
@@ -1178,6 +1349,35 @@ var LibraryOpenAL = {
     }
   },
 
+  alListener3f: function(param, v1, v2, v3) {
+    if (!AL.currentContext) {
+#if OPENAL_DEBUG
+      console.error("alListenerfv called without a valid context");
+#endif
+      return;
+    }
+    switch (param) {
+    case 0x1004 /* AL_POSITION */:
+      AL.currentContext.ctx.listener._position[0] = v1;
+      AL.currentContext.ctx.listener._position[1] = v2;
+      AL.currentContext.ctx.listener._position[2] = v3;
+      AL.currentContext.ctx.listener.setPosition(v1, v2, v3);
+      break;
+    case 0x1006 /* AL_VELOCITY */:
+      AL.currentContext.ctx.listener._velocity[0] = v1;
+      AL.currentContext.ctx.listener._velocity[1] = v2;
+      AL.currentContext.ctx.listener._velocity[2] = v3;
+      AL.currentContext.ctx.listener.setVelocity(v1, v2, v3);
+      break;
+    default:
+#if OPENAL_DEBUG
+      console.error("alListener3f with param " + param + " not implemented yet");
+#endif
+      AL.currentContext.err = 0xA002 /* AL_INVALID_ENUM */;
+      break;
+    }
+  },
+
   alListenerfv: function(param, values) {
     if (!AL.currentContext) {
 #if OPENAL_DEBUG
@@ -1190,14 +1390,18 @@ var LibraryOpenAL = {
       var x = {{{ makeGetValue('values', '0', 'float') }}};
       var y = {{{ makeGetValue('values', '4', 'float') }}};
       var z = {{{ makeGetValue('values', '8', 'float') }}};
-      AL.currentContext.ctx.listener._position = [x, y, z];
+      AL.currentContext.ctx.listener._position[0] = x;
+      AL.currentContext.ctx.listener._position[1] = y;
+      AL.currentContext.ctx.listener._position[2] = z;
       AL.currentContext.ctx.listener.setPosition(x, y, z);
       break;
     case 0x1006 /* AL_VELOCITY */:
       var x = {{{ makeGetValue('values', '0', 'float') }}};
       var y = {{{ makeGetValue('values', '4', 'float') }}};
       var z = {{{ makeGetValue('values', '8', 'float') }}};
-      AL.currentContext.ctx.listener._velocity = [x, y, z];
+      AL.currentContext.ctx.listener._velocity[0] = x;
+      AL.currentContext.ctx.listener._velocity[1] = y;
+      AL.currentContext.ctx.listener._velocity[2] = z;
       AL.currentContext.ctx.listener.setVelocity(x, y, z);
       break;
     case 0x100F /* AL_ORIENTATION */:
@@ -1207,7 +1411,12 @@ var LibraryOpenAL = {
       var x2 = {{{ makeGetValue('values', '12', 'float') }}};
       var y2 = {{{ makeGetValue('values', '16', 'float') }}};
       var z2 = {{{ makeGetValue('values', '20', 'float') }}};
-      AL.currentContext.ctx.listener._orientation = [x, y, z, x2, y2, z2];
+      AL.currentContext.ctx.listener._orientation[0] = x;
+      AL.currentContext.ctx.listener._orientation[1] = y;
+      AL.currentContext.ctx.listener._orientation[2] = z;
+      AL.currentContext.ctx.listener._orientation[3] = x2;
+      AL.currentContext.ctx.listener._orientation[4] = y2;
+      AL.currentContext.ctx.listener._orientation[5] = z2;
       AL.currentContext.ctx.listener.setOrientation(x, y, z, x2, y2, z2);
       break;
     default:
@@ -1220,6 +1429,10 @@ var LibraryOpenAL = {
   },
 
   alIsExtensionPresent: function(extName) {
+    extName = Pointer_stringify(extName);
+
+    if (extName == "AL_EXT_float32") return 1;
+
     return 0;
   },
 
@@ -1259,7 +1472,7 @@ var LibraryOpenAL = {
       ret = 'WebAudio';
       break;
     case 0xB004 /* AL_EXTENSIONS */:
-      ret = '';
+      ret = 'AL_EXT_float32';
       break;
     default:
       AL.currentContext.err = 0xA002 /* AL_INVALID_ENUM */;
@@ -1344,10 +1557,26 @@ var LibraryOpenAL = {
     return 0;
   },
 
+  alGetEnumValue: function(name) {
+    name = Pointer_stringify(name);
+
+    if (name == "AL_FORMAT_MONO_FLOAT32") return 0x10010;
+    if (name == "AL_FORMAT_STEREO_FLOAT32") return 0x10011;
+
+    AL.currentContext.err = 0xA003 /* AL_INVALID_VALUE */;
+    return 0;
+  },
+
+  alSpeedOfSound: function(value) {
+    Runtime.warnOnce('alSpeedOfSound() is not yet implemented! Ignoring all calls to it.');
+  },
+
   alDopplerFactor: function(value) {
+    Runtime.warnOnce('alDopplerFactor() is not yet implemented! Ignoring all calls to it.');
   },
 
   alDopplerVelocity: function(value) {
+    Runtime.warnOnce('alDopplerVelocity() is not yet implemented! Ignoring all calls to it.');
   }
 };
 

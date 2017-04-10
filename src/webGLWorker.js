@@ -10,6 +10,8 @@ function WebGLProgram(id) {
   this.shaders = [];
   this.attributes = {};
   this.attributeVec = [];
+  this.nextAttributes = {};
+  this.nextAttributeVec = [];
 }
 function WebGLFramebuffer(id) {
   this.what = 'frameBuffer';
@@ -26,21 +28,6 @@ function WebGLTexture(id) {
 }
 
 function WebGLWorker() {
-  //=======
-  // State
-  //=======
-
-  var commandBuffer = [];
-
-  var nextId = 1; // valid ids are > 0
-
-  var bindings = {
-    texture2D: null,
-    arrayBuffer: null,
-    elementArrayBuffer: null,
-    program: null
-  };
-
   //===========
   // Constants
   //===========
@@ -451,6 +438,7 @@ function WebGLWorker() {
   this.FRAMEBUFFER_INCOMPLETE_DIMENSIONS         = 0x8CD9;
   this.FRAMEBUFFER_UNSUPPORTED                   = 0x8CDD;
   
+  this.ACTIVE_TEXTURE                 = 0x84E0;
   this.FRAMEBUFFER_BINDING            = 0x8CA6;
   this.RENDERBUFFER_BINDING           = 0x8CA7;
   this.MAX_RENDERBUFFER_SIZE          = 0x84E8;
@@ -463,6 +451,35 @@ function WebGLWorker() {
   this.CONTEXT_LOST_WEBGL             = 0x9242;
   this.UNPACK_COLORSPACE_CONVERSION_WEBGL = 0x9243;
   this.BROWSER_DEFAULT_WEBGL          = 0x9244;
+
+  //=======
+  // State
+  //=======
+
+  var commandBuffer = [];
+
+  var nextId = 1; // valid ids are > 0
+
+  var bindings = {
+    texture2D: null,
+    arrayBuffer: null,
+    elementArrayBuffer: null,
+    program: null,
+    framebuffer: null,
+    activeTexture: this.TEXTURE0,
+    generateMipmapHint: this.DONT_CARE,
+    blendSrcRGB: this.ONE,
+    blendSrcAlpha: this.ONE,
+    blendDstRGB: this.ZERO,
+    blendDstAlpha: this.ZERO,
+    blendEquationRGB: this.FUNC_ADD,
+    blendEquationAlpha: this.FUNC_ADD,
+    enabledState: {} // Stores whether various GL state via glEnable/glDisable/glIsEnabled/getParameter are enabled.
+  };
+  var stateDisabledByDefault = [this.BLEND, this.CULL_FACE, this.DEPTH_TEST, this.DITHER, this.POLYGON_OFFSET_FILL, this.SAMPLE_ALPHA_TO_COVERAGE, this.SAMPLE_COVERAGE, this.SCISSOR_TEST, this.STENCIL_TEST];
+  for(var i in stateDisabledByDefault) {
+    bindings.enabledState[stateDisabledByDefault[i]] = false; // It will be important to distinguish between false and undefined (undefined meaning the state cap enum is unknown/unsupported).
+  }
 
   //==========
   // Functions
@@ -509,7 +526,37 @@ function WebGLWorker() {
       case this.CURRENT_PROGRAM: {
         return bindings.program;
       }
-      default: throw 'TODO: get parameter ' + name + ' : ' + revname(name);
+      case this.FRAMEBUFFER_BINDING: {
+        return bindings.framebuffer;
+      }
+      case this.ACTIVE_TEXTURE: {
+        return bindings.activeTexture;
+      }
+      case this.GENERATE_MIPMAP_HINT: {
+        return bindings.generateMipmapHint;
+      }
+      case this.BLEND_SRC_RGB: {
+        return bindings.blendSrcRGB;
+      }
+      case this.BLEND_SRC_ALPHA: {
+        return bindings.blendSrcAlpha;
+      }
+      case this.BLEND_DST_RGB: {
+        return bindings.blendDstRGB;
+      }
+      case this.BLEND_DST_ALPHA: {
+        return bindings.blendDstAlpha;
+      }
+      case this.BLEND_EQUATION_RGB: {
+        return bindings.blendEquationRGB;
+      }
+      case this.BLEND_EQUATION_ALPHA: {
+        return bindings.blendEquationAlpha;
+      }
+      default: {
+        if (bindings.enabledState[name] !== undefined) return bindings.enabledState[name];
+        throw 'TODO: get parameter ' + name + ' : ' + revname(name);
+      }
     }
   };
   this.getExtension = function(name) {
@@ -517,17 +564,57 @@ function WebGLWorker() {
     if (i < 0) return null;
     commandBuffer.push(1, name);
     switch (name) {
-      case 'EXT_texture_filter_anisotropic':
-      case 'MOZ_EXT_texture_filter_anisotropic':
-      case 'WEBKIT_EXT_texture_filter_anisotropic': {
+      case 'EXT_texture_filter_anisotropic': {
         return {
           TEXTURE_MAX_ANISOTROPY_EXT:     0x84FE,
           MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84FF
         };
       }
-      case 'OES_standard_derivatives':
-      case 'MOZ_OES_standard_derivatives':
-      case 'WEBKIT_OES_standard_derivatives': {
+      case 'WEBGL_draw_buffers': {
+        return {
+          COLOR_ATTACHMENT0_WEBGL     : 0x8CE0,
+          COLOR_ATTACHMENT1_WEBGL     : 0x8CE1,
+          COLOR_ATTACHMENT2_WEBGL     : 0x8CE2,
+          COLOR_ATTACHMENT3_WEBGL     : 0x8CE3,
+          COLOR_ATTACHMENT4_WEBGL     : 0x8CE4,
+          COLOR_ATTACHMENT5_WEBGL     : 0x8CE5,
+          COLOR_ATTACHMENT6_WEBGL     : 0x8CE6,
+          COLOR_ATTACHMENT7_WEBGL     : 0x8CE7,
+          COLOR_ATTACHMENT8_WEBGL     : 0x8CE8,
+          COLOR_ATTACHMENT9_WEBGL     : 0x8CE9,
+          COLOR_ATTACHMENT10_WEBGL    : 0x8CEA,
+          COLOR_ATTACHMENT11_WEBGL    : 0x8CEB,
+          COLOR_ATTACHMENT12_WEBGL    : 0x8CEC,
+          COLOR_ATTACHMENT13_WEBGL    : 0x8CED,
+          COLOR_ATTACHMENT14_WEBGL    : 0x8CEE,
+          COLOR_ATTACHMENT15_WEBGL    : 0x8CEF,
+
+          DRAW_BUFFER0_WEBGL          : 0x8825,
+          DRAW_BUFFER1_WEBGL          : 0x8826,
+          DRAW_BUFFER2_WEBGL          : 0x8827,
+          DRAW_BUFFER3_WEBGL          : 0x8828,
+          DRAW_BUFFER4_WEBGL          : 0x8829,
+          DRAW_BUFFER5_WEBGL          : 0x882A,
+          DRAW_BUFFER6_WEBGL          : 0x882B,
+          DRAW_BUFFER7_WEBGL          : 0x882C,
+          DRAW_BUFFER8_WEBGL          : 0x882D,
+          DRAW_BUFFER9_WEBGL          : 0x882E,
+          DRAW_BUFFER10_WEBGL         : 0x882F,
+          DRAW_BUFFER11_WEBGL         : 0x8830,
+          DRAW_BUFFER12_WEBGL         : 0x8831,
+          DRAW_BUFFER13_WEBGL         : 0x8832,
+          DRAW_BUFFER14_WEBGL         : 0x8833,
+          DRAW_BUFFER15_WEBGL         : 0x8834,
+
+          MAX_COLOR_ATTACHMENTS_WEBGL : 0x8CDF,
+          MAX_DRAW_BUFFERS_WEBGL      : 0x8824,
+
+          drawBuffersWEBGL: function(buffers) {
+            that.drawBuffersWEBGL(buffers);
+          }
+        };
+      }
+      case 'OES_standard_derivatives': {
         return { FRAGMENT_SHADER_DERIVATIVE_HINT_OES: 0x8B8B };
       }
     };
@@ -541,9 +628,14 @@ function WebGLWorker() {
   };
   this.enable = function(cap) {
     commandBuffer.push(2, cap);
+    bindings.enabledState[cap] = true;
+  };
+  this.isEnabled = function(cap) {
+    return bindings.enabledState[cap];
   };
   this.disable = function(cap) {
     commandBuffer.push(3, cap);
+    bindings.enabledState[cap] = false;
   };
   this.clear = function(mask) {
     commandBuffer.push(4, mask);
@@ -584,8 +676,8 @@ function WebGLWorker() {
     commandBuffer.push(12, program.id, shader.id);
   };
   this.bindAttribLocation = function(program, index, name) {
-    program.attributes[name] = { what: 'attribute', name: name, size: -1, location: index, type: '?' }; // fill in size, type later
-    program.attributeVec[index] = name;
+    program.nextAttributes[name] = { what: 'attribute', name: name, size: -1, location: index, type: '?' }; // fill in size, type later
+    program.nextAttributeVec[index] = name;
     commandBuffer.push(13, program.id, index, name);
   };
   this.getAttribLocation = function(program, name) {
@@ -647,6 +739,11 @@ function WebGLWorker() {
     program.uniforms = {};
     program.uniformVec = [];
 
+    program.attributes = program.nextAttributes;
+    program.attributeVec = program.nextAttributeVec;
+    program.nextAttributes = {};
+    program.nextAttributeVec = [];
+
     var existingAttributes = {};
 
     program.shaders.forEach(function(shader) {
@@ -658,7 +755,9 @@ function WebGLWorker() {
     for (var attr in existingAttributes) {
       if (!(attr in program.attributes)) {
         var index = program.attributeVec.length;
-        this.bindAttribLocation(program, index, attr);
+        program.attributes[attr] = { what: 'attribute', name: attr, size: -1, location: index, type: '?' }; // fill in size, type later
+        program.attributeVec[index] = attr;
+        commandBuffer.push(13, program.id, index, attr); // do a bindAttribLocation as well, so this takes effect in the link we are about to do
       }
       program.attributes[attr].size = existingAttributes[attr].size;
       program.attributes[attr].type = existingAttributes[attr].type;
@@ -720,6 +819,10 @@ function WebGLWorker() {
   this.uniform3fv = function(location, data) {
     if (!location) return;
     commandBuffer.push(20, location.id, new Float32Array(data));
+  };
+  this.uniform4f = function(location, x, y, z, w) {
+    if (!location) return;
+    commandBuffer.push(21, location.id, new Float32Array([x, y, z, w]));
   };
   this.uniform4fv = function(location, data) {
     if (!location) return;
@@ -809,7 +912,7 @@ function WebGLWorker() {
         break;
       }
     }
-    texture.binding = target;
+    if (texture) texture.binding = target;
     commandBuffer.push(38, target, texture ? texture.id : 0);
   };
   this.texParameteri = function(target, pname, param) {
@@ -836,6 +939,7 @@ function WebGLWorker() {
   };
   this.activeTexture = function(texture) {
     commandBuffer.push(42, texture);
+    bindings.activeTexture = texture;
   };
   this.getShaderParameter = function(shader, pname) {
     switch (pname) {
@@ -874,6 +978,8 @@ function WebGLWorker() {
   };
   this.blendFunc = function(sfactor, dfactor) {
     commandBuffer.push(51, sfactor, dfactor);
+    bindings.blendSrcRGB = bindings.blendSrcAlpha = sfactor;
+    bindings.blendDstRGB = bindings.blendDstAlpha = dfactor;
   };
   this.scissor = function(x, y, width, height) {
     commandBuffer.push(52, x, y, width, height);
@@ -895,6 +1001,7 @@ function WebGLWorker() {
   };
   this.bindFramebuffer = function(target, framebuffer) {
     commandBuffer.push(57, target, framebuffer ? framebuffer.id : 0);
+    bindings.framebuffer = framebuffer;
   };
   this.framebufferTexture2D = function(target, attachment, textarget, texture, level) {
     commandBuffer.push(58, target, attachment, textarget, texture ? texture.id : 0, level);
@@ -925,9 +1032,11 @@ function WebGLWorker() {
   };
   this.hint = function(target, mode) {
     commandBuffer.push(65, target, mode);
+    if (target == this.GENERATE_MIPMAP_HINT) bindings.generateMipmapHint = mode;
   };
   this.blendEquation = function(mode) {
     commandBuffer.push(66, mode);
+    bindings.blendEquationRGB = bindings.blendEquationAlpha = mode;
   };
   this.generateMipmap = function(target) {
     commandBuffer.push(67, target);
@@ -935,6 +1044,69 @@ function WebGLWorker() {
   this.uniformMatrix3fv = function(location, transpose, data) {
     if (!location) return;
     commandBuffer.push(68, location.id, transpose, new Float32Array(data));
+  };
+  this.stencilMask = function(mask) {
+    commandBuffer.push(69, mask);
+  };
+  this.clearStencil = function(s) {
+    commandBuffer.push(70, s);
+  };
+  this.texSubImage2D = function(target, level, xoffset, yoffset, width, height, format, type, pixels) {
+    if (pixels === undefined) {
+      // shorter overload:      target, level, xoffset, yoffset, format,  type, pixels
+      var formatTemp = format;
+      format = width;
+      type = height;
+      pixels = formatTemp;
+      assert(pixels instanceof Image);
+      assert(format === this.RGBA); // HTML Images are RGBA, 8-bit
+      assert(type === this.UNSIGNED_BYTE);
+      var data = pixels.data;
+      width = data.width;
+      height = data.height;
+      pixels = new Uint8Array(data.data); // XXX transform from clamped to normal, could have been done in duplicate
+    }
+    commandBuffer.push(71, target, level, xoffset, yoffset, width, height, format, type, duplicate(pixels));
+  };
+  this.uniform3f = function(location, x, y, z) {
+    if (!location) return;
+    commandBuffer.push(72, location.id, x, y, z);
+  };
+  this.blendFuncSeparate = function(srcRGB, dstRGB, srcAlpha, dstAlpha) {
+    commandBuffer.push(73, srcRGB, dstRGB, srcAlpha, dstAlpha);
+    bindings.blendSrcRGB = srcRGB;
+    bindings.blendSrcAlpha = srcAlpha;
+    bindings.blendDstRGB = dstRGB;
+    bindings.blendDstAlpha = dstAlpha;
+  }
+  this.uniform2fv = function(location, data) {
+    if (!location) return;
+    commandBuffer.push(74, location.id, new Float32Array(data));
+  };
+  this.texParameterf = function(target, pname, param) {
+    commandBuffer.push(75, target, pname, param);
+  };
+  this.isContextLost = function() {
+    // optimisticaly return that everything is ok; client will abort on an actual context loss. we assume an error-free async workflow
+    commandBuffer.push(76);
+    return false;
+  };
+  this.isProgram = function(program) {
+    return program && program.what === 'program';
+  };
+  this.blendEquationSeparate = function(rgb, alpha) {
+    commandBuffer.push(77, rgb, alpha);
+    bindings.blendEquationRGB = rgb;
+    bindings.blendEquationAlpha = alpha;
+  };
+  this.stencilFuncSeparate = function(face, func, ref, mask) {
+    commandBuffer.push(78, face, func, ref, mask);
+  };
+  this.stencilOpSeparate = function(face, fail, zfail, zpass) {
+    commandBuffer.push(79, face, fail, zfail, zpass);
+  };
+  this.drawBuffersWEBGL = function(buffers) {
+    commandBuffer.push(80, buffers);
   };
 
   // Setup
@@ -951,11 +1123,14 @@ function WebGLWorker() {
     //throttledTracker.tick();
   }
 
+  var postRAFed = false;
+
   function postRAF() {
     if (commandBuffer.length > 0) {
       postMessage({ target: 'gl', op: 'render', commandBuffer: commandBuffer });
       commandBuffer = [];
     }
+    postRAFed = true;
   }
 
   assert(!Browser.doSwapBuffers);
@@ -968,8 +1143,11 @@ function WebGLWorker() {
         window.requestAnimationFrame(func); // skip this frame, do it later
         return;
       }
+      postRAFed = false;
       func();
-      postRAF();
+      if (!postRAFed) { // if we already posted this frame (e.g. from doSwapBuffers) do not post again
+        postRAF();
+      }
     });
   }
 

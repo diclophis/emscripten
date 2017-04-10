@@ -1,8 +1,8 @@
 .. _emscripten-authors:
 
-============================
-AUTHORS (ready-for-review)
-============================
+=======
+AUTHORS
+=======
 
 The `AUTHORS <https://github.com/kripken/emscripten/blob/incoming/AUTHORS>`_ file lists everyone who has contributed to Emscripten.
 
@@ -10,7 +10,7 @@ The `AUTHORS <https://github.com/kripken/emscripten/blob/incoming/AUTHORS>`_ fil
 
 The contributors for releases up to Emscripten |release| inclusive (|today|) are listed below.
 
-.. include::   ..\..\..\..\AUTHORS
+.. include::   ../../../../AUTHORS
    :literal:
 
 

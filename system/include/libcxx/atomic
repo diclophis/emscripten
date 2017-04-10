@@ -17,6 +17,10 @@
 namespace std
 {
 
+// feature test macro
+
+#define __cpp_lib_atomic_is_always_lock_free // as specified by SG10
+
 // order and consistency
 
 typedef enum memory_order
@@ -89,6 +93,7 @@ void
 template <class T>
 struct atomic
 {
+    static constexpr bool is_always_lock_free;
     bool is_lock_free() const volatile noexcept;
     bool is_lock_free() const noexcept;
     void store(T desr, memory_order m = memory_order_seq_cst) volatile noexcept;
@@ -127,6 +132,7 @@ struct atomic
 template <>
 struct atomic<integral>
 {
+    static constexpr bool is_always_lock_free;
     bool is_lock_free() const volatile noexcept;
     bool is_lock_free() const noexcept;
     void store(integral desr, memory_order m = memory_order_seq_cst) volatile noexcept;
@@ -202,6 +208,7 @@ struct atomic<integral>
 template <class T>
 struct atomic<T*>
 {
+    static constexpr bool is_always_lock_free;
     bool is_lock_free() const volatile noexcept;
     bool is_lock_free() const noexcept;
     void store(T* desr, memory_order m = memory_order_seq_cst) volatile noexcept;
@@ -533,17 +540,294 @@ void atomic_signal_fence(memory_order m) noexcept;
 #pragma GCC system_header
 #endif
 
-_LIBCPP_BEGIN_NAMESPACE_STD
-
-#if !__has_feature(cxx_atomic)
+#ifdef _LIBCPP_HAS_NO_THREADS
+#error <atomic> is not supported on this single threaded system
+#endif
+#if !defined(_LIBCPP_HAS_C_ATOMIC_IMP) && !defined(_LIBCPP_HAS_GCC_ATOMIC_IMP)
 #error <atomic> is not implemented
-#else
+#endif
+
+#if _LIBCPP_STD_VER > 14
+// FIXME: use the right feature test macro value as chose by SG10.
+# define __cpp_lib_atomic_is_always_lock_free 201603L
+#endif
+
+_LIBCPP_BEGIN_NAMESPACE_STD
 
 typedef enum memory_order
 {
     memory_order_relaxed, memory_order_consume, memory_order_acquire,
     memory_order_release, memory_order_acq_rel, memory_order_seq_cst
 } memory_order;
+
+#if defined(_LIBCPP_HAS_GCC_ATOMIC_IMP)
+namespace __gcc_atomic {
+template <typename _Tp>
+struct __gcc_atomic_t {
+
+#if _GNUC_VER >= 501
+    static_assert(is_trivially_copyable<_Tp>::value,
+      "std::atomic<Tp> requires that 'Tp' be a trivially copyable type");
+#endif
+
+  _LIBCPP_INLINE_VISIBILITY
+#ifndef _LIBCPP_HAS_NO_DEFAULTED_FUNCTIONS
+    __gcc_atomic_t() _NOEXCEPT = default;
+#else
+    __gcc_atomic_t() _NOEXCEPT : __a_value() {}
+#endif // _LIBCPP_HAS_NO_DEFAULTED_FUNCTIONS
+  _LIBCPP_CONSTEXPR explicit __gcc_atomic_t(_Tp value) _NOEXCEPT
+    : __a_value(value) {}
+  _Tp __a_value;
+};
+#define _Atomic(x) __gcc_atomic::__gcc_atomic_t<x>
+
+template <typename _Tp> _Tp __create();
+
+template <typename _Tp, typename _Td>
+typename enable_if<sizeof(_Tp()->__a_value = __create<_Td>()), char>::type
+    __test_atomic_assignable(int);
+template <typename _Tp, typename _Up>
+__two __test_atomic_assignable(...);
+
+template <typename _Tp, typename _Td>
+struct __can_assign {
+  static const bool value =
+      sizeof(__test_atomic_assignable<_Tp, _Td>(1)) == sizeof(char);
+};
+
+static inline _LIBCPP_CONSTEXPR int __to_gcc_order(memory_order __order) {
+  // Avoid switch statement to make this a constexpr.
+  return __order == memory_order_relaxed ? __ATOMIC_RELAXED:
+         (__order == memory_order_acquire ? __ATOMIC_ACQUIRE:
+          (__order == memory_order_release ? __ATOMIC_RELEASE:
+           (__order == memory_order_seq_cst ? __ATOMIC_SEQ_CST:
+            (__order == memory_order_acq_rel ? __ATOMIC_ACQ_REL:
+              __ATOMIC_CONSUME))));
+}
+
+static inline _LIBCPP_CONSTEXPR int __to_gcc_failure_order(memory_order __order) {
+  // Avoid switch statement to make this a constexpr.
+  return __order == memory_order_relaxed ? __ATOMIC_RELAXED:
+         (__order == memory_order_acquire ? __ATOMIC_ACQUIRE:
+          (__order == memory_order_release ? __ATOMIC_RELAXED:
+           (__order == memory_order_seq_cst ? __ATOMIC_SEQ_CST:
+            (__order == memory_order_acq_rel ? __ATOMIC_ACQUIRE:
+              __ATOMIC_CONSUME))));
+}
+
+} // namespace __gcc_atomic
+
+template <typename _Tp>
+static inline
+typename enable_if<
+    __gcc_atomic::__can_assign<volatile _Atomic(_Tp)*, _Tp>::value>::type
+__c11_atomic_init(volatile _Atomic(_Tp)* __a,  _Tp __val) {
+  __a->__a_value = __val;
+}
+
+template <typename _Tp>
+static inline
+typename enable_if<
+    !__gcc_atomic::__can_assign<volatile _Atomic(_Tp)*, _Tp>::value &&
+     __gcc_atomic::__can_assign<         _Atomic(_Tp)*, _Tp>::value>::type
+__c11_atomic_init(volatile _Atomic(_Tp)* __a,  _Tp __val) {
+  // [atomics.types.generic]p1 guarantees _Tp is trivially copyable. Because
+  // the default operator= in an object is not volatile, a byte-by-byte copy
+  // is required.
+  volatile char* to = reinterpret_cast<volatile char*>(&__a->__a_value);
+  volatile char* end = to + sizeof(_Tp);
+  char* from = reinterpret_cast<char*>(&__val);
+  while (to != end) {
+    *to++ = *from++;
+  }
+}
+
+template <typename _Tp>
+static inline void __c11_atomic_init(_Atomic(_Tp)* __a,  _Tp __val) {
+  __a->__a_value = __val;
+}
+
+static inline void __c11_atomic_thread_fence(memory_order __order) {
+  __atomic_thread_fence(__gcc_atomic::__to_gcc_order(__order));
+}
+
+static inline void __c11_atomic_signal_fence(memory_order __order) {
+  __atomic_signal_fence(__gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline void __c11_atomic_store(volatile _Atomic(_Tp)* __a,  _Tp __val,
+                                      memory_order __order) {
+  return __atomic_store(&__a->__a_value, &__val,
+                        __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline void __c11_atomic_store(_Atomic(_Tp)* __a,  _Tp __val,
+                                      memory_order __order) {
+  __atomic_store(&__a->__a_value, &__val,
+                 __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_load(volatile _Atomic(_Tp)* __a,
+                                    memory_order __order) {
+  _Tp __ret;
+  __atomic_load(&__a->__a_value, &__ret,
+                __gcc_atomic::__to_gcc_order(__order));
+  return __ret;
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_load(_Atomic(_Tp)* __a, memory_order __order) {
+  _Tp __ret;
+  __atomic_load(&__a->__a_value, &__ret,
+                __gcc_atomic::__to_gcc_order(__order));
+  return __ret;
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_exchange(volatile _Atomic(_Tp)* __a,
+                                        _Tp __value, memory_order __order) {
+  _Tp __ret;
+  __atomic_exchange(&__a->__a_value, &__value, &__ret,
+                    __gcc_atomic::__to_gcc_order(__order));
+  return __ret;
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_exchange(_Atomic(_Tp)* __a, _Tp __value,
+                                        memory_order __order) {
+  _Tp __ret;
+  __atomic_exchange(&__a->__a_value, &__value, &__ret,
+                    __gcc_atomic::__to_gcc_order(__order));
+  return __ret;
+}
+
+template <typename _Tp>
+static inline bool __c11_atomic_compare_exchange_strong(
+    volatile _Atomic(_Tp)* __a, _Tp* __expected, _Tp __value,
+    memory_order __success, memory_order __failure) {
+  return __atomic_compare_exchange(&__a->__a_value, __expected, &__value,
+                                   false,
+                                   __gcc_atomic::__to_gcc_order(__success),
+                                   __gcc_atomic::__to_gcc_failure_order(__failure));
+}
+
+template <typename _Tp>
+static inline bool __c11_atomic_compare_exchange_strong(
+    _Atomic(_Tp)* __a, _Tp* __expected, _Tp __value, memory_order __success,
+    memory_order __failure) {
+  return __atomic_compare_exchange(&__a->__a_value, __expected, &__value,
+                                   false,
+                                   __gcc_atomic::__to_gcc_order(__success),
+                                   __gcc_atomic::__to_gcc_failure_order(__failure));
+}
+
+template <typename _Tp>
+static inline bool __c11_atomic_compare_exchange_weak(
+    volatile _Atomic(_Tp)* __a, _Tp* __expected, _Tp __value,
+    memory_order __success, memory_order __failure) {
+  return __atomic_compare_exchange(&__a->__a_value, __expected, &__value,
+                                   true,
+                                   __gcc_atomic::__to_gcc_order(__success),
+                                   __gcc_atomic::__to_gcc_failure_order(__failure));
+}
+
+template <typename _Tp>
+static inline bool __c11_atomic_compare_exchange_weak(
+    _Atomic(_Tp)* __a, _Tp* __expected, _Tp __value, memory_order __success,
+    memory_order __failure) {
+  return __atomic_compare_exchange(&__a->__a_value, __expected, &__value,
+                                   true,
+                                   __gcc_atomic::__to_gcc_order(__success),
+                                   __gcc_atomic::__to_gcc_failure_order(__failure));
+}
+
+template <typename _Tp>
+struct __skip_amt { enum {value = 1}; };
+
+template <typename _Tp>
+struct __skip_amt<_Tp*> { enum {value = sizeof(_Tp)}; };
+
+// FIXME: Haven't figured out what the spec says about using arrays with
+// atomic_fetch_add. Force a failure rather than creating bad behavior.
+template <typename _Tp>
+struct __skip_amt<_Tp[]> { };
+template <typename _Tp, int n>
+struct __skip_amt<_Tp[n]> { };
+
+template <typename _Tp, typename _Td>
+static inline _Tp __c11_atomic_fetch_add(volatile _Atomic(_Tp)* __a,
+                                         _Td __delta, memory_order __order) {
+  return __atomic_fetch_add(&__a->__a_value, __delta * __skip_amt<_Tp>::value,
+                            __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp, typename _Td>
+static inline _Tp __c11_atomic_fetch_add(_Atomic(_Tp)* __a, _Td __delta,
+                                         memory_order __order) {
+  return __atomic_fetch_add(&__a->__a_value, __delta * __skip_amt<_Tp>::value,
+                            __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp, typename _Td>
+static inline _Tp __c11_atomic_fetch_sub(volatile _Atomic(_Tp)* __a,
+                                         _Td __delta, memory_order __order) {
+  return __atomic_fetch_sub(&__a->__a_value, __delta * __skip_amt<_Tp>::value,
+                            __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp, typename _Td>
+static inline _Tp __c11_atomic_fetch_sub(_Atomic(_Tp)* __a, _Td __delta,
+                                         memory_order __order) {
+  return __atomic_fetch_sub(&__a->__a_value, __delta * __skip_amt<_Tp>::value,
+                            __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_fetch_and(volatile _Atomic(_Tp)* __a,
+                                         _Tp __pattern, memory_order __order) {
+  return __atomic_fetch_and(&__a->__a_value, __pattern,
+                            __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_fetch_and(_Atomic(_Tp)* __a,
+                                         _Tp __pattern, memory_order __order) {
+  return __atomic_fetch_and(&__a->__a_value, __pattern,
+                            __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_fetch_or(volatile _Atomic(_Tp)* __a,
+                                        _Tp __pattern, memory_order __order) {
+  return __atomic_fetch_or(&__a->__a_value, __pattern,
+                           __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_fetch_or(_Atomic(_Tp)* __a, _Tp __pattern,
+                                        memory_order __order) {
+  return __atomic_fetch_or(&__a->__a_value, __pattern,
+                           __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_fetch_xor(volatile _Atomic(_Tp)* __a,
+                                         _Tp __pattern, memory_order __order) {
+  return __atomic_fetch_xor(&__a->__a_value, __pattern,
+                            __gcc_atomic::__to_gcc_order(__order));
+}
+
+template <typename _Tp>
+static inline _Tp __c11_atomic_fetch_xor(_Atomic(_Tp)* __a, _Tp __pattern,
+                                         memory_order __order) {
+  return __atomic_fetch_xor(&__a->__a_value, __pattern,
+                            __gcc_atomic::__to_gcc_order(__order));
+}
+#endif // _LIBCPP_HAS_GCC_ATOMIC_IMP
 
 template <class _Tp>
 inline _LIBCPP_INLINE_VISIBILITY
@@ -553,6 +837,17 @@ kill_dependency(_Tp __y) _NOEXCEPT
     return __y;
 }
 
+#define ATOMIC_BOOL_LOCK_FREE      __GCC_ATOMIC_BOOL_LOCK_FREE
+#define ATOMIC_CHAR_LOCK_FREE      __GCC_ATOMIC_CHAR_LOCK_FREE
+#define ATOMIC_CHAR16_T_LOCK_FREE  __GCC_ATOMIC_CHAR16_T_LOCK_FREE
+#define ATOMIC_CHAR32_T_LOCK_FREE  __GCC_ATOMIC_CHAR32_T_LOCK_FREE
+#define ATOMIC_WCHAR_T_LOCK_FREE   __GCC_ATOMIC_WCHAR_T_LOCK_FREE
+#define ATOMIC_SHORT_LOCK_FREE     __GCC_ATOMIC_SHORT_LOCK_FREE
+#define ATOMIC_INT_LOCK_FREE       __GCC_ATOMIC_INT_LOCK_FREE
+#define ATOMIC_LONG_LOCK_FREE      __GCC_ATOMIC_LONG_LOCK_FREE
+#define ATOMIC_LLONG_LOCK_FREE     __GCC_ATOMIC_LLONG_LOCK_FREE
+#define ATOMIC_POINTER_LOCK_FREE   __GCC_ATOMIC_POINTER_LOCK_FREE
+
 // general atomic<T>
 
 template <class _Tp, bool = is_integral<_Tp>::value && !is_same<_Tp, bool>::value>
@@ -560,12 +855,22 @@ struct __atomic_base  // false
 {
     mutable _Atomic(_Tp) __a_;
 
+#if defined(__cpp_lib_atomic_is_always_lock_free)
+  static _LIBCPP_CONSTEXPR bool is_always_lock_free = __atomic_always_lock_free(sizeof(__a_), 0);
+#endif
+
     _LIBCPP_INLINE_VISIBILITY
     bool is_lock_free() const volatile _NOEXCEPT
-        {return __c11_atomic_is_lock_free(sizeof(_Tp));}
+    {
+#if defined(_LIBCPP_HAS_C_ATOMIC_IMP)
+    return __c11_atomic_is_lock_free(sizeof(_Tp));
+#else
+    return __atomic_is_lock_free(sizeof(_Tp), 0);
+#endif
+    }
     _LIBCPP_INLINE_VISIBILITY
     bool is_lock_free() const _NOEXCEPT
-        {return __c11_atomic_is_lock_free(sizeof(_Tp));}
+        {return static_cast<__atomic_base const volatile*>(this)->is_lock_free();}
     _LIBCPP_INLINE_VISIBILITY
     void store(_Tp __d, memory_order __m = memory_order_seq_cst) volatile _NOEXCEPT
         {__c11_atomic_store(&__a_, __d, __m);}
@@ -641,6 +946,11 @@ private:
     __atomic_base& operator=(const __atomic_base&) volatile;
 #endif  // _LIBCPP_HAS_NO_DELETED_FUNCTIONS
 };
+
+#if defined(__cpp_lib_atomic_is_always_lock_free)
+template <class _Tp, bool __b>
+_LIBCPP_CONSTEXPR bool __atomic_base<_Tp, __b>::is_always_lock_free;
+#endif
 
 // atomic<Integral>
 
@@ -1510,21 +1820,6 @@ typedef atomic<uintmax_t> atomic_uintmax_t;
 
 #define ATOMIC_FLAG_INIT {false}
 #define ATOMIC_VAR_INIT(__v) {__v}
-
-// lock-free property
-
-#define ATOMIC_BOOL_LOCK_FREE      __GCC_ATOMIC_BOOL_LOCK_FREE
-#define ATOMIC_CHAR_LOCK_FREE      __GCC_ATOMIC_CHAR_LOCK_FREE
-#define ATOMIC_CHAR16_T_LOCK_FREE  __GCC_ATOMIC_CHAR16_T_LOCK_FREE
-#define ATOMIC_CHAR32_T_LOCK_FREE  __GCC_ATOMIC_CHAR32_T_LOCK_FREE
-#define ATOMIC_WCHAR_T_LOCK_FREE   __GCC_ATOMIC_WCHAR_T_LOCK_FREE
-#define ATOMIC_SHORT_LOCK_FREE     __GCC_ATOMIC_SHORT_LOCK_FREE
-#define ATOMIC_INT_LOCK_FREE       __GCC_ATOMIC_INT_LOCK_FREE
-#define ATOMIC_LONG_LOCK_FREE      __GCC_ATOMIC_LONG_LOCK_FREE
-#define ATOMIC_LLONG_LOCK_FREE     __GCC_ATOMIC_LLONG_LOCK_FREE
-#define ATOMIC_POINTER_LOCK_FREE   __GCC_ATOMIC_POINTER_LOCK_FREE
-
-#endif  //  !__has_feature(cxx_atomic)
 
 _LIBCPP_END_NAMESPACE_STD
 

@@ -1,35 +1,50 @@
-==================================
-API Reference (under-construction) 
-==================================
+.. _api-reference-index:
 
-This section lists Emscripten's public API, organised by header file. At very high level it consists of:
+=============
+API Reference
+=============
 
-- **emscripten.h**: *APIs for integrating with the browser environment.*
+This section lists Emscripten's public API, organised by header file. At a very high level it consists of:
 
-	This includes APIs for: controlling application execution, calling JavaScript from C code, loading files, logging etc.
+- :ref:`emscripten-h`: 
+	APIs for integrating with the browser environment.
 	
-- **html5.h**: *Low level glue bindings for interfacing with HTML5 APIs from native code.*
-
-	This includes APIs for registering event callbacks for all types of HTML5 events, ranging from key, mouse and touch events, through to screen and device orientation events, through to WebGL context events etc.
+- :ref:`html5-h`: 
+	Low level glue bindings for interfacing with HTML5 APIs from native code.
 	
-- **preamble.js**: *APIs for working with compiled code.*
+- :ref:`preamble-js`: 
+	APIs for working with compiled code from JavaScript.
 
-	This includes APIs for calling compiled C functions, accessing memory, converting pointers to JavaScript ``Strings`` and ``Strings`` to pointers (with different encodings/formats), and other convenience functions.
-	
-- **Filesystem-API (library_fs.js)**: *APIs for (primarily) synchronous File I/O.*
+- :ref:`Filesystem-API` (**library_fs.js**): 
+	APIs for managing file systems and synchronous file operations.
 
-- **Advanced APIs**: *APIs for advanced users/core developers*
+- :ref:`Module`: 
+	Global JavaScript object that can be used to control code execution and access exported methods.
 
-	In addition to the public APIs listed above, there are additional APIs which are intended only when developing Emscripten itself, or which are complicated to use and hence considered suitable for "advanced users". At time of writing are not documented individually, but are mentioned at high level in :doc:`advanced-apis`.
+- :ref:`val-h`: 
+	Embind API to support transliteration of JavaScript code to C++.
+
+- :ref:`bind-h`: 
+	Embind API for binding C++ functions and classes so that they can be called from JavaScript in a natural way.
+
+- :ref:`trace-h`:
+	A tracing API for doing memory usage analysis.
+
+- :ref:`api-reference-advanced-apis`: 
+	APIs for advanced users/core developers.
 
 
 .. toctree:: 
-   :maxdepth: 1
+   :hidden:
    
    emscripten.h
    html5.h
    preamble.js
    Filesystem-API
+   module
+   val.h
+   bind.h
+   trace.h
    advanced-apis
 
 

@@ -13,6 +13,7 @@ from subprocess import check_call, Popen, PIPE, STDOUT, CalledProcessError
 sys.path += [os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'tools')]
 import shared
 
+# can add flags like --no-threads --ion-offthread-compile=off
 engine1 = eval('shared.' + sys.argv[1]) if len(sys.argv) > 1 else shared.JS_ENGINES[0]
 engine2 = shared.SPIDERMONKEY_ENGINE if os.path.exists(shared.SPIDERMONKEY_ENGINE[0]) else None
 
@@ -24,13 +25,13 @@ CSMITH_PATH = os.environ.get('CSMITH_PATH')
 assert CSMITH_PATH, 'Please set the environment variable CSMITH_PATH.'
 CSMITH_CFLAGS = ['-I', os.path.join(CSMITH_PATH, 'runtime')]
 
-filename = os.path.join(shared.CANONICAL_TEMP_DIR, 'fuzzcode')
+filename = os.path.join(os.getcwd(), 'temp_fuzzcode' + str(os.getpid()) + '_')
 
 shared.DEFAULT_TIMEOUT = 5
 
 tried = 0
 
-notes = { 'invalid': 0, 'unaligned': 0, 'embug': 0 }
+notes = { 'invalid': 0, 'embug': 0 }
 
 fails = 0
 
@@ -44,10 +45,17 @@ while 1:
       opts = '-Oz'
   print 'opt level:', opts
 
+  llvm_opts = []
+  if random.random() < 0.5:
+    llvm_opts = ['--llvm-opts', str(random.randint(0, 3))]
+
   print 'Tried %d, notes: %s' % (tried, notes)
   print '1) Generate source'
   extra_args = []
   if random.random() < 0.5: extra_args += ['--no-math64']
+  extra_args += ['--no-bitfields'] # due to pnacl bug 4027, "LLVM ERROR: can't convert calls with illegal types"
+  #if random.random() < 0.5: extra_args += ['--float'] # XXX hits undefined behavior on float=>int conversions (too big to fit)
+  if random.random() < 0.5: extra_args += ['--max-funcs', str(random.randint(10, 30))]
   suffix = '.c'
   COMP = shared.CLANG_CC
   if random.random() < 0.5:
@@ -72,10 +80,10 @@ while 1:
     notes['invalid'] += 1
     continue
 
-  shared.check_execute([COMP, '-m32', opts, '-emit-llvm', '-c', fullname, '-o', filename + '.bc'] + CSMITH_CFLAGS + shared.EMSDK_OPTS)
-  shared.check_execute([shared.path_from_root('tools', 'nativize_llvm.py'), filename + '.bc'])
+  shared.check_execute([COMP, '-m32', opts, '-emit-llvm', '-c', fullname, '-o', filename + '.bc'] + CSMITH_CFLAGS + shared.EMSDK_OPTS + ['-w'])
+  shared.check_execute([shared.path_from_root('tools', 'nativize_llvm.py'), filename + '.bc'], stderr=PIPE)
   shutil.move(filename + '.bc.run', filename + '2')
-  shared.check_execute([COMP, fullname, '-o', filename + '3'] + CSMITH_CFLAGS)
+  shared.check_execute([COMP, fullname, '-o', filename + '3'] + CSMITH_CFLAGS + ['-w'])
   print '3) Run natively'
   try:
     correct1 = shared.jsrun.timeout_run(Popen([filename + '1'], stdout=PIPE, stderr=PIPE), 3)
@@ -90,65 +98,123 @@ while 1:
     notes['invalid'] += 1
     continue
 
+  fail_output_name = 'newfail_%d_%d%s' % (os.getpid(), fails, suffix)
+
   print '4) Compile JS-ly and compare'
 
-  def try_js(args):
+  def try_js(args=[]):
     shared.try_delete(filename + '.js')
-    print '(compile)'
-    shared.check_execute([shared.PYTHON, shared.EMCC, opts, fullname, '-o', filename + '.js'] + CSMITH_CFLAGS + args)
-    assert os.path.exists(filename + '.js')
-    print '(run)'
-    js = shared.run_js(filename + '.js', engine=engine1, check_timeout=True, assert_returncode=None, cwd='/tmp/emscripten_temp')
-    assert correct1 == js or correct2 == js, ''.join([a.rstrip()+'\n' for a in difflib.unified_diff(correct1.split('\n'), js.split('\n'), fromfile='expected', tofile='actual')])
-
-  # Try normally, then try unaligned because csmith does generate nonportable code that requires x86 alignment
-  ok = False
-  normal = True
-  for args, note in [([], None)]:#, (['-s', 'UNALIGNED_MEMORY=1'], 'unaligned')]:
+    js_args = [shared.PYTHON, shared.EMCC, fullname, '-o', filename + '.js'] + [opts] + llvm_opts + CSMITH_CFLAGS + args + ['-w']
+    if 0: # binaryen testing, off by default for now
+      js_args += ['-s', 'BINARYEN=1']
+      r = random.random()
+      if r < 0.45:
+        js_args += ['-s', 'BINARYEN_METHOD="interpret-s-expr"']
+      elif r < 0.90:
+        js_args += ['-s', 'BINARYEN_METHOD="interpret-binary"']
+      else:
+        if random.random() < 0.5:
+          js_args += ['-s', 'BINARYEN_METHOD="interpret-binary,asmjs"']
+        else:
+          js_args += ['-s', 'BINARYEN_METHOD="interpret-s-expr,asmjs"']
+      if random.random() < 0.5:
+        if random.random() < 0.5:
+          js_args += ['--js-opts', '0']
+        else:
+          js_args += ['--js-opts', '1']
+      if random.random() < 0.5:
+        # pick random passes
+        BINARYEN_PASSES = [
+          "duplicate-function-elimination",
+          "dce",
+          "remove-unused-brs",
+          "remove-unused-names",
+          "optimize-instructions",
+          "precompute",
+          "simplify-locals",
+          "vacuum",
+          "coalesce-locals",
+          "reorder-locals",
+          "merge-blocks",
+          "remove-unused-functions",
+        ]
+        passes = []
+        while 1:
+          passes.append(random.choice(BINARYEN_PASSES))
+          if random.random() < 0.1:
+            break
+        js_args += ['-s', 'BINARYEN_PASSES="' + ','.join(passes) + '"']
+    if random.random() < 0.5:
+      js_args += ['-s', 'ALLOW_MEMORY_GROWTH=1']
+    if random.random() < 0.5 and 'ALLOW_MEMORY_GROWTH=1' not in js_args and 'BINARYEN=1' not in js_args:
+      js_args += ['-s', 'MAIN_MODULE=1']
+    if random.random() < 0.25:
+      js_args += ['-s', 'INLINING_LIMIT=1'] # inline nothing, for more call interaction
+    if random.random() < 0.333:
+      js_args += ['-s', 'EMTERPRETIFY=1']
+      if random.random() < 0.5:
+        if random.random() < 0.5:
+          js_args += ['-s', 'EMTERPRETIFY_BLACKLIST=["_main"]'] # blacklist main and all inlined into it, but interpret the rest, tests mixing
+        else:
+          js_args += ['-s', 'EMTERPRETIFY_WHITELIST=["_main"]'] # the opposite direction
+      if random.random() < 0.5:
+        js_args += ['-s', 'EMTERPRETIFY_ASYNC=1']
+    if random.random() < 0.5:
+      js_args += ["--memory-init-file", "0", "-s", "MEM_INIT_METHOD=2"]
+    if random.random() < 0.5:
+      js_args += ['-s', 'ASSERTIONS=1']
+    print '(compile)', ' '.join(js_args)
+    short_args = [shared.PYTHON, shared.EMCC, fail_output_name] + js_args[5:]
+    escaped_short_args = map(lambda x : ("'" + x + "'") if '"' in x else x, short_args)
+    open(fullname, 'a').write('\n// ' + ' '.join(escaped_short_args) + '\n\n')
     try:
-      try_js(args)
-      ok = True
-      if note:
-        notes[note] += 1
-      break
-    except Exception, e:
-      print e
-      normal = False
-  #open('testcase%d.js' % tried, 'w').write(
-  #  open(filename + '.js').read().replace('  var ret = run();', '  var ret = run(["1"]);')
-  #)
-  if not ok:
+      shared.check_execute(js_args)
+      assert os.path.exists(filename + '.js')
+      return js_args
+    except:
+      return False
+
+  def execute_js(engine):
+    print '(run in %s)' % engine
+    try:
+      js = shared.run_js(filename + '.js', engine=engine, check_timeout=True, assert_returncode=None)
+    except:
+      print 'failed to run in primary'
+      return False
+    js = js.split('\n')[0] + '\n' # remove any extra printed stuff (node workarounds)
+    return correct1 == js or correct2 == js
+
+  def fail():
+    global fails
     print "EMSCRIPTEN BUG"
     notes['embug'] += 1
     fails += 1
-    shutil.copyfile(fullname, 'newfail%d%s%s' % (fails, opts.replace('-', '_'), suffix))
-    continue
-  #if not ok:
-  #  try: # finally, try with safe heap. if that is triggered, this is nonportable code almost certainly
-  #    try_js(['-s', 'SAFE_HEAP=1'])
-  #  except Exception, e:
-  #    print e
-  #    js = shared.run_js(filename + '.js', stderr=PIPE, full_output=True, assert_returncode=None)
-  #  print js
-  #  if 'SAFE_HEAP' in js:
-  #    notes['safeheap'] += 1
-  #  else:
-  #    break
+    shutil.copyfile(fullname, fail_output_name)
 
-  # This is ok. Try in secondary JS engine too
-  if opts != '-O0' and engine2 and normal:
+  js_args = try_js()
+  if not js_args:
+    fail()
+    continue
+  if not execute_js(engine1):
+    fail()
+    continue
+  if engine2 and not execute_js(engine2):
+    fail()
+    continue
+
+  # This is ok. Try validation in secondary JS engine
+  if opts != '-O0' and 'ALLOW_MEMORY_GROWTH=1' not in js_args and engine2 and 'BINARYEN=1' not in js_args:
     try:
       js2 = shared.run_js(filename + '.js', stderr=PIPE, engine=engine2 + ['-w'], full_output=True, check_timeout=True, assert_returncode=None)
     except:
-      print 'failed to run in secondary', js2
+      print 'failed to run in secondary'
       break
 
     # asm.js testing
     if 'warning: Successfully compiled asm.js code' not in js2:
       print "ODIN VALIDATION BUG"
       notes['embug'] += 1
-      fails += 1
-      shutil.copyfile(fullname, 'newfail%d.c' % fails)
+      fail()
       continue
-    print '[asm.js validation ok]'
+    print '[asm.js validation ok in %s]' % str(engine2)
 

@@ -1,13 +1,24 @@
+// -*- Mode: javascript; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 ; js-indent-level : 2 ; js-curly-indent-offset: 0 -*-
+// vim: set ts=2 et sw=2:
+
 //==============================================================================
 // Optimizer tool. This is meant to be run after the emscripten compiler has
 // finished generating code. These optimizations are done on the generated
-// code to further improve it. Some of the modifications also work in
-// conjunction with closure compiler.
+// code to further improve it.
+//
+// Be aware that this is *not* a general JS optimizer. It assumes that the
+// input is valid asm.js and makes strong assumptions based on this. It may do
+// anything from crashing to optimizing incorrectly if the input is not valid!
 //
 // TODO: Optimize traverse to modify a node we want to replace, in-place,
 //       instead of returning it to the previous call frame where we check?
 // TODO: Share EMPTY_NODE instead of emptyNode that constructs?
 //==============================================================================
+
+if (!Math.fround) {
+  var froundBuffer = new Float32Array(1);
+  Math.fround = function(x) { froundBuffer[0] = x; return froundBuffer[0] };
+}
 
 // *** Environment setup code ***
 var arguments_ = [];
@@ -141,6 +152,9 @@ var CONTINUE_CAPTURERS = LOOP;
 
 var COMMABLE = set('assign', 'binary', 'unary-prefix', 'unary-postfix', 'name', 'num', 'call', 'seq', 'conditional', 'sub');
 
+var CONDITION_CHECKERS = set('if', 'do', 'while', 'switch');
+var BOOLEAN_RECEIVERS = set('if', 'do', 'while', 'conditional');
+
 var FUNCTIONS_THAT_ALWAYS_THROW = set('abort', '___resumeException', '___cxa_throw', '___cxa_rethrow');
 
 var UNDEFINED_NODE = ['unary-prefix', 'void', ['num', 0]];
@@ -155,12 +169,20 @@ function srcToAst(src) {
 }
 
 function astToSrc(ast, minifyWhitespace) {
-    return uglify.uglify.gen_code(ast, {
+  return uglify.uglify.gen_code(ast, {
     debug: debug,
     ascii_only: true,
     beautify: !minifyWhitespace,
     indent_level: 1
   });
+}
+
+function srcToStat(src) {
+  return srcToAst(src)[1][0]; // look into toplevel
+}
+
+function srcToExp(src) {
+  return srcToStat(src)[1];
 }
 
 // Traverses the children of a node. If the traverse function returns an object,
@@ -227,6 +249,11 @@ function traverseGenerated(ast, pre, post) {
   });
 }
 
+function deStat(node) {
+  if (node[0] === 'stat') return node[1];
+  return node;
+}
+
 function emptyNode() { // XXX do we need to create new nodes here? can't we reuse?
   return ['toplevel', []]
 }
@@ -279,6 +306,116 @@ function astCompare(x, y) {
   return true;
 }
 
+// calls definitely on child nodes that will be called, in order, and calls maybe on nodes that might be called.
+// a(); if (b) c(); d(); will call definitely(a, arg), maybe(c, arg), definitely(d, arg)
+function traverseChildrenInExecutionOrder(node, definitely, maybe, arg) {
+  switch (node[0]) {
+    default: throw '!' + node[0];
+    case 'num': case 'var': case 'name': case 'toplevel': case 'string':
+    case 'break': case 'continue': break; // nodes with no interesting children; they themselves have already been definitely or maybe'd
+    case 'assign': case 'binary': {
+      definitely(node[2], arg);
+      definitely(node[3], arg);
+      break;
+    }
+    case 'sub': case 'seq': {
+      definitely(node[1], arg);
+      definitely(node[2], arg);
+      break;
+    }
+    case 'while': {
+      definitely(node[1], arg);
+      maybe(node[2], arg); // may never enter the loop
+      maybe(node[1], arg); // may enter the loop a second time
+      maybe(node[2], arg);
+      break;
+    }
+    case 'do': {
+      definitely(node[2], arg);
+      maybe(node[1], arg); // may never reach the condition if we break
+      maybe(node[2], arg);
+      maybe(node[1], arg);
+      break;
+    }
+    case 'binary': {
+      definitely(node[2], arg);
+      definitely(node[3], arg);
+      break;
+    }
+    case 'dot': {
+      definitely(node[1], arg);
+      break;
+    }
+    case 'unary-prefix': case 'label': {
+      definitely(node[2], arg);
+      break;
+    }
+    case 'call': {
+      definitely(node[1], arg);
+      var args = node[2];
+      for (var i = 0; i < args.length; i++) {
+        definitely(args[i], arg);
+      }
+      break;
+    }
+    case 'if': case 'conditional': {
+      definitely(node[1], arg);
+      maybe(node[2], arg);
+      if (node[3]) { maybe(node[3], arg); }
+      break;
+    }
+    case 'defun': case 'func': case 'block': {
+      var stats = getStatements(node);
+      if (!stats || stats.length === 0) break;
+      for (var i = 0; i < stats.length; i++) {
+        definitely(stats[i], arg);
+        // check if we might break, if we have more to do
+        if (i === stats.length - 1) break;
+        var labels = {};
+        var breakCaptured = 0;
+        var mightBreak = false;
+        traverse(stats[i], function(node, type) {
+          if (type === 'label') labels[node[1]] = true;
+          else if (type in BREAK_CAPTURERS) {
+            breakCaptured++;
+          } else if (type === 'break') {
+            if (node[1]) {
+              // labeled break
+              if (!(node[1] in labels)) mightBreak = true;
+            } else {
+              if (!breakCaptured) mightBreak = true;
+            }
+          }
+        }, function(node, type) {
+          if (type === 'label') delete labels[node[1]];
+          else if (type in BREAK_CAPTURERS) {
+            breakCaptured--;
+          }
+        });
+        if (mightBreak) {
+          // all the rest are in one big maybe
+          return maybe(['block', stats.slice(i+1)], arg);
+        }
+      }
+      break;
+    }
+    case 'stat': case 'return': {
+      definitely(node[1], arg);
+      break;
+    }
+    case 'switch': {
+      definitely(node[1], arg);
+      var cases = node[2];
+      for (var i = 0; i < cases.length; i++) {
+        var c = cases[i];
+        var stats = c[1];
+        var temp = ['block', stats];
+        maybe(temp, arg);
+      }
+    }
+  }
+}
+
 // Passes
 
 // Dump the AST. Useful for debugging. For example,
@@ -289,6 +426,18 @@ function dumpAst(ast) {
 
 function dumpSrc(ast) {
   printErr(astToSrc(ast));
+}
+
+function overwrite(x, y) {
+  for (var i = 0; i < y.length; i++) x[i] = y[i];
+  x.length = y.length;
+}
+
+var STACK_ALIGN = 16;
+
+function stackAlign(x) {
+  if (x % STACK_ALIGN) x += STACK_ALIGN - (x % STACK_ALIGN);
+  return x;
 }
 
 // Closure compiler, when inlining, will insert assignments to
@@ -364,8 +513,28 @@ function removeUnneededLabelSettings(ast) {
 
 // Various expression simplifications. Happens after elimination, which opens up many of these simplification opportunities.
 
+function makeTempParseHeap() {
+  return { unsigned: false, float: false, bits: 0, type: 0 };
+}
+
+var parseHeapTemp = makeTempParseHeap();
+
+function parseHeap(name, out) { // XXX this uses parseHeapTemp by default, which is global! If between your call and your use, something else can call - that is bad
+  out = out || parseHeapTemp;
+  if (name.substr(0, 4) != 'HEAP') return false;
+  out.unsigned = name[4] === 'U';
+  out.float = name[4] === 'F';
+  out.bits = parseInt(name.substr(out.unsigned || out.float ? 5 : 4));
+  out.type = !out.float ? ASM_INT : (out.bits === 64 ? ASM_DOUBLE : ASM_FLOAT);
+  return true;
+}
+
 var USEFUL_BINARY_OPS = set('<<', '>>', '|', '&', '^');
 var COMPARE_OPS = set('<', '<=', '>', '>=', '==', '===', '!=', '!==');
+
+function isFunctionTable(name) {
+  return /^FUNCTION_TABLE.*/.test(name);
+}
 
 function simplifyExpressions(ast) {
   // Simplify common expressions used to perform integer conversion operations
@@ -406,7 +575,7 @@ function simplifyExpressions(ast) {
   // Likewise, if we have |0 inside a block that will be >>'d, then the |0 is unnecessary because some
   // 'useful' mathops already |0 anyhow.
 
-  function simplifyBitops(ast) {
+  function simplifyOps(ast) {
     var SAFE_BINARY_OPS;
     if (asm) {
       SAFE_BINARY_OPS = set('+', '-'); // division is unsafe as it creates non-ints in JS; mod is unsafe as signs matter so we can't remove |0's; mul does not nest with +,- in asm
@@ -485,17 +654,18 @@ function simplifyExpressions(ast) {
 
     // & and heap-related optimizations
 
-    var heapBits, heapUnsigned;
-    function parseHeap(name) {
-      if (name.substr(0, 4) != 'HEAP') return false;
-      heapUnsigned = name[4] === 'U';
-      heapBits = parseInt(name.substr(heapUnsigned ? 5 : 4));
-      return true;
-    }
-
     var hasTempDoublePtr = false, rerunOrZeroPass = false;
 
     traverse(ast, function(node, type) {
+      // The "pre" visitor. Useful for detecting trees which should not
+      // be simplified.
+      if (type == 'sub' && node[1][0] == 'name' && isFunctionTable(node[1][1])) {
+        return null; // do not traverse subchildren here, we should not collapse 55 & 126.
+      }
+    }, function(node, type) {
+      // The "post" visitor. The simplifications are done in this visitor so
+      // that we simplify a node's operands before the node itself. This allows
+      // optimizations to cascade.
       if (type === 'name') {
         if (node[1] === 'tempDoublePtr') hasTempDoublePtr = true;
       } else if (type === 'binary' && node[1] === '&' && node[3][0] === 'num') {
@@ -510,9 +680,9 @@ function simplifyExpressions(ast) {
           // HEAP8[..] & 255 => HEAPU8[..]
           var name = input[1][1];
           if (parseHeap(name)) {
-            if (amount === Math.pow(2, heapBits)-1) {
-              if (!heapUnsigned) {
-                input[1][1] = 'HEAPU' + heapBits; // make unsigned
+            if (amount === Math.pow(2, parseHeapTemp.bits)-1) {
+              if (!parseHeapTemp.unsigned) {
+                input[1][1] = 'HEAPU' + parseHeapTemp.bits; // make unsigned
               }
               if (asm) {
                 // we cannot return HEAPU8 without a coercion, but at least we do HEAP8 & 255 => HEAPU8 | 0
@@ -523,6 +693,13 @@ function simplifyExpressions(ast) {
               return input;
             }
           }
+        } else if (input[0] === 'binary' && input[1] === '>>' &&
+                   input[2][0] === 'binary' && input[2][1] === '<<' &&
+                   input[2][3][0] === 'num' && input[3][0] === 'num' &&
+                   input[2][3][1] === input[3][1] &&
+                   (~(-1 >>> input[3][1]) & amount) == 0) {
+            // x << 24 >> 24 & 255 => x & 255
+            return ['binary', '&', input[2][2], node[3]];
         }
       } else if (type === 'binary' && node[1] === '^') {
         // LLVM represents bitwise not as xor with -1. Translate it back to an actual bitwise not.
@@ -538,8 +715,8 @@ function simplifyExpressions(ast) {
         var amount = node[3][1];
         var name = node[2][2][1][1];
         if (amount === node[2][3][1] && parseHeap(name)) {
-          if (heapBits === 32 - amount) {
-            node[2][2][1][1] = 'HEAP' + heapBits;
+          if (parseHeapTemp.bits === 32 - amount) {
+            node[2][2][1][1] = 'HEAP' + parseHeapTemp.bits;
             node[1] = '|';
             node[2] = node[2][2];
             node[3][1] = 0;
@@ -585,8 +762,19 @@ function simplifyExpressions(ast) {
             node[3] = value[2];
           }
         }
-      } else if (type == 'sub' && node[1][0] == 'name' && /^FUNCTION_TABLE.*/.exec(node[1][1])) {
-        return null; // do not traverse subchildren here, we should not collapse 55 & 126. TODO: optimize this into a nonvirtual call (also because we lose some other opts here)!
+      } else if (type === 'binary' && node[1] === '>>' && node[2][0] === 'num' && node[3][0] === 'num') {
+        // optimize num >> num, in asm we need this since we do not optimize shifts in asm.js
+        node[0] = 'num';
+        node[1] = node[2][1] >> node[3][1];
+        node.length = 2;
+        return node;
+      } else if (type === 'binary' && node[1] === '+') {
+        // The most common mathop is addition, e.g. in getelementptr done repeatedly. We can join all of those,
+        // by doing (num+num) ==> newnum.
+        if (node[2][0] === 'num' && node[3][0] === 'num') {
+          node[2][1] += node[3][1];
+          return node[2];
+        }
       }
     });
 
@@ -619,7 +807,7 @@ function simplifyExpressions(ast) {
                 node[2][0] !== 'seq') { // avoid (x, y, z) which can be used for tempDoublePtr on doubles for alignment fixes
               if (node[1][2][1][1] === 'HEAP32') {
                 node[1][3][1][1] = 'HEAPF32';
-                return makeAsmCoercion(node[1][3], detectAsmCoercion(node[2]));
+                return makeAsmCoercion(node[1][3], detectType(node[2]));
               } else {
                 node[1][3][1][1] = 'HEAP32';
                 return ['binary', '|', node[1][3], ['num', 0]];
@@ -693,60 +881,7 @@ function simplifyExpressions(ast) {
         }
         denormalizeAsm(ast, asmData);
       }
-
-      // optimize num >> num, in asm we need this here since we do not run optimizeShifts
-      traverse(ast, function(node, type) {
-        if (type === 'binary' && node[1] === '>>' && node[2][0] === 'num' && node[3][0] === 'num') {
-          node[0] = 'num';
-          node[1] = node[2][1] >> node[3][1];
-          node.length = 2;
-        }
-      });
     }
-  }
-
-  // The most common mathop is addition, e.g. in getelementptr done repeatedly. We can join all of those,
-  // by doing (num+num) ==> newnum, and (name+num)+num = name+newnum
-  function joinAdditions(ast) {
-    var rerun = true;
-    while (rerun) {
-      rerun = false;
-      traverse(ast, function(node, type) {
-        if (type === 'binary' && node[1] === '+') {
-          if (node[2][0] === 'num' && node[3][0] === 'num') {
-            rerun = true;
-            node[2][1] += node[3][1];
-            return node[2];
-          }
-          for (var i = 2; i <= 3; i++) {
-            var ii = 5-i;
-            for (var j = 2; j <= 3; j++) {
-              if (node[i][0] === 'num' && node[ii][0] === 'binary' && node[ii][1] === '+' && node[ii][j][0] === 'num') {
-                rerun = true;
-                node[ii][j][1] += node[i][1];
-                return node[ii];
-              }
-            }
-          }
-        }
-      });
-    }
-  }
-
-  // if (x === 0) can be if (!x), etc.
-  function simplifyZeroComp(ast) {
-    traverse(ast, function(node, type) {
-      var binary;
-      if (type === 'if' && (binary = node[1])[0] === 'binary') {
-        if ((binary[1] === '!=' || binary[1] === '!==') && binary[3][0] === 'num' && binary[3][1] === 0) {
-          node[1] = binary[2];
-          return node;
-        } else if ((binary[1] === '==' || binary[1] === '===') && binary[3][0] === 'num' && binary[3][1] === 0) {
-          node[1] = ['unary-prefix', '!', binary[2]];
-          return node;
-        }
-      }
-    });
   }
 
   function emitsBoolean(node) {
@@ -811,16 +946,185 @@ function simplifyExpressions(ast) {
     });
   }
 
+  function simplifyNotZero(ast) {
+    traverse(ast, function(node, type) {
+      if (node[0] in BOOLEAN_RECEIVERS) {
+        var boolean = node[1];
+        if (boolean[0] === 'binary' && boolean[1] === '!=' && boolean[3][0] === 'num' && boolean[3][1] === 0) {
+          node[1] = boolean[2];
+        }
+      }
+    });
+  }
+
   traverseGeneratedFunctions(ast, function(func) {
     simplifyIntegerConversions(func);
-    simplifyBitops(func);
-    joinAdditions(func);
+    simplifyOps(func);
     simplifyNotComps(func);
     conditionalize(func);
-    // simplifyZeroComp(func); TODO: investigate performance
+    simplifyNotZero(func);
   });
 }
 
+function localCSE(ast) {
+  // very simple CSE/GVN type optimization, factor out common expressions in a single basic block
+  assert(asm);
+  var MIN_COST = 3;
+  traverseGeneratedFunctions(ast, function(func) {
+    var asmData = normalizeAsm(func);
+    var counter = 0;
+    var optimized = false;
+    traverse(func, function(node, type) {
+      var stats = getStatements(node);
+      if (!stats) return;
+      var exps = {}; // JSON'd expression => [i it first appears on, original node, replacement var, type, sign]
+      var deps = {}; // dependency (local name, or 'memory' or 'global')
+      function invalidate(what) {
+        var list = deps[what];
+        if (!list) return;
+        for (var i = 0; i < list.length; i++) {
+          delete exps[list[i]];
+        }
+        delete deps[what];
+      }
+      function doInvalidations(curr) {
+        return traverse(curr, function(node, type) {
+          if (type in CONTROL_FLOW) {
+            exps = {};
+            deps = {};
+            return true; // abort everything
+          }
+          if (type === 'assign') {
+            var target = node[2];
+            if (target[0] === 'name') {
+              var name = target[1];
+              if (name in asmData.params || name in asmData.vars) {
+                invalidate(name);
+              } else {
+                invalidate('<global>');
+              }
+            } else {
+              assert(target[0] === 'sub');
+              invalidate('<memory>');
+            }
+          }
+          if (type === 'call') {
+            invalidate('<global>');
+            invalidate('<memory>');
+          }
+        });
+      }
+      for (var i = 0; i < stats.length; i++) {
+        var curr = stats[i];
+        // first, look at the entire line and invalidate what we need to
+        if (doInvalidations(curr) === true) {
+          continue; // we saw control flow
+        }
+        // next, process the line and try to find useful expressions
+        var skips = [];
+        traverse(curr, function seekExpressions(node, type) {
+          if (type === 'sub' && node[1][0] === 'name' && node[2][0] === 'binary' && node[2][1] === '>>') {
+            // skip over the shift, we can't cse that
+            skips.push(node[2]);
+            return;
+          }
+          if (type === 'binary' || type === 'unary-prefix') {
+            if (type === 'binary' && skips.indexOf(node) >= 0) return;
+            if (measureCost(node) < MIN_COST) return;
+            if (detectType(node, asmData) === ASM_NONE) return; // if we can't figure it out locally, forget it
+            var str = JSON.stringify(node);
+            var lookup = exps[str];
+            if (!lookup) {
+              // add ourselves, and set up our deps
+              exps[str] = [i, node, null];
+              traverse(node, function(node, type) {
+                var names = [];
+                if (type === 'name') {
+                  var name = node[1];
+                  if (!(name in asmData.params || name in asmData.vars)) name = '<global>';
+                  names.push(name);
+                } else if (type === 'sub') {
+                  names.push('<memory>');
+                } else if (type === 'call') {
+                  names.push('<memory>');
+                  names.push('<global>');
+                }
+                names.forEach(function(name) {
+                  if (!deps[name]) deps[name] = [];
+                  deps[name].push(str);
+                });
+              });
+            } else {
+              //printErr('CSEing ' + str);
+              optimized = true;
+              var type, sign;
+              // with the original node plus us, this is worth optimizing out
+              if (lookup[2] === null) {
+                // this is the first node after the first. generate the saved var, and optimize out the original
+                lookup[2] = 'CSE$' + (counter++);
+                // ensure an asm coercion
+                type = lookup[3] = detectType(node, asmData);
+                sign = detectSign(node);
+                if (sign === ASM_FLEXIBLE) sign = ASM_SIGNED;
+                lookup[4] = sign;
+                asmData.vars[lookup[2]] = type;
+                overwrite(lookup[1], makeSignedAsmCoercion(['name', lookup[2]], type, sign));
+                stats.splice(lookup[0], 0, ['stat', ['assign', true, ['name', lookup[2]], makeSignedAsmCoercion(node, type, sign)]]);
+                // adjust indexes after that splice
+                i++; // i must be after lookup[0]
+                for (var e in exps) {
+                  var curr = exps[e];
+                  if (curr[2] === null) {
+                    if (curr[0] >= lookup[0]) curr[0]++;
+                  }
+                }
+              } else {
+                type = lookup[3];
+                sign = lookup[4];
+              }
+              // optimize out ourselves
+              return makeSignedAsmCoercion(['name', lookup[2]], type, sign);
+            }
+          }
+        });
+        // finally, repeat invalidation processing, to not be sensitive to inter-line control flow
+        doInvalidations(curr);
+      }
+    });
+    denormalizeAsm(func, asmData);
+    if (optimized) {
+      simplifyExpressions(func); // remove double coercions, etc.
+    }
+  });
+}
+
+function safeLabelSettingInternal(func, asmData) {
+  if ('label' in asmData.vars) {
+    var stats = getStatements(func);
+    var seenVar = false;
+    for (var i = 0; i < stats.length; i++) {
+      var curr = stats[i];
+      if (curr[0] === 'stat') curr = curr[1];
+      if (curr[0] === 'var') {
+        seenVar = true;
+      } else if (seenVar && curr[0] !== 'var') {
+        // first location after the vars
+        stats.splice(i, 0, ['stat', ['assign', true, ['name', 'label'], ['num', 0]]]);
+        break;
+      }
+    }
+  }
+}
+
+function safeLabelSetting(ast) {
+  // Add an assign to label, if it exists, so that even after we minify/registerize variable names, we can tell if any vars use the asm init value of 0 - none will, so it's easy to tell
+  assert(asm);
+  traverseGeneratedFunctions(ast, function(func) {
+    var asmData = normalizeAsm(func);
+    safeLabelSettingInternal(func, asmData);
+    denormalizeAsm(func, asmData);
+  });
+}
 
 function simplifyIfs(ast) {
   traverseGeneratedFunctions(ast, function(func) {
@@ -975,405 +1279,6 @@ function simplifyIfs(ast) {
   });
 }
 
-// In typed arrays mode 2, we can have
-//  HEAP[x >> 2]
-// very often. We can in some cases do the shift on the variable itself when it is set,
-// to greatly reduce the number of shift operations.
-function optimizeShiftsInternal(ast, conservative) {
-  assert(!asm);
-  var MAX_SHIFTS = 3;
-  traverseGeneratedFunctions(ast, function(fun) {
-    var funMore = true;
-    var funFinished = {};
-    while (funMore) {
-      funMore = false;
-      // Recognize variables and parameters
-      var vars = {};
-      function newVar(name, param, addUse) {
-        if (!vars[name]) {
-          vars[name] = {
-            param: param,
-            defs: addUse ? 1 : 0,
-            uses: 0,
-            timesShifted: [0, 0, 0, 0], // zero shifts of size 0, 1, 2, 3
-            benefit: 0,
-            primaryShift: -1
-          };
-        }
-      }
-      // params
-      if (fun[2]) {
-        fun[2].forEach(function(arg) {
-          newVar(arg, true, true);
-        });
-      }
-      // vars
-      // XXX if var has >>=, ignore it here? That means a previous pass already optimized it
-      var hasSwitch = traverse(fun, function(node, type) {
-        if (type === 'var') {
-          node[1].forEach(function(arg) {
-            newVar(arg[0], false, arg[1]);
-          });
-        } else if (type === 'switch') {
-          // The relooper can't always optimize functions, and we currently don't work with
-          // switch statements when optimizing shifts. Bail.
-          return true;
-        }
-      });
-      if (hasSwitch) {
-        break;
-      }
-      // uses and defs TODO: weight uses by being inside a loop (powers). without that, we
-      // optimize for code size, not speed.
-      var stack = [];
-      traverse(fun, function(node, type) {
-        stack.push(node);
-        if (type === 'name' && vars[node[1]] && stack[stack.length-2][0] != 'assign') {
-          vars[node[1]].uses++;
-        } else if (type === 'assign' && node[2][0] === 'name' && vars[node[2][1]]) {
-          vars[node[2][1]].defs++;
-        }
-      }, function() {
-        stack.pop();
-      });
-      // First, break up elements inside a shift. This lets us see clearly what to do next.
-      traverse(fun, function(node, type) {
-        if (type === 'binary' && node[1] === '>>' && node[3][0] === 'num') {
-          var shifts = node[3][1];
-          if (shifts <= MAX_SHIFTS) {
-            // Check for validity. It is ok to have a single element that might have non-zeroed lower bits, but no more.
-            // x + 4 >> 2 === (x >> 2) + (4 >> 2), but not x + 3 >> 2 === (x >> 2) + (3 >> 2) (c.f. x=1, we get 1 !== 0)
-            var seen = '', ok = true;
-            function checkShift(subNode) {
-              if (subNode[0] === 'binary') {
-                switch (subNode[1]) {
-                  case '+': case '|': case '&': { // this could be more comprehensive, but likely not needed
-                    checkShift(subNode[2]);
-                    checkShift(subNode[3]);
-                    break;
-                  }
-                  case '>>': case '>>>': {
-                    checkShift(subNode[2]);
-                    break;
-                  }
-                  case '<<': {
-                    if (subNode[3][0] === 'num' && subNode[3][1] >= shifts) break; // bits are clear, all good
-                    checkShift(subNode[2]);
-                    break;
-                  }
-                  case '*': {
-                    if (subNode[3][0] === 'num') {
-                      var value = subNode[3][1];
-                      if (((value >> shifts) << shifts) === value) return; // bits are clear, all good
-                    }
-                    checkShift(subNode[2]);
-                    checkShift(subNode[3]);
-                    break;
-                  }
-                  default: ok = false;
-                }
-                return;
-              }
-              if (subNode[0] === 'name') {
-                var name = subNode[1];
-                if (!seen) {
-                  seen = name;
-                } else if (name !== seen) {
-                  ok = false;
-                }
-                return;
-              }
-              if (subNode[0] === 'num') {
-                var value = subNode[1];
-                if (((value >> shifts) << shifts) !== value) ok = false;
-                return;
-              }
-              if (subNode[0] === 'sub') {
-                if (seen) ok = false;
-                seen = 'heap access';
-                return;
-              }
-              ok = false; // anything else is bad
-            }
-            checkShift(node[2]);
-            if (!ok) return;
-
-            // Push the >> inside the value elements
-            function addShift(subNode) {
-              if (subNode[0] === 'binary' && subNode[1] === '+') {
-                subNode[2] = addShift(subNode[2]);
-                subNode[3] = addShift(subNode[3]);
-                return subNode;
-              }
-              if (subNode[0] === 'name' && !subNode[2]) { // names are returned with a shift, but we also note their being shifted
-                var name = subNode[1];
-                if (vars[name]) {
-                  vars[name].timesShifted[shifts]++;
-                  subNode[2] = true;
-                }
-              }
-              return ['binary', '>>', subNode, ['num', shifts]];
-            }
-            return addShift(node[2]);
-          }
-        }
-      });
-      traverse(fun, function(node, type) {
-        if (node[0] === 'name' && node[2]) {
-          return node.slice(0, 2); // clean up our notes
-        }
-      });
-      // At this point, shifted expressions are split up, and we know who the vars are and their info, so we can decide
-      // TODO: vars that depend on other vars
-      for (var name in vars) {
-        var data = vars[name];
-        var totalTimesShifted = sum(data.timesShifted);
-        if (totalTimesShifted === 0) {
-          continue;
-        }
-        if (totalTimesShifted != Math.max.apply(null, data.timesShifted)) {
-          // TODO: Handle multiple different shifts
-          continue;
-        }
-        if (funFinished[name]) continue;
-        // We have one shift size (and possible unshifted uses). Consider replacing this variable with a shifted clone. If
-        // the estimated benefit is >0, we will do it
-        if (data.defs === 1) {
-          data.benefit = totalTimesShifted - 2*(data.defs + (data.param ? 1 : 0));
-        }
-        if (conservative) data.benefit = 0;
-        if (data.benefit > 0) {
-          funMore = true; // We will reprocess this function
-          for (var i = 0; i < 4; i++) {
-            if (data.timesShifted[i]) {
-              data.primaryShift = i;
-            }
-          }
-        }
-      }
-      //printErr(JSON.stringify(vars));
-      function cleanNotes() { // We need to mark 'name' nodes as 'processed' in some passes here; this cleans the notes up
-        traverse(fun, function(node, type) {
-          if (node[0] === 'name' && node[2]) {
-            return node.slice(0, 2);
-          }
-        });
-      }
-      cleanNotes();
-      // Apply changes
-      function needsShift(name) {
-        return vars[name] && vars[name].primaryShift >= 0;
-      }
-      for (var name in vars) { // add shifts for params and var's for all new variables
-        var data = vars[name];
-        if (needsShift(name)) {
-          if (data.param) {
-            fun[3].unshift(['var', [[name + '$s' + data.primaryShift, ['binary', '>>', ['name', name], ['num', data.primaryShift]]]]]);
-          } else {
-            fun[3].unshift(['var', [[name + '$s' + data.primaryShift]]]);
-          }
-        }
-      }
-      var stack = [];
-      traverse(fun, function(node, type) { // add shift to assignments
-        stack.push(node);
-        if (node[0] === 'assign' && node[1] === true && node[2][0] === 'name' && needsShift(node[2][1]) && !node[2][2]) {
-          var name = node[2][1];
-          var data = vars[name];
-          var parent = stack[stack.length-3];
-          var statements = getStatements(parent);
-          assert(statements, 'Invalid parent for assign-shift: ' + dump(parent));
-          var i = statements.indexOf(stack[stack.length-2]);
-          statements.splice(i+1, 0, ['stat', ['assign', true, ['name', name + '$s' + data.primaryShift], ['binary', '>>', ['name', name, true], ['num', data.primaryShift]]]]);
-        } else if (node[0] === 'var') {
-          var args = node[1];
-          for (var i = 0; i < args.length; i++) {
-            var arg = args[i];
-            var name = arg[0];
-            var data = vars[name];
-            if (arg[1] && needsShift(name)) {
-              args.splice(i+1, 0, [name + '$s' + data.primaryShift, ['binary', '>>', ['name', name, true], ['num', data.primaryShift]]]);
-            }
-          }
-          return node;
-        }
-      }, function() {
-        stack.pop();
-      });
-      cleanNotes();
-      var stack = [];
-      traverse(fun, function(node, type) { // replace shifted name with new variable
-        stack.push(node);
-        if (node[0] === 'binary' && node[1] === '>>' && node[2][0] === 'name' && needsShift(node[2][1]) && node[3][0] === 'num') {
-          var name = node[2][1];
-          var data = vars[name];
-          var parent = stack[stack.length-2];
-          // Don't modify in |x$sN = x >> 2|, in normal assigns and in var assigns
-          if (parent[0] === 'assign' && parent[2][0] === 'name' && parent[2][1] === name + '$s' + data.primaryShift) return;
-          if (parent[0] === name + '$s' + data.primaryShift) return;
-          if (node[3][1] === data.primaryShift) {
-            return ['name', name + '$s' + data.primaryShift];
-          }
-        }
-      }, function() {
-        stack.pop();
-      });
-      cleanNotes();
-      var SIMPLE_SHIFTS = set('<<', '>>');
-      var more = true;
-      while (more) { // combine shifts in the same direction as an optimization
-        more = false;
-        traverse(fun, function(node, type) {
-          if (node[0] === 'binary' && node[1] in SIMPLE_SHIFTS && node[2][0] === 'binary' && node[2][1] === node[1] &&
-              node[3][0] === 'num' && node[2][3][0] === 'num') { // do not turn a << b << c into a << b + c; while logically identical, it is slower
-            more = true;
-            return ['binary', node[1], node[2][2], ['num', node[3][1] + node[2][3][1]]];
-          }
-        });
-      }
-      // Before recombining, do some additional optimizations
-      traverse(fun, function(node, type) {
-        // Apply constant shifts onto constants
-        if (type === 'binary' && node[1] === '>>' && node[2][0] === 'num' && node[3][0] === 'num' && node[3][1] <= MAX_SHIFTS) {
-          var subNode = node[2];
-          var shifts = node[3][1];
-          var result = subNode[1] / Math.pow(2, shifts);
-          if (result % 1 === 0) {
-            subNode[1] = result;
-            return subNode;
-          }
-        }
-        // Optimize the case of ($a*80)>>2 into ($a*20)|0
-        if (type === 'binary' && node[1] in SIMPLE_SHIFTS &&
-            node[2][0] === 'binary' && node[2][1] === '*') {
-          var mulNode = node[2];
-          if (mulNode[2][0] === 'num') {
-            var temp = mulNode[2];
-            mulNode[2] = mulNode[3];
-            mulNode[3] = temp;
-          }
-          if (mulNode[3][0] === 'num') {
-            if (node[1] === '<<') {
-              mulNode[3][1] *= Math.pow(2, node[3][1]);
-              node[1] = '|';
-              node[3][1] = 0;
-              return node;
-            } else {
-              if (mulNode[3][1] % Math.pow(2, node[3][1]) === 0) {
-                mulNode[3][1] /= Math.pow(2, node[3][1]);
-                node[1] = '|';
-                node[3][1] = 0;
-                return node;
-              }
-            }
-          }
-        }
-        /* XXX - theoretically useful optimization(s), but commented out as not helpful in practice
-        // Transform (x << 2) >> 2 into x & mask or something even simpler
-        if (type === 'binary'       && node[1]    === '>>' && node[3][0] === 'num' &&
-            node[2][0] === 'binary' && node[2][1] === '<<' && node[2][3][0] === 'num' && node[3][1] === node[2][3][1]) {
-          var subNode = node[2];
-          var shifts = node[3][1];
-          var mask = ((0xffffffff << shifts) >>> shifts) | 0;
-          return ['binary', '&', subNode[2], ['num', mask]];
-          //return ['binary', '|', subNode[2], ['num', 0]];
-          //return subNode[2];
-        }
-        */
-      });
-      // Re-combine remaining shifts, to undo the breaking up we did before. may require reordering inside +'s
-      var stack = [];
-      traverse(fun, function(node, type) {
-        stack.push(node);
-        if (type === 'binary' && node[1] === '+' && (stack[stack.length-2][0] != 'binary' || stack[stack.length-2][1] !== '+')) {
-          // 'Flatten' added items
-          var addedItems = [];
-          function flatten(node) {
-            if (node[0] === 'binary' && node[1] === '+') {
-              flatten(node[2]);
-              flatten(node[3]);
-            } else {
-              addedItems.push(node);
-            }
-          }
-          flatten(node);
-          var originalOrder = addedItems.slice();
-          function key(node) { // a unique value for all relevant shifts for recombining, non-unique for stuff we don't need to bother with
-            function originalOrderKey(item) {
-              return -originalOrder.indexOf(item);
-            }
-            if (node[0] === 'binary' && node[1] in SIMPLE_SHIFTS) {
-              if (node[3][0] === 'num' && node[3][1] <= MAX_SHIFTS) return 2*node[3][1] + (node[1] === '>>' ? 100 : 0); // 0-106
-              return (node[1] === '>>' ? 20000 : 10000) + originalOrderKey(node);
-            }
-            if (node[0] === 'num') return -20000 + node[1];
-            return -10000 + originalOrderKey(node); // Don't modify the original order if we don't modify anything
-          }
-          for (var i = 0; i < addedItems.length; i++) {
-            if (addedItems[i][0] === 'string') return; // this node is not relevant for us
-          }
-          addedItems.sort(function(node1, node2) {
-            return key(node1) - key(node2);
-          });
-          // Regenerate items, now sorted
-          var i = 0;
-          while (i < addedItems.length-1) { // re-combine inside addedItems
-            var k = key(addedItems[i]), k1 = key(addedItems[i+1]);
-            if (k === k1 && k >= 0 && k1 <= 106) {
-              addedItems[i] = ['binary', addedItems[i][1], ['binary', '+', addedItems[i][2], addedItems[i+1][2]], addedItems[i][3]];
-              addedItems.splice(i+1, 1);
-            } else {
-              i++;
-            }
-          }
-          var num = 0;
-          for (i = 0; i < addedItems.length; i++) { // combine all numbers into one
-            if (addedItems[i][0] === 'num') {
-              num += addedItems[i][1];
-              addedItems.splice(i, 1);
-              i--;
-            }
-          }
-          if (num != 0) { // add the numbers into an existing shift, we 
-                          // prefer (x+5)>>7 over (x>>7)+5 , since >>'s result is known to be 32-bit and is more easily optimized.
-                          // Also, in the former we can avoid the parentheses, which saves a little space (the number will be bigger,
-                          // so it might take more space, but normally at most one more digit).
-            var added = false;
-            for (i = 0; i < addedItems.length; i++) {
-              if (addedItems[i][0] === 'binary' && addedItems[i][1] === '>>' && addedItems[i][3][0] === 'num' && addedItems[i][3][1] <= MAX_SHIFTS) {
-                addedItems[i] = ['binary', '>>', ['binary', '+', addedItems[i][2], ['num', num << addedItems[i][3][1]]], addedItems[i][3]];
-                added = true;
-              }
-            }
-            if (!added) {
-              addedItems.unshift(['num', num]);
-            }
-          }
-          var ret = addedItems.pop();
-          while (addedItems.length > 0) { // re-create AST from addedItems
-            ret = ['binary', '+', ret, addedItems.pop()];
-          }
-          return ret;
-        }
-      }, function() {
-        stack.pop();
-      });
-      // Note finished variables
-      for (var name in vars) {
-        funFinished[name] = true;
-      }
-    }
-  });
-}
-
-function optimizeShiftsConservative(ast) {
-  optimizeShiftsInternal(ast, true);
-}
-
-function optimizeShiftsAggressive(ast) {
-  optimizeShiftsInternal(ast, false);
-}
-
 // We often have branchings that are simplified so one end vanishes, and
 // we then get
 //   if (!(x < 5))
@@ -1381,8 +1286,7 @@ function optimizeShiftsAggressive(ast) {
 function simplifyNotCompsDirect(node) {
   if (node[0] === 'unary-prefix' && node[1] === '!') {
     // de-morgan's laws do not work on floats, due to nans >:(
-    if (node[2][0] === 'binary' && (!asm || (((node[2][2][0] === 'binary' && node[2][2][1] === '|') || node[2][2][0] === 'num') &&
-                                             ((node[2][3][0] === 'binary' && node[2][3][1] === '|') || node[2][3][0] === 'num')))) {
+    if (node[2][0] === 'binary' && (!asm || (detectType(node[2][2]) === ASM_INT && detectType(node[2][3]) === ASM_INT))) {
       switch(node[2][1]) {
         case '<': return ['binary', '>=', node[2][2], node[2][3]];
         case '>': return ['binary', '<=', node[2][2], node[2][3]];
@@ -1400,6 +1304,43 @@ function simplifyNotCompsDirect(node) {
   if (!simplifyNotCompsPass) return node;
 }
 
+var SAFE_TO_DROP_COERCION = set('unary-prefix', 'name', 'num');
+
+function canDropCoercion(node) {
+  if (node[0] in SAFE_TO_DROP_COERCION) return true;
+  if (node[0] === 'binary') {
+    switch (node[1]) {
+      case '>>': case '>>>': case '<<': case '|': case '^': case '&': return true;
+    }
+  }
+  return false;
+}
+
+function simplifyCondition(node) {
+  node = simplifyNotCompsDirect(node);
+  // on integers, if (x == 0) is the same as if (x), and if (x != 0) as if (!x)
+  if (node[0] === 'binary' && (node[1] === '==' || node[1] === '!=')) {
+    var target = null;
+    if (detectType(node[2]) === ASM_INT && node[3][0] === 'num' && node[3][1] === 0) {
+      target = node[2];
+    } else if (detectType(node[3]) === ASM_INT && node[2][0] === 'num' && node[2][1] === 0) {
+      target = node[3];
+    }
+    if (target) {
+      if (target[0] === 'binary' && (target[1] === '|' || target[1] === '>>>') && target[3][0] === 'num' && target[3][1] === 0 &&
+          canDropCoercion(target[2])) {
+        target = target[2]; // drop the coercion, in a condition it is ok to do if (x)
+      }
+      if (node[1] === '==') {
+        return ['unary-prefix', '!', target];
+      } else {
+        return target;
+      }
+    }
+  }
+  return node;
+}
+
 function flipCondition(cond) {
   return simplifyNotCompsDirect(['unary-prefix', '!', cond]);
 }
@@ -1412,8 +1353,12 @@ function simplifyNotComps(ast) {
   simplifyNotCompsPass = false;
 }
 
+function isMathFunc(name) {
+  return /^Math_/.test(name);
+}
+
 function callHasSideEffects(node) { // checks if the call itself (not the args) has side effects (or is not statically known)
-  return !(node[1][0] === 'name' && /^Math_/.test(node[1][1]));
+  return !(node[1][0] === 'name' && isMathFunc(node[1][1]));
 }
 
 function hasSideEffects(node) { // this is 99% incomplete!
@@ -1504,6 +1449,8 @@ function vacuum(ast) {
       case 'stat': {
         if (node[1][0] === 'block') {
           return node[1];
+        } else if (!hasSideEffects(node[1])) {
+          return emptyNode();
         }
       } break;
       case 'defun': {
@@ -1824,55 +1771,311 @@ function unVarify(vars, ret) { // transform var x=1, y=2 etc. into (x=1, y=2), i
 var ASM_INT = 0;
 var ASM_DOUBLE = 1;
 var ASM_FLOAT = 2;
-var ASM_NONE = 3;
+var ASM_FLOAT32X4 = 3;
+var ASM_FLOAT64X2 = 4;
+var ASM_INT8X16 = 5;
+var ASM_INT16X8 = 6;
+var ASM_INT32X4 = 7;
+var ASM_BOOL8X16 = 8;
+var ASM_BOOL16X8 = 9;
+var ASM_BOOL32X4 = 10;
+var ASM_BOOL64X2 = 11;
+var ASM_NONE = 12;
+
+var ASM_SIG = {
+  0: 'i',
+  1: 'd',
+  2: 'f',
+  3: 'F',
+  4: 'D',
+  5: 'B',
+  6: 'S',
+  7: 'I',
+  8: 'Z', // For Bool SIMD.js types, arbitrarily use consecutive letters ZXCV.
+  9: 'X',
+  10: 'C',
+  11: 'V',
+  12: 'v'
+};
 
 var ASM_FLOAT_ZERO = null; // TODO: share the entire node?
 
-function detectAsmCoercion(node, asmInfo, inVarDef) {
+function detectType(node, asmInfo, inVarDef) {
   // for params, +x vs x|0, for vars, 0.0 vs 0
-  if (node[0] === 'num' && node[1].toString().indexOf('.') >= 0) return ASM_DOUBLE;
-  if (node[0] === 'unary-prefix') return ASM_DOUBLE;
-  if (node[0] === 'call' && node[1][0] === 'name' && node[1][1] === 'Math_fround') return ASM_FLOAT;
-  if (asmInfo && node[0] == 'name') return getAsmType(node[1], asmInfo);
-  if (node[0] === 'name') {
-    if (!inVarDef) return ASM_NONE;
-    // We are in a variable definition, where Math_fround(0) optimized into a global constant becomes f0 = Math_fround(0)
-    if (!ASM_FLOAT_ZERO) ASM_FLOAT_ZERO = node[1];
-    else assert(ASM_FLOAT_ZERO === node[1]);
-    return ASM_FLOAT;
+  switch (node[0]) {
+    case 'num': {
+      if (node[1].toString().indexOf('.') >= 0) return ASM_DOUBLE;
+      return ASM_INT;
+    }
+    case 'unary-prefix': {
+      switch (node[1]) {
+        case '+': return ASM_DOUBLE;
+        case '-': return detectType(node[2], asmInfo, inVarDef);
+        case '!': case '~': return ASM_INT;
+      }
+      break;
+    }
+    case 'call': {
+      if (node[1][0] === 'name') {
+        switch (node[1][1]) {
+          case 'Math_fround':          return ASM_FLOAT;
+          case 'SIMD_Float32x4':
+          case 'SIMD_Float32x4_check': return ASM_FLOAT32X4;
+          case 'SIMD_Float64x2':
+          case 'SIMD_Float64x2_check': return ASM_FLOAT64X2;
+          case 'SIMD_Int8x16':
+          case 'SIMD_Int8x16_check':   return ASM_INT8X16;
+          case 'SIMD_Int16x8':
+          case 'SIMD_Int16x8_check':   return ASM_INT16X8;
+          case 'SIMD_Int32x4':
+          case 'SIMD_Int32x4_check':   return ASM_INT32X4;
+          case 'SIMD_Bool8x16':
+          case 'SIMD_Bool8x16_check':  return ASM_BOOL8X16;
+          case 'SIMD_Bool16x8':
+          case 'SIMD_Bool16x8_check':  return ASM_BOOL16X8;
+          case 'SIMD_Bool32x4':
+          case 'SIMD_Bool32x4_check':  return ASM_BOOL32X4;
+          case 'SIMD_Bool64x2':
+          case 'SIMD_Bool64x2_check':  return ASM_BOOL64X2;
+          default: break;
+        }
+      }
+      return ASM_NONE;
+    }
+    case 'name': {
+      if (asmInfo) {
+        var ret = getAsmType(node[1], asmInfo);
+        if (ret !== ASM_NONE) return ret;
+      }
+      if (!inVarDef) {
+        switch (node[1]) {
+          case 'inf': case 'nan': return ASM_DOUBLE; // TODO: when minified
+          case 'tempRet0': return ASM_INT;
+        }
+        return ASM_NONE;
+      }
+      // We are in a variable definition, where Math_fround(0) optimized into a global constant becomes f0 = Math_fround(0)
+      if (!ASM_FLOAT_ZERO) ASM_FLOAT_ZERO = node[1];
+      else assert(ASM_FLOAT_ZERO === node[1]);
+      return ASM_FLOAT;
+    }
+    case 'binary': {
+      switch (node[1]) {
+        case '+': case '-':
+        case '*': case '/': case '%': {
+          var ret = detectType(node[2], asmInfo, inVarDef);
+          if (ret !== ASM_NONE) return ret;
+          return detectType(node[3], asmInfo, inVarDef)
+        }
+        case '|': case '&': case '^': case '<<': case '>>': case '>>>':
+        case '==': case '!=': case '<': case '<=': case '>': case '>=': {
+          return ASM_INT;
+        }
+      }
+      break;
+    }
+    case 'conditional': case 'seq': {
+      return detectType(node[2], asmInfo, inVarDef);
+    }
+    case 'sub': {
+      assert(node[1][0] === 'name');
+      if (!parseHeap(node[1][1])) return ASM_NONE;
+      return parseHeapTemp.float ? ASM_DOUBLE : ASM_INT; // XXX ASM_FLOAT?
+    }
   }
-  return ASM_INT;
+  assert(0 , 'horrible ' + JSON.stringify(node));
+}
+
+function isAsmCoercion(node) {
+  if (node[0] === 'binary' && ((node[1] === '|' && node[3][0] === 'num' && node[3][1] === 0) ||
+                               (node[1] === '>>>' && node[3][0] === 'num' && node[3][1] === 0))) return true;
+  if (node[0] === 'unary-prefix' && (node[1] === '+' || (node[1] === '~' && node[2][0] === 'unary-prefix' && node[2][1] === '~'))) return true;
+  return false;
 }
 
 function makeAsmCoercion(node, type) {
   switch (type) {
-    case ASM_INT: return ['binary', '|', node, ['num', 0]];
-    case ASM_DOUBLE: return ['unary-prefix', '+', node];
-    case ASM_FLOAT: return ['call', ['name', 'Math_fround'], [node]];
-    case ASM_NONE: return node; // non-validating code, emit nothing
-    default: throw 'whaa?';
+    case ASM_INT:       return ['binary', '|', node, ['num', 0]];
+    case ASM_DOUBLE:    return ['unary-prefix', '+', node];
+    case ASM_FLOAT:     return ['call', ['name', 'Math_fround'], [node]];
+    case ASM_FLOAT32X4: return ['call', ['name', 'SIMD_Float32x4_check'], [node]];
+    case ASM_FLOAT64X2: return ['call', ['name', 'SIMD_Float64x2_check'], [node]];
+    case ASM_INT8X16:   return ['call', ['name', 'SIMD_Int8x16_check'],   [node]];
+    case ASM_INT16X8:   return ['call', ['name', 'SIMD_Int16x8_check'],   [node]];
+    case ASM_INT32X4:   return ['call', ['name', 'SIMD_Int32x4_check'],   [node]];
+    case ASM_BOOL8X16:  return ['call', ['name', 'SIMD_Bool8x16_check'],  [node]];
+    case ASM_BOOL16X8:  return ['call', ['name', 'SIMD_Bool16x8_check'],  [node]];
+    case ASM_BOOL32X4:  return ['call', ['name', 'SIMD_Bool32x4_check'],  [node]];
+    case ASM_BOOL64X2:  return ['call', ['name', 'SIMD_Bool64x2_check'],  [node]];
+    case ASM_NONE:
+    default: return node; // non-validating code, emit nothing XXX this is dangerous, we should only allow this when we know we are not validating
+  }
+}
+
+function makeSignedAsmCoercion(node, type, sign) {
+  if (type !== ASM_INT || sign === ASM_SIGNED) return makeAsmCoercion(node, type);
+  if (sign === ASM_UNSIGNED) return ['binary', '>>>', node, ['num', 0]];
+  assert(0);
+}
+
+function makeAsmCoercedZero(type) {
+  switch (type) {
+    case ASM_INT: return ['num', 0];
+    case ASM_DOUBLE: return ['unary-prefix', '+', ['num', 0]];
+    case ASM_FLOAT: {
+      if (ASM_FLOAT_ZERO) {
+        return ['name', ASM_FLOAT_ZERO];
+      } else {
+        return ['call', ['name', 'Math_fround'], [['num', 0]]];
+      }
+    }
+    case ASM_FLOAT32X4: {
+      return ['call', ['name', 'SIMD_Float32x4'], [['num', 0], ['num', 0], ['num', 0], ['num', 0]]];
+    }
+    case ASM_FLOAT64X2: {
+      return ['call', ['name', 'SIMD_Float64x2'], [['num', 0], ['num', 0]]];
+    }
+    case ASM_INT8X16: {
+      return ['call', ['name', 'SIMD_Int8x16'], [['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0]]];
+    }
+    case ASM_INT16X8: {
+      return ['call', ['name', 'SIMD_Int16x8'], [['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0]]];
+    }
+    case ASM_INT32X4: {
+      return ['call', ['name', 'SIMD_Int32x4'], [['num', 0], ['num', 0], ['num', 0], ['num', 0]]];
+    }
+    case ASM_BOOL8X16: {
+      return ['call', ['name', 'SIMD_Bool8x16'], [['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0]]];
+    }
+    case ASM_BOOL16X8: {
+      return ['call', ['name', 'SIMD_Bool16x8'], [['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0], ['num', 0]]];
+    }
+    case ASM_BOOL32X4: {
+      return ['call', ['name', 'SIMD_Bool32x4'], [['num', 0], ['num', 0], ['num', 0], ['num', 0]]];
+    }
+    case ASM_BOOL64X2: {
+      return ['call', ['name', 'SIMD_Bool64x2'], [['num', 0], ['num', 0]]];
+    }
+    default: throw 'wha? ' + JSON.stringify(type) + new Error().stack;
   }
 }
 
 function makeAsmVarDef(v, type) {
-  switch (type) {
-    case ASM_INT: return [v, ['num', 0]];
-    case ASM_DOUBLE: return [v, ['unary-prefix', '+', ['num', 0]]];
-    case ASM_FLOAT: {
-      if (ASM_FLOAT_ZERO) {
-        return [v, ['name', ASM_FLOAT_ZERO]];
-      } else {
-        return [v, ['call', ['name', 'Math_fround'], [['num', 0]]]];
-      }
-    }
-    default: throw 'wha? ' + JSON.stringify([node, type]) + new Error().stack;
-  }
+  return [v, makeAsmCoercedZero(type)];
 }
 
 function getAsmType(name, asmInfo) {
   if (name in asmInfo.vars) return asmInfo.vars[name];
   if (name in asmInfo.params) return asmInfo.params[name];
-  assert(false, 'unknown var ' + name);
+  return ASM_NONE;
+}
+
+function getCombinedType(node1, node2, asmData, hint) {
+  var type1 = detectType(node1, asmData);
+  var type2 = detectType(node2, asmData);
+  if (type1 === ASM_NONE && type2 === ASM_NONE) {
+    assert(hint !== undefined);
+    return hint;
+  }
+  if (type1 === ASM_NONE) {
+    assert(type2 != ASM_NONE);
+    return type2;
+  } else if (type2 === ASM_NONE) {
+    assert(type1 != ASM_NONE);
+    return type1;
+  }
+  if (type1 !== type2) {
+    if (type1 === hint || type2 === hint) return hint;
+    assert(0, "can't figure it out " + JSON.stringify([node1, '....', node2, '     ', type1, type2, hint], null, '  '));
+  }
+  return type1;
+}
+
+var ASM_FLEXIBLE = 0; // small constants can be signed or unsigned, variables are also flexible
+var ASM_SIGNED = 1;
+var ASM_UNSIGNED = 2;
+var ASM_NONSIGNED = 3;
+
+function detectSign(node) {
+  switch (node[0]) {
+    case 'binary': {
+      switch(node[1]) {
+        case '|': case '&': case '^': case '<<': case '>>': return ASM_SIGNED;
+        case '>>>': return ASM_UNSIGNED;
+        case '+': case '-': return ASM_FLEXIBLE;
+        case '*': {
+          // a double, unless one is a small int and the other is an int, in
+          // which case one is a num. that can't be a double, since then it
+          // would be a +num.
+          if (node[2][0] === 'num' || node[3][0] === 'num') return ASM_FLEXIBLE;
+          return ASM_NONSIGNED;
+        }
+        case '/': return ASM_NONSIGNED; // without a coercion, this is double
+        case '==': case '!=': case '<': case '<=': case '>': case '>=': return ASM_SIGNED;
+        default: throw 'yikes ' + node[1];
+      }
+      break;
+    }
+    case 'unary-prefix': {
+      switch(node[1]) {
+        case '-': return ASM_FLEXIBLE;
+        case '+': return ASM_NONSIGNED; // XXX double
+        case '~': return ASM_SIGNED;
+        default: throw 'yikes';
+      }
+      break;
+    }
+    case 'num': {
+      var value = node[1];
+      if (value < 0) return ASM_SIGNED;
+      if (value > (-1>>>0) || value % 1 !== 0) return ASM_NONSIGNED;
+      if (value === (value | 0)) return ASM_FLEXIBLE;
+      return ASM_UNSIGNED;
+    }
+    case 'name': return ASM_FLEXIBLE;
+    case 'conditional': case 'seq': {
+      return detectSign(node[2]);
+    }
+    case 'call': {
+      if (node[1][0] === 'name') {
+        switch (node[1][1]) {
+          case 'Math_fround': return ASM_NONSIGNED
+          default: break;
+        }
+      }
+    }
+  }
+  assert(0 , 'badd ' + JSON.stringify(node));
+}
+
+function getCombinedSign(node1, node2, hint) {
+  var sign1 = detectSign(node1);
+  var sign2 = detectSign(node2);
+  if (sign1 === ASM_FLEXIBLE && sign2 === ASM_FLEXIBLE) {
+    return ASM_FLEXIBLE;
+  }
+  if (sign1 === ASM_FLEXIBLE) {
+    assert(sign2 != ASM_FLEXIBLE);
+    return sign2;
+  } else if (sign2 === ASM_FLEXIBLE) {
+    assert(sign1 != ASM_FLEXIBLE);
+    return sign1;
+  }
+  if (sign1 === sign2) return sign1;
+  if (sign1 === hint || sign2 === hint) return hint;
+  if ((sign1 === ASM_SIGNED && sign2 === ASM_UNSIGNED) ||
+      (sign1 === ASM_UNSIGNED && sign2 === ASM_SIGNED)) {
+    return ASM_FLEXIBLE;
+  }
+  assert(0, JSON.stringify([node1, '      ', node2, sign1, sign2, hint]));
+}
+
+function getSignature(func, asmData) {
+  var ret = asmData.ret >= 0 ? ASM_SIG[asmData.ret] : 'v';
+  for (var i = 0; i < func[2].length; i++) {
+    ret += ASM_SIG[asmData.params[func[2][i]]];
+  }
+  return ret;
 }
 
 function normalizeAsm(func) {
@@ -1893,7 +2096,7 @@ function normalizeAsm(func) {
     var name = node[2][1];
     if (func[2] && func[2].indexOf(name) < 0) break; // not an assign into a parameter, but a global
     if (name in data.params) break; // already done that param, must be starting function body
-    data.params[name] = detectAsmCoercion(node[3]);
+    data.params[name] = detectType(node[3]);
     stats[i] = emptyNode();
     i++;
   }
@@ -1907,7 +2110,7 @@ function normalizeAsm(func) {
       var name = v[0];
       var value = v[1];
       if (!(name in data.vars)) {
-        data.vars[name] = detectAsmCoercion(value, null, true);
+        data.vars[name] = detectType(value, null, true);
         v.length = 1; // make an un-assigning var
       } else {
         assert(j === 0, 'cannot break in the middle');
@@ -1932,7 +2135,7 @@ function normalizeAsm(func) {
   // look for final 'return' statement to get return type.
   var retStmt = stats[stats.length - 1];
   if (retStmt && retStmt[0] === 'return' && retStmt[1]) {
-    data.ret = detectAsmCoercion(retStmt[1]);
+    data.ret = detectType(retStmt[1]);
   }
   //printErr('normalized \n\n' + astToSrc(func) + '\n\nwith: ' + JSON.stringify(data));
   return data;
@@ -1990,11 +2193,7 @@ function denormalizeAsm(func, data) {
   if (data.ret !== undefined) {
     var retStmt = stats[stats.length - 1];
     if (!retStmt || retStmt[0] !== 'return') {
-      var retVal = ['num', 0];
-      if (data.ret !== ASM_INT) {
-        retVal = makeAsmCoercion(retVal, data.ret);
-      }
-      stats.push(['return', retVal]);
+      stats.push(['return', makeAsmCoercedZero(data.ret)]);
     }
   }
   //printErr('denormalized \n\n' + astToSrc(func) + '\n\n');
@@ -2018,7 +2217,9 @@ function getStackBumpNode(ast) {
     if (type === 'assign' && node[2][0] === 'name' && node[2][1] === 'STACKTOP') {
       var value = node[3];
       if (value[0] === 'name') return true;
-      assert(value[0] == 'binary' && value[1] == '|' && value[2][0] == 'binary' && value[2][1] == '+' && value[2][2][0] == 'name' && value[2][2][1] == 'STACKTOP' && value[2][3][0] == 'num');
+      if (value[0] == 'binary' && value[1] == '&') return; // this is an alignment fix, ignore
+      assert(value[0] == 'binary' && value[1] == '|' && value[2][0] == 'binary' && value[2][1] == '+' && value[2][2][0] == 'name' && value[2][2][1] == 'STACKTOP');
+      if (value[2][3][0] !== 'num') return; // non-constant bump, ignore
       found = node;
       return true;
     }
@@ -2033,7 +2234,7 @@ function getStackBumpSize(ast) {
 
 // Name minification
 
-var RESERVED = set('do', 'if', 'in', 'for', 'new', 'try', 'var', 'env', 'let');
+var RESERVED = set('do', 'if', 'in', 'for', 'new', 'try', 'var', 'env', 'let', 'case', 'else', 'enum', 'void', 'this', 'void', 'with');
 var VALID_MIN_INITS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
 var VALID_MIN_LATERS = VALID_MIN_INITS + '0123456789';
 
@@ -2122,7 +2323,23 @@ function registerize(ast) {
         ret = 'r' + num;
       } else {
         var type = asmData.vars[name];
-        ret = (type ? 'd' : 'i') + num;
+        switch (type) {
+          case ASM_INT:       ret = 'i'; break;
+          case ASM_DOUBLE:    ret = 'd'; break;
+          case ASM_FLOAT:     ret = 'f'; break;
+          case ASM_FLOAT32X4: ret = 'F4'; break;
+          case ASM_FLOAT64X2: ret = 'F2'; break;
+          case ASM_INT8X16:   ret = 'I16'; break;
+          case ASM_INT16X8:   ret = 'I8'; break;
+          case ASM_INT32X4:   ret = 'I4'; break;
+          case ASM_BOOL8X16:  ret = 'B16'; break;
+          case ASM_BOOL16X8:  ret = 'B8'; break;
+          case ASM_BOOL32X4:  ret = 'B4'; break;
+          case ASM_BOOL64X2:  ret = 'B2'; break;
+          case ASM_NONE:      ret = 'Z'; break;
+          default: assert(false, 'type ' + type + ' doesn\'t have a name yet');
+        }
+        ret += num;
         regTypes[ret] = type;
       }
       if (ret in allVars) {
@@ -2235,7 +2452,7 @@ function registerize(ast) {
     // we just use a fresh register to make sure we avoid this, but it could be
     // optimized to check for safe registers (free, and not used in this loop level).
     var varRegs = {}; // maps variables to the register they will use all their life
-    var freeRegsClasses = asm ? [[], [], [], []] : []; // two classes for asm, one otherwise XXX - hardcoded length
+    var freeRegsClasses = asm ? [[], [], [], [], [], [], [], [], [], [], [], [], []] : []; // two classes for asm, one otherwise XXX - hardcoded length
     var nextReg = 1;
     var fullNames = {};
     var loopRegs = {}; // for each loop nesting level, the list of bound variables
@@ -2381,6 +2598,13 @@ function registerizeHarder(ast) {
 
   traverseGeneratedFunctions(ast, function(fun) {
 
+    // Do not try to process non-validating methods, like the heap replacer
+    var abort = false;
+    traverse(fun, function(node, type) {
+      if (type === 'new') abort = true;
+    });
+    if (abort) return;
+
     var asmData = normalizeAsm(fun);
 
     var localVars = asmData.vars;
@@ -2391,21 +2615,21 @@ function registerizeHarder(ast) {
     // Utilities for allocating register variables.
     // We need distinct register pools for each type of variable.
 
-    var allRegsByType = [{}, {}, {}, {}];
-    var regPrefixByType = ['i', 'd', 'f', 'n'];
+    var allRegsByType = [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]; // XXX - hardcoded length
+    var regPrefixByType = ['i', 'd', 'f', 'F4', 'F2', 'I16', 'I8', 'I4', 'B16', 'B8', 'B4', 'B2', 'n'];
     var nextReg = 1;
 
     function createReg(forName) {
       // Create a new register of type suitable for the given variable name.
       var allRegs = allRegsByType[localVars[forName]];
-      reg = nextReg++;
+      var reg = nextReg++;
       allRegs[reg] = regPrefixByType[localVars[forName]] + reg;
       return reg;
     }
 
     // Traverse the tree in execution order and synthesize a basic flow-graph.
     // It's convenient to build a kind of "dual" graph where the nodes identify
-    // the junctions between blocks  at which control-flow may branch, and each
+    // the junctions between blocks at which control-flow may branch, and each
     // basic block is an edge connecting two such junctions.
     // For each junction we store:
     //    * set of blocks that originate at the junction
@@ -2503,9 +2727,9 @@ function registerizeHarder(ast) {
     }
 
     function markNonLocalJump(type, label) {
-      // Complete a block via  'return', 'break' or 'continue'.
+      // Complete a block via 'return', 'break' or 'continue'.
       // This joins the targetted junction and then sets the current junction to null.
-      // Any code traversed before we get back an existing junction is dead code.
+      // Any code traversed before we get back to an existing junction is dead code.
       if (type === 'return') {
         joinJunction(EXIT_JUNCTION);
       } else {
@@ -2553,7 +2777,7 @@ function registerizeHarder(ast) {
       // Look through value-preserving casts, like "x | 0" => "x"
       if (node[0] === 'binary' && node[1] === '|') {
         if (node[3][0] === 'num' && node[3][1] === 0) {
-            return lookThroughCasts(node[2]);
+          return lookThroughCasts(node[2]);
         }
       }
       return node;
@@ -2728,7 +2952,7 @@ function registerizeHarder(ast) {
             joinJunction(jCondExit);
             joinJunction(jLoop);
             setJunction(jCondExit);
-            joinJunction(jExit)
+            joinJunction(jExit);
           }
           break;
         case 'for':
@@ -2799,7 +3023,7 @@ function registerizeHarder(ast) {
             setJunction(jCheckExit);
           }
           joinJunction(jExit);
-          popActiveLabels()
+          popActiveLabels();
           break;
         case 'return':
           if (node[1]) {
@@ -2934,7 +3158,7 @@ function registerizeHarder(ast) {
           // saving/restoring label to the stack.
           for (var j = 0; j < block.nodes.length - 1; j++) {
             if (block.nodes[j][0] === 'assign' && block.nodes[j][2][1] === 'label') {
-              if (block.nodes[j][3][0] !== 'num' && block.nodes[j][3][1] !== 0) {
+              if (block.nodes[j][3][0] !== 'num' || block.nodes[j][3][1] !== 0) {
                 labelledBlocks = {};
                 labelledJumps = [];
                 break FINDLABELLEDBLOCKS;
@@ -3180,9 +3404,9 @@ function registerizeHarder(ast) {
           junctionVariables[name].conf[otherName] = 1;
         }
         for (var b in junc.outblocks) {
-          // It conflits with any output vars of successor blocks,
+          // It conflicts with any output vars of successor blocks,
           // if they're assigned before it goes dead in that block.
-          block = blocks[b];
+          var block = blocks[b];
           var jSucc = junctions[block.exit];
           for (var otherName in jSucc.live) {
             if (junc.live[otherName]) continue;
@@ -3281,7 +3505,7 @@ function registerizeHarder(ast) {
       // Mark the point at which each input reg becomes dead.
       // Variables alive before this point must not be assigned
       // to that register.
-      var inputVars = {}
+      var inputVars = {};
       var inputDeadLoc = {};
       var inputVarsByReg = {};
       for (var name in jExit.live) {
@@ -3376,7 +3600,7 @@ function registerizeHarder(ast) {
           }
         }
       }
-      // If we managed to create an "x=x" assignments, remove them.
+      // If we managed to create any "x=x" assignments, remove them.
       for (var j = 0; j < maybeRemoveNodes.length; j++) {
         var node = maybeRemoveNodes[j][1];
         if (node[2][1] === node[3][1]) {
@@ -3391,7 +3615,7 @@ function registerizeHarder(ast) {
 
     // Assign registers to function params based on entry junction
 
-    var paramRegs = {}
+    var paramRegs = {};
     if (fun[2]) {
       for (var i = 0; i < fun[2].length; i++) {
         var allRegs = allRegsByType[localVars[fun[2][i]]];
@@ -3464,6 +3688,7 @@ function registerizeHarder(ast) {
 var ELIMINATION_SAFE_NODES = set('var', 'assign', 'call', 'if', 'toplevel', 'do', 'return', 'label', 'switch', 'binary', 'unary-prefix'); // do is checked carefully, however
 var IGNORABLE_ELIMINATOR_SCAN_NODES = set('num', 'toplevel', 'string', 'break', 'continue', 'dot'); // dot can only be STRING_TABLE.*
 var ABORTING_ELIMINATOR_SCAN_NODES = set('new', 'object', 'function', 'defun', 'for', 'while', 'array', 'throw'); // we could handle some of these, TODO, but nontrivial (e.g. for while, the condition is hit multiple times after the body)
+var HEAP_NAMES = set('HEAP8', 'HEAP16', 'HEAP32', 'HEAPU8', 'HEAPU16', 'HEAPU32', 'HEAPF32', 'HEAPF64');
 
 function isTempDoublePtrAccess(node) { // these are used in bitcasts; they are not really affecting memory, and should cause no invalidation
   assert(node[0] === 'sub');
@@ -3818,7 +4043,8 @@ function eliminate(ast, memSafe) {
             var name = node[1];
             if (name in tracked) {
               doEliminate(name, node);
-            } else if (!(name in locals) && !callsInvalidated) {
+            } else if (!(name in locals) && !callsInvalidated && (memSafe || !(name in HEAP_NAMES))) { // ignore HEAP8 etc when not memory safe, these are ok to
+                                                                                                       // access, e.g. SIMD_Int32x4_load(HEAP8, ...)
               invalidateCalls();
               callsInvalidated = true;
             }
@@ -3901,7 +4127,9 @@ function eliminate(ast, memSafe) {
             for (var j = 0; j < stats.length; j++) {
               traverseInOrder(stats[j]);
             }
-            // We cannot track from one switch case into another, undo all new trackings TODO: general framework here, use in if-else as well
+            // We cannot track from one switch case into another if there are external dependencies, undo all new trackings
+            // Otherwise we can track, e.g. a var used in a case before assignment in another case is UB in asm.js, so no need for the assignment
+            // TODO: general framework here, use in if-else as well
             for (var t in tracked) {
               if (!(t in originalTracked)) {
                 var info = tracked[t];
@@ -3911,6 +4139,7 @@ function eliminate(ast, memSafe) {
               }
             }
           }
+          tracked = {}; // do not track from inside the switch to outside
         } else {
           if (!(type in ABORTING_ELIMINATOR_SCAN_NODES)) {
             printErr('unfamiliar eliminator scan node: ' + JSON.stringify(node));
@@ -3932,6 +4161,7 @@ function eliminate(ast, memSafe) {
       var info = tracked[name];
       delete tracked[name];
       var defNode = info.defNode;
+      var value;
       if (!sideEffectFree[name]) {
         if (defNode[0] === 'var') {
           defNode[1].forEach(function(pair) {
@@ -4104,11 +4334,12 @@ function eliminate(ast, memSafe) {
               // if a loop variable is used after we assigned to the helper, we must save its value and use that.
               // (note that this can happen due to elimination, if we eliminate an expression containing the
               // loop var far down, past the assignment!)
-              // first, see if the looper and helper overlap
+              // first, see if the looper and helpers overlap. Note that we check for this looper, compared to
+              // *ALL* the helpers. Helpers will be replaced by loopers as we eliminate them, potentially
+              // causing conflicts, so any helper is a concern.
               var firstLooperUsage = -1;
               var lastLooperUsage = -1;
               var firstHelperUsage = -1;
-              var lastHelperUsage = -1;
               for (var i = found+1; i < stats.length; i++) {
                 var curr = i < stats.length-1 ? stats[i] : last[1]; // on the last line, just look in the condition
                 traverse(curr, function(node, type) {
@@ -4116,9 +4347,8 @@ function eliminate(ast, memSafe) {
                     if (node[1] === looper) {
                       if (firstLooperUsage < 0) firstLooperUsage = i;
                       lastLooperUsage = i;
-                    } else if (node[1] === helper) {
+                    } else if (helpers.indexOf(node[1]) >= 0) {
                       if (firstHelperUsage < 0) firstHelperUsage = i;
-                      lastHelperUsage = i;
                     }
                   }
                 });
@@ -4277,6 +4507,10 @@ function minifyGlobals(ast) {
         ensureMinifiedNames(next);
         vars[i][0] = minified[name] = minifiedNames[next++];
       }
+    } else if (type === 'defun') {
+      var name = node[1];
+      ensureMinifiedNames(next);
+      node[1] = minified[name] = minifiedNames[next++];
     }
   });
   // add all globals in function chunks, i.e. not here but passed to us
@@ -4299,8 +4533,8 @@ function minifyGlobals(ast) {
 
 
 function minifyLocals(ast) {
-  assert(asm)
-  assert(extraInfo && extraInfo.globals)
+  assert(asm);
+  assert(extraInfo && extraInfo.globals);
 
   traverseGeneratedFunctions(ast, function(fun, type) {
 
@@ -4332,7 +4566,7 @@ function minifyLocals(ast) {
 
     // The first time we encounter a local name, we assign it a
     // minified name that's not currently in use.  Allocating on
-    // demand means they're processed in a predicatable order,
+    // demand means they're processed in a predictable order,
     // which is very handy for testing/debugging purposes.
     var nextMinifiedName = 0;
     function getNextMinifiedName() {
@@ -4653,6 +4887,17 @@ function aggressiveVariableElimination(ast) {
 }
 
 function outline(ast) {
+  // Move from 'label' to another name. This will avoid optimizations for label later, but we modify control flow so much here, we just give up on them
+  function deLabel(func, asmData) {
+    if (!('label' in asmData.vars)) return;
+    safeLabelSettingInternal(func, asmData);
+    assert(!('fakeLabel' in asmData.vars));
+    asmData.vars.fakeLabel = ASM_INT;
+    delete asmData.vars.label;
+    traverse(func, function(node, type) {
+      if (type === 'name' && node[1] === 'label') node[1] = 'fakeLabel';
+    });
+  }
   // Try to flatten out code as much as possible, to make outlining more feasible.
   function flatten(func, asmData) {
     var minSize = extraInfo.sizeToOutline/4;
@@ -4801,7 +5046,8 @@ function outline(ast) {
     }
     asmData.stackPos = {};
     var stackSize = getStackBumpSize(func);
-    if (stackSize % 8 === 0) stackSize += 8 - (stackSize % 8);
+    assert(stackSize % STACK_ALIGN === 0, 'bad stack! ' + stackSize);
+    stackSize += STACK_ALIGN;
     for (var i = 0; i < stack.length; i++) {
       asmData.stackPos[stack[i]] = stackSize + i*8;
     }
@@ -4810,8 +5056,10 @@ function outline(ast) {
     // the value after they return.
     var size = measureSize(func);
     asmData.maxOutlinings = Math.min(Math.round(3*size/extraInfo.sizeToOutline), maxTotalOutlinings);
+    asmData.maxAttemptedOutlinings = Infinity;
+    if (extraInfo.sizeToOutline < 100) asmData.maxAttemptedOutlinings = Math.min(50, asmData.maxAttemptedOutlinings); // tiny sizes, be careful of too many attempts
     asmData.intendedPieces = Math.ceil(size/extraInfo.sizeToOutline);
-    asmData.totalStackSize = stackSize + (stack.length + 2*asmData.maxOutlinings)*8;
+    asmData.totalStackSize = stackAlign(stackSize + (stack.length + 2*asmData.maxOutlinings)*8);
     asmData.controlStackPos = function(i) { return stackSize + (stack.length + i)*8 };
     asmData.controlDataStackPos = function(i) { return stackSize + (stack.length + i)*8 + 4 };
     asmData.splitCounter = 0;
@@ -4851,7 +5099,7 @@ function outline(ast) {
         if (!node[1]) {
           hasReturn = true;
         } else {
-          hasReturnType[detectAsmCoercion(node[1])] = true;
+          hasReturnType[detectType(node[1])] = true;
         }
       } else if (type == 'break') {
         var label = node[1] || 0;
@@ -4895,7 +5143,7 @@ function outline(ast) {
     return ['assign', true, dst, src];
   }
   function makeStackAccess(type, pos) { // TODO: float64, not 32
-    return ['sub', ['name', type == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', pos]], ['num', '2']]];
+    return ['sub', ['name', type == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', pos]], ['num', 2]]];
   }
   function makeIf(cond, then, else_) {
     var ret = ['if', cond, ['block', then]];
@@ -4955,7 +5203,7 @@ function outline(ast) {
     var sortedWrites = keys(codeInfo.writes).sort(orderFunc);
     sortedReadsAndWrites.forEach(function(v) {
       if (!(v in owned)) {
-        reps.push(['stat', ['assign', true, ['sub', ['name', getAsmType(v, asmData) == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', asmData.stackPos[v]]], ['num', '2']]], ['name', v]]]);
+        reps.push(['stat', ['assign', true, ['sub', ['name', getAsmType(v, asmData) == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', asmData.stackPos[v]]], ['num', 2]]], ['name', v]]]);
       }
     });
     // wipe out control variable
@@ -4966,7 +5214,7 @@ function outline(ast) {
     // add unspills
     sortedWrites.forEach(function(v) {
       if (!(v in owned)) {
-        reps.push(['stat', ['assign', true, ['name', v], makeAsmCoercion(['sub', ['name', getAsmType(v, asmData) == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', asmData.stackPos[v]]], ['num', '2']]], getAsmType(v, asmData))]]);
+        reps.push(['stat', ['assign', true, ['name', v], makeAsmCoercion(['sub', ['name', getAsmType(v, asmData) == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', asmData.stackPos[v]]], ['num', 2]]], getAsmType(v, asmData))]]);
       }
     });
 
@@ -4995,7 +5243,7 @@ function outline(ast) {
               if (!node[1]) {
                 ret.push(['stat', makeAssign(makeStackAccess(ASM_INT, asmData.controlStackPos(outlineIndex)), ['num', CONTROL_RETURN_VOID])]);
               } else {
-                var type = detectAsmCoercion(node[1], asmData);
+                var type = detectType(node[1], asmData);
                 ret.push(['stat', makeAssign(makeStackAccess(ASM_INT, asmData.controlStackPos(outlineIndex)), ['num', controlFromAsmType(type)])]);
                 ret.push(['stat', makeAssign(makeStackAccess(type, asmData.controlDataStackPos(outlineIndex)), node[1])]);
               }
@@ -5056,7 +5304,7 @@ function outline(ast) {
       if (codeInfo.hasReturn) {
         reps.push(makeIf(
           makeComparison(makeAsmCoercion(['name', 'tempValue'], ASM_INT), '==', ['num', CONTROL_RETURN_VOID]),
-          [['stat', ['return']]]
+          [['stat', ['return', null]]]
         ));
       }
       for (var returnType in codeInfo.hasReturnType) {
@@ -5068,7 +5316,7 @@ function outline(ast) {
       if (codeInfo.hasBreak) {
         reps.push(makeIf(
           makeComparison(makeAsmCoercion(['name', 'tempValue'], ASM_INT), '==', ['num', CONTROL_BREAK]),
-          [['stat', ['break']]]
+          [['stat', ['break', null]]]
         ));
         if (keys(codeInfo.breaks).length > 0) {
           reps.push(makeIf(
@@ -5083,7 +5331,7 @@ function outline(ast) {
       if (codeInfo.hasContinue) {
         reps.push(makeIf(
           makeComparison(makeAsmCoercion(['name', 'tempValue'], ASM_INT), '==', ['num', CONTROL_CONTINUE]),
-          [['stat', ['continue']]]
+          [['stat', ['continue', null]]]
         ));
         if (keys(codeInfo.continues).length > 0) {
           reps.push(makeIf(
@@ -5100,12 +5348,12 @@ function outline(ast) {
     sortedReadsAndWrites.reverse();
     sortedReadsAndWrites.forEach(function(v) {
       if (!(v in owned)) {
-        code.unshift(['stat', ['assign', true, ['name', v], makeAsmCoercion(['sub', ['name', getAsmType(v, asmData) == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', asmData.stackPos[v]]], ['num', '2']]], getAsmType(v, asmData))]]);
+        code.unshift(['stat', ['assign', true, ['name', v], makeAsmCoercion(['sub', ['name', getAsmType(v, asmData) == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', asmData.stackPos[v]]], ['num', 2]]], getAsmType(v, asmData))]]);
       }
     });
     sortedWrites.forEach(function(v) {
       if (!(v in owned)) {
-        code.push(['stat', ['assign', true, ['sub', ['name', getAsmType(v, asmData) == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', asmData.stackPos[v]]], ['num', '2']]], ['name', v]]]);
+        code.push(['stat', ['assign', true, ['sub', ['name', getAsmType(v, asmData) == ASM_INT ? 'HEAP32' : 'HEAPF32'], ['binary', '>>', ['binary', '+', ['name', 'sp'], ['num', asmData.stackPos[v]]], ['num', 2]]], ['name', v]]]);
       }
     });
     // finalize
@@ -5153,6 +5401,7 @@ function outline(ast) {
   }
 
   function outlineStatements(func, asmData, stats, maxSize) {
+    asmData.maxAttemptedOutlinings--;
     level++;
     //printErr('outlineStatements: ' + [func[1], level, measureSize(func)]);
     var lastSize = measureSize(stats);
@@ -5183,7 +5432,7 @@ function outline(ast) {
       }
     }
     function done() {
-      return asmData.splitCounter >= asmData.maxOutlinings || measureSize(func) <= extraInfo.sizeToOutline;
+      return asmData.splitCounter >= asmData.maxOutlinings || measureSize(func) <= extraInfo.sizeToOutline || asmData.maxAttemptedOutlinings < 0;
     }
     while (1) {
       i--;
@@ -5317,6 +5566,7 @@ function outline(ast) {
       if (size >= extraInfo.sizeToOutline && maxTotalFunctions > 0) {
         maxTotalFunctions--;
         aggressiveVariableEliminationInternal(func, asmData);
+        deLabel(func, asmData);
         flatten(func, asmData);
         analyzeFunction(func, asmData);
         calculateThreshold(func, asmData);
@@ -5414,75 +5664,192 @@ function outline(ast) {
   });
 }
 
-function safeHeap(ast) {
-  function fixPtr(ptr, heap) {
-    switch (heap) {
-      case 'HEAP8':   case 'HEAPU8': break;
-      case 'HEAP16':  case 'HEAPU16': {
-        if (ptr[0] === 'binary') {
-          assert(ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 1);
-          ptr = ptr[2]; // skip the shift
-        } else {
-          ptr = ['binary', '*', ptr, ['num', 2]]; // was unshifted, convert to absolute address
-        }
-        break;
+function fixPtr(ptr, heap) {
+  switch (heap) {
+    case 'HEAP8':   case 'HEAPU8': break;
+    case 'HEAP16':  case 'HEAPU16': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 1) {
+        ptr = ptr[2]; // skip the shift
+      } else {
+        ptr = ['binary', '*', ptr, ['num', 2]]; // was unshifted, convert to absolute address
       }
-      case 'HEAP32':  case 'HEAPU32': {
-        if (ptr[0] === 'binary') {
-          assert(ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 2);
-          ptr = ptr[2]; // skip the shift
-        } else {
-          ptr = ['binary', '*', ptr, ['num', 4]]; // was unshifted, convert to absolute address
-        }
-        break;
-      }
-      case 'HEAPF32': {
-        if (ptr[0] === 'binary') {
-          assert(ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 2);
-          ptr = ptr[2]; // skip the shift
-        } else {
-          ptr = ['binary', '*', ptr, ['num', 4]]; // was unshifted, convert to absolute address
-        }
-        break;
-      }
-      case 'HEAPF64': {
-        if (ptr[0] === 'binary') {
-          assert(ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 3);
-          ptr = ptr[2]; // skip the shift
-        } else {
-          ptr = ['binary', '*', ptr, ['num', 8]]; // was unshifted, convert to absolute address
-        }
-        break;
-      }
-      default: throw 'bad heap ' + heap;
+      break;
     }
-    ptr = ['binary', '|', ptr, ['num', 0]];
-    return ptr;
+    case 'HEAP32':  case 'HEAPU32': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 2) {
+        ptr = ptr[2]; // skip the shift
+      } else {
+        ptr = ['binary', '*', ptr, ['num', 4]]; // was unshifted, convert to absolute address
+      }
+      break;
+    }
+    case 'HEAPF32': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 2) {
+        ptr = ptr[2]; // skip the shift
+      } else {
+        ptr = ['binary', '*', ptr, ['num', 4]]; // was unshifted, convert to absolute address
+      }
+      break;
+    }
+    case 'HEAPF64': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 3) {
+        ptr = ptr[2]; // skip the shift
+      } else {
+        ptr = ['binary', '*', ptr, ['num', 8]]; // was unshifted, convert to absolute address
+      }
+      break;
+    }
+    default: {
+      return ptr; // unchanged
+    }
   }
-  traverseGenerated(ast, function(node, type) {
+  ptr = ['binary', '|', ptr, ['num', 0]];
+  return ptr;
+}
+
+function safeHeap(ast) {
+  var SAFE_HEAP_FUNCS = set('SAFE_HEAP_LOAD', 'SAFE_HEAP_LOAD_D', 'SAFE_HEAP_STORE', 'SAFE_HEAP_STORE_D', 'SAFE_FT_MASK');
+  traverseGeneratedFunctions(ast, function(func) {
+    if (func[1] in SAFE_HEAP_FUNCS) return null;
+    traverseGenerated(func, function(node, type) {
+      if (type === 'assign') {
+        if (node[1] === true && node[2][0] === 'sub') {
+          var heap = node[2][1][1];
+          var ptr = fixPtr(node[2][2], heap);
+          var value = node[3];
+          // SAFE_HEAP_STORE(ptr, value, bytes, isFloat) 
+          switch (heap) {
+            case 'HEAP8':   case 'HEAPU8': {
+              return ['call', ['name', 'SAFE_HEAP_STORE'], [ptr, makeAsmCoercion(value, ASM_INT), ['num', 1]]];
+            }
+            case 'HEAP16':  case 'HEAPU16': {
+              return ['call', ['name', 'SAFE_HEAP_STORE'], [ptr, makeAsmCoercion(value, ASM_INT), ['num', 2]]];
+            }
+            case 'HEAP32':  case 'HEAPU32': {
+              return ['call', ['name', 'SAFE_HEAP_STORE'], [ptr, makeAsmCoercion(value, ASM_INT), ['num', 4]]];
+            }
+            case 'HEAPF32': {
+              return ['call', ['name', 'SAFE_HEAP_STORE_D'], [ptr, makeAsmCoercion(value, ASM_DOUBLE), ['num', 4]]];
+            }
+            case 'HEAPF64': {
+              return ['call', ['name', 'SAFE_HEAP_STORE_D'], [ptr, makeAsmCoercion(value, ASM_DOUBLE), ['num', 8]]];
+            }
+            default: throw 'bad heap ' + heap;
+          }
+        }
+      } else if (type === 'sub') {
+        var target = node[1][1];
+        if (target[0] === 'H') {
+          // heap access
+          var heap = target;
+          var ptr = fixPtr(node[2], heap);
+          // SAFE_HEAP_LOAD(ptr, bytes, isFloat) 
+          switch (heap) {
+            case 'HEAP8': {
+              return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 1], ['num', 0]]], ASM_INT);
+            }
+            case 'HEAPU8': {
+              return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 1], ['num', 1]]], ASM_INT);
+            }
+            case 'HEAP16': {
+              return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 2], ['num', 0]]], ASM_INT);
+            }
+            case 'HEAPU16': {
+              return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 2], ['num', 1]]], ASM_INT);
+            }
+            case 'HEAP32': {
+              return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 4], ['num', 0]]], ASM_INT);
+            }
+            case 'HEAPU32': {
+              return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 4], ['num', 1]]], ASM_INT);
+            }
+            case 'HEAPF32': {
+              return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD_D'], [ptr, ['num', 4]]], ASM_DOUBLE);
+            }
+            case 'HEAPF64': {
+              return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD_D'], [ptr, ['num', 8]]], ASM_DOUBLE);
+            }
+            default: throw 'bad heap ' + heap;
+          }
+        } else {
+          assert(target[0] == 'F');
+          // function table indexing mask
+          assert(node[2][0] === 'binary' && node[2][1] === '&');
+          node[2][2] = makeAsmCoercion(['call', ['name', 'SAFE_FT_MASK'], [makeAsmCoercion(node[2][2], ASM_INT), makeAsmCoercion(node[2][3], ASM_INT)]], ASM_INT);
+        }
+      }
+    });
+  });
+}
+
+function fixPtrSlim(ptr, heap, shell) {
+  switch (heap) {
+    case 'HEAP8':   case 'HEAPU8': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 0) {
+        ptr = ['binary', '|', ptr[2], ['num', 0]]; // smaller
+      }
+      break;
+    }
+    case 'HEAP16':  case 'HEAPU16': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 1) {
+        ptr = ptr[2]; // skip the shift
+      } else {
+        ptr = ['binary', '*', ptr, ['num', 2]]; // was unshifted, convert to absolute address
+      }
+      break;
+    }
+    case 'HEAP32':  case 'HEAPU32': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 2) {
+        ptr = ptr[2]; // skip the shift
+      } else {
+        ptr = ['binary', '*', ptr, ['num', 4]]; // was unshifted, convert to absolute address
+      }
+      break;
+    }
+    case 'HEAPF32': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 2) {
+        ptr = ptr[2]; // skip the shift
+      } else {
+        ptr = ['binary', '*', ptr, ['num', 4]]; // was unshifted, convert to absolute address
+      }
+      break;
+    }
+    case 'HEAPF64': {
+      if (ptr[0] === 'binary' && ptr[1] === '>>' && ptr[3][0] === 'num' && ptr[3][1] === 3) {
+        ptr = ptr[2]; // skip the shift
+      } else {
+        ptr = ['binary', '*', ptr, ['num', 8]]; // was unshifted, convert to absolute address
+      }
+      break;
+    }
+    default: {
+      if (!shell) throw 'bad heap ' + heap;
+      return ptr; // unchanged
+    }
+  }
+  return ptr;
+}
+
+function splitMemory(ast, shell) {
+  traverse(ast, function(node, type) {
     if (type === 'assign') {
-      if (node[1] === true && node[2][0] === 'sub') {
+      if (node[2][0] === 'sub' && node[2][1][0] === 'name') {
         var heap = node[2][1][1];
-        var ptr = fixPtr(node[2][2], heap);
-        var value = node[3];
-        // SAFE_HEAP_STORE(ptr, value, bytes, isFloat) 
-        switch (heap) {
-          case 'HEAP8':   case 'HEAPU8': {
-            return ['call', ['name', 'SAFE_HEAP_STORE'], [ptr, makeAsmCoercion(value, ASM_INT), ['num', 1], ['num', '0']]];
+        if (parseHeap(heap)) {
+          if (node[1] !== true) assert(0, 'bad assign, split memory cannot handle ' + JSON.stringify(node) + '= to a HEAP');
+          var ptr = fixPtrSlim(node[2][2], heap, shell);
+          var value = node[3];
+          switch (heap) {
+            case 'HEAP8': return ['call', ['name', 'set8'], [ptr, value]];
+            case 'HEAP16': return ['call', ['name', 'set16'], [ptr, value]];
+            case 'HEAP32': return ['call', ['name', 'set32'], [ptr, value]];
+            case 'HEAPU8': return ['call', ['name', 'setU8'], [ptr, value]];
+            case 'HEAPU16': return ['call', ['name', 'setU16'], [ptr, value]];
+            case 'HEAPU32': return ['call', ['name', 'setU32'], [ptr, value]];
+            case 'HEAPF32': return ['call', ['name', 'setF32'], [ptr, value]];
+            case 'HEAPF64': return ['call', ['name', 'setF64'], [ptr, value]];
+            default: if (!shell) throw 'bad heap ' + heap;
           }
-          case 'HEAP16':  case 'HEAPU16': {
-            return ['call', ['name', 'SAFE_HEAP_STORE'], [ptr, makeAsmCoercion(value, ASM_INT), ['num', 2], ['num', '0']]];
-          }
-          case 'HEAP32':  case 'HEAPU32': {
-            return ['call', ['name', 'SAFE_HEAP_STORE'], [ptr, makeAsmCoercion(value, ASM_INT), ['num', 4], ['num', '0']]];
-          }
-          case 'HEAPF32': {
-            return ['call', ['name', 'SAFE_HEAP_STORE'], [ptr, makeAsmCoercion(value, ASM_DOUBLE), ['num', 4], ['num', '1']]];
-          }
-          case 'HEAPF64': {
-            return ['call', ['name', 'SAFE_HEAP_STORE'], [ptr, makeAsmCoercion(value, ASM_DOUBLE), ['num', 8], ['num', '1']]];
-          }
-          default: throw 'bad heap ' + heap;
         }
       }
     } else if (type === 'sub') {
@@ -5490,43 +5857,33 @@ function safeHeap(ast) {
       if (target[0] === 'H') {
         // heap access
         var heap = target;
-        var ptr = fixPtr(node[2], heap);
-        // SAFE_HEAP_LOAD(ptr, bytes, isFloat) 
+        var ptr = fixPtrSlim(node[2], heap, shell);
         switch (heap) {
-          case 'HEAP8': {
-            return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 1], ['num', '0'], ['num', '0']]], ASM_INT);
-          }
-          case 'HEAPU8': {
-            return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 1], ['num', '0'], ['num', '1']]], ASM_INT);
-          }
-          case 'HEAP16': {
-            return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 2], ['num', '0'], ['num', '0']]], ASM_INT);
-          }
-          case 'HEAPU16': {
-            return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 2], ['num', '0'], ['num', '1']]], ASM_INT);
-          }
-          case 'HEAP32': {
-            return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 4], ['num', '0'], ['num', '0']]], ASM_INT);
-          }
-          case 'HEAPU32': {
-            return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 4], ['num', '0'], ['num', '1']]], ASM_INT);
-          }
-          case 'HEAPF32': {
-            return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 4], ['num', '1'], ['num', '0']]], ASM_DOUBLE);
-          }
-          case 'HEAPF64': {
-            return makeAsmCoercion(['call', ['name', 'SAFE_HEAP_LOAD'], [ptr, ['num', 8], ['num', '1'], ['num', '0']]], ASM_DOUBLE);
-          }
-          default: throw 'bad heap ' + heap;
+          case 'HEAP8': return ['call', ['name', 'get8'], [ptr]];
+          case 'HEAP16': return ['call', ['name', 'get16'], [ptr]];
+          case 'HEAP32': return ['call', ['name', 'get32'], [ptr]];
+          case 'HEAPU8': return ['call', ['name', 'getU8'], [ptr]];
+          case 'HEAPU16': return ['call', ['name', 'getU16'], [ptr]];
+          case 'HEAPU32': return ['call', ['name', 'getU32'], [ptr]];
+          case 'HEAPF32': return ['call', ['name', 'getF32'], [ptr]];
+          case 'HEAPF64': return ['call', ['name', 'getF64'], [ptr]];
+          default: if (!shell) throw 'bad heap ' + heap;
         }
-      } else {
-        assert(target[0] == 'F');
-        // function table indexing mask
-        assert(node[2][0] === 'binary' && node[2][1] === '&');
-        node[2][2] = makeAsmCoercion(['call', ['name', 'SAFE_FT_MASK'], [makeAsmCoercion(node[2][2], ASM_INT), makeAsmCoercion(node[2][3], ASM_INT)]], ASM_INT);
       }
     }
   });
+  var SPLIT_GETS = set('get8', 'get16', 'get32', 'getU8', 'getU16', 'getU32', 'getF32', 'getF64');
+  traverse(ast, function(node, type) {
+    if (type === 'binary' && node[1] === '|' && node[2][0] === 'call' && node[2][1][0] === 'name' && node[2][1][1] in SPLIT_GETS && node[3][0] === 'num' && node[3][1] === 0) {
+      return node[2];
+    } else if (type === 'unary-prefix' && node[1] === '+' && node[2][0] === 'call' && node[2][1][0] === 'name' && node[2][1][1] in SPLIT_GETS) {
+      return node[2];
+    }
+  });
+}
+
+function splitMemoryShell(ast) {
+  splitMemory(ast, true);
 }
 
 function optimizeFrounds(ast) {
@@ -5549,6 +5906,1658 @@ function optimizeFrounds(ast) {
   traverseChildren(ast, fix);
 }
 
+// Ensures that if label exists, it is assigned an initial value (to not assume the asm declaration has an effect, which we normally do not)
+function ensureLabelSet(ast) {
+  assert(asm);
+  traverseGeneratedFunctions(ast, function(func) {
+    var asmData = normalizeAsm(func);
+    if ('label' in asmData.vars) {
+      var stats = getStatements(func);
+      for (var i = 0; i < stats.length; i++) {
+        var node = stats[i];
+        if (node[0] === 'stat') node = node[1];
+        if (node[0] === 'assign' && node[2][0] === 'name' && node[2][1] === 'label') {
+          break; // all good
+        }
+        if (node[0] === 'label' || (node[0] in CONTROL_FLOW)) {
+          // we haven't seen an assign, and we hit control flow. add an assign
+          stats.splice(i, 0, ['stat', ['assign', true, ['name', 'label'], ['num', 0]]]);
+          break;
+        }
+      }
+    }
+    denormalizeAsm(func, asmData);
+  });
+}
+
+// finds vars that may not be assigned to. misses out on vars that are assigned to in all branches of an if etc. TODO: optimize
+function findUninitializedVars(func, asmData) {
+  var bad = {};
+  function definitely(node, uninitialized) {
+    if (!node) return;
+    if (node[0] === 'assign' && node[2][0] === 'name') {
+      var name = node[2][1];
+      if (name in uninitialized) {
+        delete uninitialized[name]; // this one is now ok
+      }
+    } else if (node[0] === 'name') {
+      var name = node[1];
+      if (name in uninitialized) {
+        bad[name] = 1;
+        delete uninitialized[name]; // this one is now bad, ignore it
+      }
+    }
+    traverseChildrenInExecutionOrder(node, definitely, maybe, uninitialized);
+  }
+  function maybe(node, uninitialized) {
+    uninitialized = copy(uninitialized); // copy it; changes here will not propagate
+    traverseChildrenInExecutionOrder(node, definitely, maybe, uninitialized);
+  }
+  traverseChildrenInExecutionOrder(func, definitely, maybe, copy(asmData.vars));
+  return bad;
+}
+
+function trample(x, y) { // x = y, by trampling it
+  for (var i = 0; i < y.length; i++) {
+    x[i] = y[i];
+  }
+  x.length = y.length;
+}
+
+function ilog2(x) {
+  x = Math.round(x);
+  if (x === 1) return 0;
+  if (x === 2) return 1;
+  if (x === 4) return 2;
+  if (x === 8) return 3;
+  throw 'ilog2 is not smart enough for ' + x;
+}
+
+// Converts functions into binary format to be run by an emterpreter
+function emterpretify(ast) {
+  emitAst = false;
+
+  var EMTERPRETED_FUNCS = set(extraInfo.emterpretedFuncs);
+  var EXTERNAL_EMTERPRETED_FUNCS = set(extraInfo.externalEmterpretedFuncs);
+  var OPCODES = extraInfo.opcodes;
+  var ROPCODES = extraInfo.ropcodes;
+  var ASYNC = extraInfo.ASYNC;
+  var PROFILING = extraInfo.PROFILING;
+  var ASSERTIONS = extraInfo.ASSERTIONS;
+
+  var RELATIVE_BRANCHES = set('BR', 'BRT', 'BRF');
+  var ABSOLUTE_BRANCHES = set('BRA', 'BRTA', 'BRFA');
+  var BRANCHES = {};
+  mergeInto(BRANCHES, RELATIVE_BRANCHES);
+  mergeInto(BRANCHES, ABSOLUTE_BRANCHES);
+  var UNCONDITIONAL_BRANCHES = set('BR', 'BRA');
+  var CONDITION_BRFS = set('LNOTBRF', 'EQBRF', 'NEBRF', 'SLTBRF', 'ULTBRF', 'SLEBRF', 'ULEBRF');
+
+  var COMPARISONS = set('LNOT', 'EQ', 'NE', 'SLT', 'ULT', 'SLE', 'ULE');
+
+  var FAST_LOCALS = 200; // any local over this will be copied to a fast local first. hopefully,
+                         // fast local + temp variables end up less than 256, because that's all we can do!
+
+  var tempBuffer = new ArrayBuffer(8);
+  var tempFloat64 = new Float64Array(tempBuffer);
+  var tempFloat32 = new Float32Array(tempBuffer);
+  var tempUint8 = new Uint8Array(tempBuffer);
+  function flattenFloat32(value) {
+    tempFloat32[0] = value;
+    return Array.prototype.slice.call(tempUint8, 0, 4);
+  }
+  function flattenFloat64(value) {
+    tempFloat64[0] = value;
+    return Array.prototype.slice.call(tempUint8, 0, 8);
+  }
+
+  // functions which are ok to run while async, even if not emterpreted
+  var OK_TO_CALL_WHILE_ASYNC = set('stackSave', 'stackRestore', 'stackAlloc', 'setThrew', '_memset', '_memcpy', '_memmove', '_strlen', '_strncpy', '_strcpy', '_strcat', 'SAFE_HEAP_LOAD', 'SAFE_HEAP_STORE', 'SAFE_FT_MASK');
+  function okToCallWhileAsync(name) {
+    // dynCall *can* be on the stack, they are just bridges; what matters is where they go
+    if (/^dynCall_/.test(name)) return true;
+    if (name in OK_TO_CALL_WHILE_ASYNC) return true;
+    return false;
+  }
+
+  function verifyCode(code, stat) {
+    if (code.length % 4 !== 0) assert(0, JSON.stringify(code));
+    var len = code.length;
+    for (var i = 0; i < len; i++) {
+      if (typeof code[i] !== 'string' && typeof code[i] !== 'number' && !(typeof code[i] === 'object' && code[i].what)) {
+        assert(0, i + ' : ' + JSON.stringify(code) + ' from ' + JSON.stringify(stat));
+      }
+    }
+  }
+
+  function walkFunction(func) {
+    if (func[1] === 'emterpret') {
+      // we will replace the stand-in, do not emit anything for it here
+      func[0] = 'toplevel';
+      func[1] = [];
+      return;
+    }
+
+    var freeLocals = [];
+    var maxLocal = 0;
+
+    // gets a 'free' local. this notices the maximum local used, which is then the size of out stack
+    // 'free' locals are ones above the set of actual local vars in the asm.js method.
+    // you *must* free that local by calling releaseFree on it, which implies you must call
+    // releaseIfFree on anything returned by getReg
+    // if possible1 or possible2 are passed in, and they are free, they will be reused. this should
+    // be done when they are free variables in use right now, but will become free in time to become
+    // the free variable we need here (e.g. y = y + z, no need for a new x to assign into). this can
+    // then be passed as a second argument to releaseFree.
+    function getFree(possible1, possible2) {
+      if (possible1 >= numLocals) return possible1; // (undefined >= any number is false)
+      if (possible2 >= numLocals) return possible2;
+      assert(freeLocals.length > 0);
+      var ret = freeLocals.pop();
+      maxLocal = Math.max(maxLocal, ret);
+      assert(ret >= numLocals);
+      //printErr('get free  ' + ret);
+      return ret;
+    }
+    // if possible is passed in, and is identical to l, then it means l was reused, and we must not free it
+    function releaseFree(l, possible) {
+      if (l === possible) return;
+      //printErr('free free ' + l);
+      assert(freeLocals.indexOf(l) < 0);
+      assert(l >= numLocals && l <= maxLocal);
+      freeLocals.push(l);
+      return l;
+    }
+    function unreleaseFree(l) {
+      assert(l >= numLocals && l <= maxLocal);
+      var i = freeLocals.indexOf(l);
+      assert(l >= 0);
+      freeLocals.splice(i, 1);
+    }
+
+    function isFree(l) {
+      return l >= numLocals;
+    }
+    function getFreeOrAssignTo(assignTo) {
+      return assignTo >= 0 ? assignTo : getFree();
+    }
+
+    var markerId = 0;
+    function getMarker(name) {
+      return { what: 'marker', name: name, relativeUses: 0, absoluteUses: 0, id: markerId++, i: 0 };
+    }
+
+    var absoluteTargets = {};
+
+    var breakStack = [];
+    var continueStack = [];
+    var breakLabels = {};
+    var continueLabels = {};
+
+    // returns [l, bytecode] where l is a local register, and bytecode is bytecode to generate it.
+    // if dropIt is provided, then the output of this can just be dropped.
+    // if assignTo is provided, then it is where we can assign to, instead of allocating a free reg for that purpose.
+    // you *must* call releaseIfFree on the l that is returned; if it is a free local, that will free it.
+    function getReg(node, dropIt, typeHint, signHint, assignTo) {
+      //printErr('getReg ' + JSON.stringify(node) + ' : ' + astToSrc(node) + ' : ' + [dropIt, typeHint, signHint, assignTo]);
+      switch(node[0]) {
+        case 'name': {
+          var name = node[1];
+          if (name in locals) {
+            var l = locals[name];
+            if (l < FAST_LOCALS) {
+              return [l, []];
+            } else {
+              assert(l < 65535);
+              var t = getFree();
+              var type = getAsmType(name, asmData);
+              var op;
+              switch (type) {
+                case ASM_INT:    op = 'FSLOW'; break;
+                case ASM_DOUBLE: op = 'FSLOWD'; break;
+                default: throw 'bad';
+              }
+              return [t, [op, t, l & 255, l >>> 8]];
+            }
+          }
+          // this is a global
+          switch(name) {
+            case 'STACKTOP': {
+              var x = getFree();
+              return [x, ['GETST', x, 0, 0]];
+            }
+            case 'tempDoublePtr': {
+              var x = getFree();
+              return [x, ['GETTDP', x, 0, 0]];
+            }
+            case 'tempRet0': {
+              var x = getFree();
+              return [x, ['GETTR0', x, 0, 0]];
+            }
+            case 'inf': return makeNum(Infinity, ASM_DOUBLE);
+            case 'nan': return makeNum(NaN, ASM_DOUBLE);
+            case 'debugger': return [-1, []]; // nothing to do here (should we?)
+            default: {
+              var x = getFree();
+              // We actually do not know the type here, and even hints won't help for global1 = global2. We swap GETGLBI to D in emterpretify.py as needed.
+              return [x, ['GETGLBI', x, name, 0]];
+            }
+          }
+        }
+        case 'num': {
+          return makeNum(node[1], ASM_INT, assignTo);
+        }
+        case 'var':
+        case 'toplevel': {
+          assert(dropIt || isEmptyNode(node));
+          return [-1, []]; // empty node
+        }
+        case 'stat': return getReg(node[1], dropIt);
+        case 'assign': {
+          assert(node[1] === true);
+          var target = node[2];
+          var value = node[3];
+          if (target[0] === 'name') {
+            // assign to a local or a global
+            var name = target[1];
+            if (name in locals) {
+              // local
+              var l = locals[name];
+              var type = getAsmType(name, asmData);
+              if (l < FAST_LOCALS) {
+                var reg = getReg(value, undefined, type, undefined, l);
+                // TODO: detect when the last operation in reg[1] assigns in its arg x, in which case we can avoid the SET and make it assign to us
+                reg[1] = reg[1].concat(makeSet(l, releaseIfFree(reg[0]), type));
+                return [l, reg[1]];
+              } else {
+                assert(l < 65535);
+                var t = getFree();
+                var type = getAsmType(name, asmData);
+                var op;
+                switch (type) {
+                  case ASM_INT:    op = 'TSLOW'; break;
+                  case ASM_DOUBLE: op = 'TSLOWD'; break;
+                  default: throw 'bad';
+                }
+                var reg = getReg(value, undefined, type, undefined, t);
+                reg[1] = reg[1].concat(makeSet(t, releaseIfFree(reg[0], t), type))
+                               .concat([op, t, l & 255, l >>> 8]);
+                return [t, reg[1]];
+              }
+            } else {
+              var reg = getReg(value, undefined, undefined, undefined, assignTo);
+              var opcode;
+              switch(name) {
+                case 'STACKTOP': opcode = 'SETST'; break;
+                case 'tempRet0': opcode = 'SETTR0'; break;
+                default: {
+                  var type = detectType(value, asmData);
+                  assert(type === ASM_INT || type === ASM_DOUBLE);
+                  reg[1].push(type === ASM_INT ? 'SETGLBI' : 'SETGLBD', name, 0, reg[0]);
+                  return reg; // caller will free reg[0] if necessary
+                }
+              }
+              reg[1].push(opcode, reg[0], 0, 0); // caller will free reg[0] if necessary
+              return reg;
+            }
+          } else if (target[0] === 'sub') {
+            assert(dropIt);
+            // assign to memory
+            var heap = target[1][1];
+            var temp = makeTempParseHeap();
+            assert(parseHeap(heap, temp));
+            // coerced heap access => a load
+            var opcode = 'STORE' + (temp.float ? 'F' : '') + temp.bits;
+            if (target[2][0] === 'binary' && target[2][1] === '>>' && target[2][3][0] === 'num') {
+              var shifts = target[2][3][1];
+              assert(shifts >= 0 && shifts <= 3);
+              var bits = Math.pow(2, shifts)*8;
+              assert(bits === temp.bits);
+              var pointer = target[2][2];
+              var x = getReg(pointer, false, ASM_INT, ASM_SIGNED);
+              var xLast = x[1][x[1].length-4];
+              if (xLast === 'ADD' || xLast === 'ADDV') {
+                var v = xLast === 'ADDV';
+                // optimized store + add
+                var curr = x[1].slice(x[1].length-4);
+                x[1].splice(x[1].length-4, 4);
+                if (curr[2] !== x[0]) unreleaseIfFree(curr[2]); // make sure these are kept alive during z's operations, we are
+                if (!v && curr[3] !== x[0]) unreleaseIfFree(curr[3]); // putting code in between their definition and use
+                var z = getReg(value);
+                if (x[0] !== curr[2] && (v || x[0] !== curr[3])) releaseIfFree(x[0]);
+                curr = [opcode + 'A' + (v ? 'V' : ''), releaseIfFree(curr[2]), !v ? releaseIfFree(curr[3]) : curr[3], releaseIfFree(z[0])];
+                var ret = x[1].concat(z[1]).concat(curr);
+                return [-1, ret];
+              } else if (value[0] === 'sub' && value[1][0] === 'name' && value[1][1] === heap && value[2][0] === 'binary' && value[2][1] === '>>') {
+                // a copy: store the result of a load, identical heap, identical shifts
+                assert(value[2][3][0] === 'num' && value[2][3][1] === shifts);
+                opcode += 'C';
+                var y = getReg(value[2][2]);
+                var ret = x[1].concat(y[1]);
+                ret.push(opcode, releaseIfFree(x[0]), releaseIfFree(y[0]), 0);
+                return [-1, ret];
+              } else {
+                var y = getReg(value); // generate y now, not earlier, to not trample x's output reg, which might be a temp
+                var ret = x[1].concat(y[1]);
+                ret.push(opcode, releaseIfFree(x[0]), releaseIfFree(y[0]), 0);
+                return [-1, ret];
+              }
+            } else {
+              assert(target[2][0] === 'num'); // HEAP32[8] or such
+              var address = target[2][1];
+              var shifts = ilog2(temp.bits/8);
+              assert(address === ((address << shifts) >> shifts));
+              var x = makeNum(address << shifts, ASM_INT);
+              var y = getReg(value);
+              y[1].push(opcode, releaseIfFree(x[0]), releaseIfFree(y[0]), 0);
+              return [-1, x[1].concat(y[1])];
+            }
+          } else throw 'assign wha? ' + target[0];
+        }
+        case 'binary': {
+          if (node[1] === '|' && node[3][0] === 'num' && node[3][1] === 0) {
+            // signed-coerced operation
+            return getReg(node[2], dropIt, ASM_INT, ASM_SIGNED, assignTo);
+          } else if (node[1] === '>>>' && node[3][0] === 'num' && node[3][1] === 0) {
+            // unsigned-coerced operation
+            return getReg(node[2], dropIt, ASM_INT, ASM_UNSIGNED, assignTo);
+          }
+
+          // not a simple coercion
+
+          if (dropIt) {
+            // a pointless thing we can drop entirely
+            var ret = [-1, []];
+            if (hasSideEffects(node)) {
+              // something here has side effects, emit it but drop the result
+              if (hasSideEffects(node[2])) {
+                var left = getReg(node[2]);
+                releaseIfFree(left[0]);
+                ret[1] = left[1];
+              }
+              if (hasSideEffects(node[3])) {
+                var right = getReg(node[3]);
+                releaseIfFree(right[0]);
+                ret[1] = ret[1].concat(right[1]);
+              }
+            }
+            return ret;
+          }
+
+          switch (node[1]) {
+            case '&': case '|': case '^': case '<<': case '>>': case '>>>': return makeBinary(node, ASM_INT, ASM_SIGNED);
+            case '>=': case '>':
+            case '+': case '-': case '*': case '/': case '%': case '<': case '<=': case '==': case '!=': {
+              var type = getCombinedType(node[2], node[3], asmData, typeHint);
+              var sign = getCombinedSign(node[2], node[3], signHint);
+              if (node[1] === '>=' || node[1] === '>') {
+                if (type === ASM_INT) { // float/double comparisons are not antisymmetrical due to NaNs
+                  var temp = node[2];
+                  node[2] = node[3];
+                  node[3] = temp;
+                  node[1] = node[1] === '>=' ? '<=' : '<';
+                }
+              }
+              return makeBinary(node, type, sign, assignTo);
+            }
+            default: throw 'ehh';
+          }
+          throw 'todo';
+        }
+        case 'unary-prefix': {
+          if (node[1] === '+') {
+            // double operation
+            var appliedCoercion = false;
+            var ret = (function() {
+              var inner = node[2];
+              switch (inner[0]) {
+                case 'call': case 'sub': {
+                  // the coercion is part of the syntax of these
+                  appliedCoercion = true;
+                  return getReg(inner, dropIt, ASM_DOUBLE, ASM_NONSIGNED, assignTo);
+                }
+                case 'num': {
+                  appliedCoercion = true;
+                  return makeNum(inner[1], ASM_DOUBLE, assignTo);
+                }
+                case 'unary-prefix': {
+                  if (inner[1] === '-' && inner[2][0] === 'num') {
+                    appliedCoercion = true;
+                    return makeNum(-inner[2][1], ASM_DOUBLE, assignTo);
+                  }
+                  // otherwise fall through
+                }
+                default: {
+                  return getReg(inner, dropIt, ASM_DOUBLE, ASM_NONSIGNED, assignTo);
+                }
+              }
+            })();
+            // add a coercion on the value, if needed
+            if (!appliedCoercion) {
+              var innerType = detectType(node[2], asmData);
+              if (innerType !== ASM_DOUBLE) {
+                if (innerType === ASM_INT) {
+                  var sign = detectSign(node[2]);
+                  var opcode = sign === ASM_SIGNED ? 'SI2D' : 'UI2D';
+                  if (isFree(ret[0])) {
+                    ret[1].push(opcode, ret[0], ret[0], 0);
+                  } else {
+                    // we can't trample this reg
+                    var l = getFree();
+                    ret[1].push(opcode, l, ret[0], 0);                   
+                    ret[0] = l;
+                  }
+                } else {
+                  throw 'whoops';
+                }
+              }
+            }
+            return ret;
+          } else if (node[1] === '~' && node[2][0] === 'unary-prefix' && node[2][1] === '~') {
+            return makeUnary(['unary-prefix', 'D2I', node[2][2]], ASM_INT, ASM_SIGNED, assignTo);
+          }
+
+          // not a simple coercion
+
+          if (dropIt) {
+            // a pointless thing we can drop entirely
+            var ret = [-1, []];
+            if (hasSideEffects(node)) {
+              // emit it but drop the result
+              var child = getReg(node[2]);
+              releaseIfFree(child[0]);
+              ret[1] = child[1];
+            }
+            return ret;
+          }
+
+          switch (node[1]) {
+            case '-': {
+              if (node[2][0] === 'num') {
+                return makeNum(-node[2][1], ASM_INT, assignTo);
+              }
+              // otherwise fall through
+            }
+            case '~': {
+              var type = detectType(node[2], asmData);
+              return makeUnary(node, type, ASM_SIGNED, assignTo);
+            }
+            case '!': return makeUnary(node, ASM_INT, ASM_SIGNED, assignTo);
+            default: throw 'ehh';
+          }
+          throw 'todo';
+        }
+        case 'call': {
+          var type;
+          var ret;
+          if (dropIt && (typeHint === undefined || typeHint === ASM_NONE)) {
+            type = ASM_NONE;
+            ret = getFreeOrAssignTo(assignTo); // get a register that is ok to write to, even if no return value, to simplify ABI XXX
+          } else {
+            assert(typeHint !== ASM_NONE);
+            type = typeHint;
+            ret = getFreeOrAssignTo(assignTo);
+          }
+          return [ret, makeCall(ret, node, type)];
+        }
+        case 'return': {
+          assert(dropIt);
+          var value = node[1];
+          var reg;
+          if (value) reg = getReg(value);
+          else reg = [-1, []];
+          reg[1].push('RET', value ? releaseIfFree(reg[0]) : 0, 0, 0);
+          return [-1, reg[1]];
+        }
+        case 'do': {
+          return makeDo(node);
+        }
+        case 'while': {
+          return makeWhile(node);
+        }
+        case 'label': {
+          var name = node[1];
+          var inner = node[2];
+          assert(name);
+          if (inner[0] === 'do') {
+            return makeDo(inner, name);
+          } else if (inner[0] === 'while') {
+            return makeWhile(inner, name);
+          } else if (inner[0] === 'switch') {
+            return makeSwitch(inner, name);
+          } else if (inner[0] === 'block') {
+            return makeDo(['do', ['num', 0], inner], name);
+          }
+          throw 'sigh ' + inner[0];
+        }
+        case 'break': {
+          var label = node[1];
+          if (!label) {
+            assert(breakStack.length > 0);
+            return [-1, ['BR', 0, breakStack[breakStack.length-1], 0]];
+          }
+          assert(label in breakLabels);
+          return [-1, ['BR', 0, breakLabels[label], 0]];
+        }
+        case 'continue': {
+          var label = node[1];
+          if (!label) {
+            assert(continueStack.length > 0);
+            return [-1, ['BR', 0, continueStack[continueStack.length-1], 0]];
+          }
+          assert(label in continueLabels);
+          return [-1, ['BR', 0, continueLabels[label], 0]];
+        }
+        case 'if': {
+          var exit = getMarker('if-exit');
+          var ret;
+          if (!node[3]) {
+            ret = makeBranchIfFalse(node[1], exit).concat(walkStatements(node[2]));
+          } else {
+            var otherwise = getMarker('if-else');
+            ret = makeBranchIfFalse(node[1], otherwise).concat(walkStatements(node[2]));
+            ret.push('BR', 0, exit, 0, 'marker', otherwise, 0, 0);
+            ret = ret.concat(walkStatements(node[3]));
+          }
+          ret.push('marker', exit, 0, 0);
+          return [-1, ret];
+        }
+        case 'conditional': {
+          // TODO: handle dropIt
+          var type = detectType(node[2], asmData);
+          if ((node[2][0] === 'name' || getNum(node[2]) !== null) && 
+              (node[3][0] === 'name' || getNum(node[3]) !== null)) {
+            // this is a simple choice between concrete values, no need for control flow here
+            var out = assignTo >= 0 ? assignTo : getFree();
+            var condition = getReg(node[1]);
+            var ifTrue = getReg(node[2]);
+            var ifFalse = getReg(node[3]);
+            return [out, condition[1].concat(ifTrue[1]).concat(ifFalse[1]).concat(
+              [type === ASM_INT ? 'COND' : 'CONDD', out, releaseIfFree(condition[0]), releaseIfFree(ifTrue[0]), releaseIfFree(ifFalse[0]), 0, 0, 0]
+            )];
+          }
+          var otherwise = getMarker('cond-else'), exit = getMarker('cond-exit');
+          var temp = getFree();
+          assert(type !== ASM_NONE);
+          var ret = makeBranchIfFalse(node[1], otherwise);
+          var first = getReg(node[2]);
+          ret = ret.concat(first[1]).concat(makeSet(temp, releaseIfFree(first[0]), type)); 
+          ret.push('BR', 0, exit, 0);
+          var second = getReg(node[3]);
+          ret.push('marker', otherwise, 0, 0);
+          ret = ret.concat(second[1]).concat(makeSet(temp, releaseIfFree(second[0]), type));
+          ret.push('marker', exit, 0, 0);
+          return [temp, ret];
+        }
+        case 'seq': {
+          var first = getReg(node[1], true); // first output is always dropped
+          releaseIfFree(first[0]);
+          var second = getReg(node[2], dropIt, undefined, undefined, assignTo); // second output might be dropped
+          return [second[0], first[1].concat(second[1])];
+        }
+        case 'sub': {
+          assert(node[1][0] === 'name');
+          var heap = node[1][1];
+          var temp = makeTempParseHeap();
+          assert(parseHeap(heap, temp));
+          // coerced heap access => a load
+          var opcode = 'LOAD' + (temp.float ? 'F' : (temp.bits < 32 && temp.unsigned ? 'U' : '')) + temp.bits;
+          if (node[2][0] === 'binary' && node[2][1] === '>>' && node[2][3][0] === 'num') {
+            var shifts = node[2][3][1];
+            assert(shifts >= 0 && shifts <= 3);
+            var bits = Math.pow(2, shifts)*8;
+            assert(bits === temp.bits);
+            var pointer = node[2][2];
+            var y = getReg(pointer, false, ASM_INT, ASM_SIGNED);
+            var yLast = y[1][y[1].length-4];
+            if (yLast === 'ADD' || yLast === 'ADDV') {
+              // optimized load + add
+              y[1][y[1].length-4] = opcode + 'A' + (yLast === 'ADDV' ? 'V' : '');
+              if (assignTo >= 0) {
+                releaseIfFree(y[0]);
+                y[1][y[1].length-3] = assignTo;
+                y[0] = assignTo;
+              }
+              return y;
+            } else {
+              var x = assignTo >= 0 ? assignTo : getFree(y[0]);
+              y[1].push(opcode, x, releaseIfFree(y[0], x), 0);
+              y[0] = x;
+              return y;
+            }
+          } else {
+            assert(node[2][0] === 'num'); // HEAP32[8] or such
+            var address = node[2][1];
+            var shifts = ilog2(temp.bits/8);
+            assert(address === ((address << shifts) >> shifts));
+            var ret = makeNum(address << shifts, ASM_INT);
+            var out = assignTo >= 0 ? assignTo : getFree(ret[0]);
+            ret[1].push(opcode, out, releaseIfFree(ret[0], out), 0);
+            ret[0] = out;
+            return ret;
+          }
+        }
+        case 'block': {
+          return [-1, walkStatements(node[1])];
+        }
+        case 'switch': {
+          return makeSwitch(node);
+        }
+        default: throw 'getReg wha? ' + node[0] + new Error().stack;
+      }
+    }
+    function releaseIfFree(l, possible) {
+      if (l >= numLocals) releaseFree(l, possible);
+      return l;
+    }
+    function unreleaseIfFree(l) {
+      if (l >= numLocals) unreleaseFree(l);
+    }
+
+    function makeSet(dst, src, type) {
+      assert(dst < 256 && src < 256);
+      if (dst === src) return [];
+      var opcode;
+      if (type === ASM_INT) {
+        opcode = 'SET';
+      } else if (type === ASM_DOUBLE) {
+        opcode = 'SETD';
+      } else assert(0, 'ick ' + type);
+      return [opcode, dst, src, 0];
+    }
+
+    var hoistedNums = {};
+
+    function makeNum(value, type, l) {
+      if (type === ASM_INT && l === undefined && value in hoistedNums) return [hoistedNums[value], []];
+      if (l === undefined) l = getFree();
+      var opcode;
+      if (((value << 16) >> 16) === (value | 0) && ((value === (value | 0)) || (type === ASM_INT && value === (value >>> 0))) &&
+          (value !== 0 || 1/value > 0)) {
+        // a small 16-bit integer value, and not negative zero
+        // note that for ints, we don't care if it is signed or not; for floating-point, we need this to be signed
+        if (type === ASM_INT) {
+          opcode = 'SETVI';
+        } else if (type === ASM_DOUBLE) {
+          opcode = 'SETVD';
+        } else throw 'yuck';
+        return [l, [opcode, l, value & 255, (value >> 8) & 255]];
+      } else {
+        if (type === ASM_INT) {
+          return [l, ['SETVIB', l, 0, 0, value & 255, (value >> 8) & 255, (value >> 16) & 255, (value >> 24) & 255]];
+        } else if (type === ASM_DOUBLE) {
+          if (value === (value | 0) && (value !== 0 || 1/value > 0)) {
+            return [l, ['SETVDI', l, 0, 0, value & 255, (value >> 8) & 255, (value >> 16) & 255, (value >> 24) & 255]];
+          } else if (value === Math.fround(value)) {
+            return [l, ['SETVDF', l, 0, 0].concat(flattenFloat32(value))];
+          } else {
+            return [l, ['SETVDD', l, 0, 0].concat(flattenFloat64(value))];
+          }
+          throw 'fff ' + value;
+        } else throw 'aw';
+      }
+    }
+
+    function getNum(node) {
+      if (node[0] === 'num') return node[1];
+      if (node[0] === 'unary-prefix' && node[1] === '-' && node[2][0] === 'num') return -node[2][1];
+      return null;
+    }
+
+    function makeBinary(node, type, sign, assignTo) {
+      var opcode;
+      var numValue = null; // if one operand is a number, we can emit an optimized op
+      var otherValue = null;
+      var numValueUnsigned = false;
+      function tryNumSymmetrical(unsigned) { // flip operands to find a num
+        numValue = getNum(node[3]);
+        if (numValue !== null) {
+          otherValue = node[2];
+          numValueUnsigned = unsigned;
+        } else {
+          numValue = getNum(node[2]);
+          if (numValue !== null) {
+            otherValue = node[3];
+            numValueUnsigned = unsigned;
+          }
+        }
+      }
+      function tryNumAsymmetrical(unsigned) { // only try on the last operand (still common, e.g. x % 5, y >> 2, z > 0
+        numValue = getNum(node[3]);
+        if (numValue !== null) {
+          otherValue = node[2];
+          numValueUnsigned = unsigned;
+        }
+      }
+      switch(node[1]) {
+        case '+': {
+          if (node[3][0] === 'unary-prefix' && node[3][1] === '-') {
+            // optimize x + (-y) into x - y
+            node[1] = '-';
+            node[3] = node[3][2];
+            // fall through into '-'
+          } else {
+            if (type === ASM_INT) {
+              opcode = 'ADD';
+              tryNumSymmetrical();
+            } else if (type === ASM_DOUBLE) opcode = 'ADDD';
+            break;
+          }
+        }
+        case '-': {
+          if (type === ASM_INT) {
+            opcode = 'SUB';
+            tryNumAsymmetrical();
+          } else if (type === ASM_DOUBLE) opcode = 'SUBD';
+          break;
+        }
+        case '*': {
+          if (type === ASM_INT) {
+            opcode = 'MUL';
+            tryNumSymmetrical();
+          } else if (type === ASM_DOUBLE) opcode = 'MULD';
+          break;
+        }
+        case '/': {
+          if (type === ASM_INT) {
+            if (sign === ASM_FLEXIBLE) sign = ASM_SIGNED;
+            if (sign === ASM_SIGNED) opcode = 'SDIV';
+            else opcode = 'UDIV';
+            tryNumAsymmetrical(sign === ASM_UNSIGNED);
+          }
+          else if (type === ASM_DOUBLE) opcode = 'DIVD';
+          break;
+        }
+        case '%': {
+          if (type === ASM_INT) {
+            if (sign === ASM_FLEXIBLE) sign = ASM_SIGNED;
+            if (sign === ASM_SIGNED) opcode = 'SMOD';
+            else opcode = 'UMOD';
+            tryNumAsymmetrical(sign === ASM_UNSIGNED);
+          }
+          else if (type === ASM_DOUBLE) opcode = 'MODD';
+          break;
+        }
+        case '<': {
+          if (type === ASM_INT) {
+            if (sign === ASM_FLEXIBLE) sign = ASM_SIGNED; // e.g. two numbers
+            if (sign === ASM_SIGNED) opcode = 'SLT';
+            else opcode = 'ULT';
+            tryNumAsymmetrical(sign === ASM_UNSIGNED);
+          }
+          else if (type === ASM_DOUBLE) opcode = 'LTD';
+          break;
+        }
+        case '<=': {
+          if (type === ASM_INT) {
+            if (sign === ASM_FLEXIBLE) sign = ASM_SIGNED; // e.g. two numbers
+            if (sign === ASM_SIGNED) opcode = 'SLE';
+            else opcode = 'ULE';
+            tryNumAsymmetrical(sign === ASM_UNSIGNED);
+          }
+          else if (type === ASM_DOUBLE) opcode = 'LED';
+          break;
+        }
+        case '>': {
+          assert(type === ASM_DOUBLE);
+          opcode = 'GTD';
+          break;
+        }
+        case '>=': {
+          assert(type === ASM_DOUBLE);
+          opcode = 'GED';
+          break;
+        }
+        case '==': {
+          if (type === ASM_INT) {
+            opcode = 'EQ';
+            tryNumSymmetrical();
+          } else if (type === ASM_DOUBLE) opcode = 'EQD';
+          break;
+        }
+        case '!=': {
+          if (type === ASM_INT) {
+            opcode = 'NE';
+            tryNumSymmetrical();
+          } else if (type === ASM_DOUBLE) opcode = 'NED';
+          break;
+        }
+        case '&': opcode = 'AND'; tryNumSymmetrical(); break;
+        case '|': opcode = 'OR'; tryNumSymmetrical(); break;
+        case '^': opcode = 'XOR'; tryNumSymmetrical(); break;
+        case '<<': opcode = 'SHL'; tryNumAsymmetrical(true); break;
+        case '>>': opcode = 'ASHR'; tryNumAsymmetrical(true); break;
+        case '>>>': opcode = 'LSHR'; tryNumAsymmetrical(true); break;
+        default: throw 'bad ' + node[1];
+      }
+      if (!opcode) assert(0, JSON.stringify([node, type, sign]));
+      var x, y, z;
+      var usingNumValue = numValue !== null && ((!numValueUnsigned && ((numValue << 24 >> 24) === numValue)) ||
+                                                ( numValueUnsigned && ((numValue & 255) === numValue)));
+      if (!usingNumValue) {
+        y = getReg(node[2], undefined, type, sign);
+        z = getReg(node[3], undefined, type, sign);
+        x = assignTo >= 0 ? assignTo : getFree(y[0], z[0]);
+        y[1] = y[1].concat(z[1]);
+        y[1].push(opcode, x, releaseIfFree(y[0], x), releaseIfFree(z[0], x));
+        return [x, y[1]];
+      } else {
+        // one operand is a small 8-bit signed number, emit an optimized instruction
+        opcode += 'V';
+        y = getReg(otherValue, undefined, type, sign);
+        x = assignTo >= 0 ? assignTo : getFree(y[0]);
+        y[1].push(opcode, x, releaseIfFree(y[0], x), numValue & 255);
+        return [x, y[1]];
+      }
+    }
+
+    function makeUnary(node, type, sign, assignTo) {
+      var opcode;
+      switch(node[1]) {
+        case '-': {
+          if (type === ASM_INT) opcode = 'NEG';
+          else if (type === ASM_DOUBLE) opcode = 'NEGD';
+          else throw 'x ' + type;
+          break;
+        }
+        case '!': assert(type === ASM_INT); opcode = 'LNOT'; break;
+        case '~': assert(type === ASM_INT); opcode = 'BNOT'; break;
+        case 'I2D': case 'D2I': opcode = node[1]; break;
+        default: throw 'bad';
+      }
+      var y = getReg(node[2]);
+      var x = assignTo >= 0 ? assignTo : getFree(y[0]);
+      y[1].push(opcode, x, releaseIfFree(y[0], x), 0);
+      return [x, y[1]];
+    }
+
+    function makeBranchIfFalse(node, where) {
+      // optimization: x = !y, BRF x => BRT y
+      var opcode = 'BRF';
+      if (node[0] === 'unary-prefix' && node[1] === '!') {
+        node = node[2];
+        opcode = 'BRT';
+      }
+      var condition = getReg(node);
+      if (isFree(condition[0]) && condition[1][condition[1].length-4] in COMPARISONS) {
+        // emit an optimized compare+branch: avoid storing to the free condition[0], and just load the jump address right after us
+        condition[1][condition[1].length-4] += opcode;
+        condition[1].push('absolute-value', where, 0, 0);
+        releaseIfFree(condition[0]);
+        return condition[1];
+      }
+      condition[1].push(opcode, releaseIfFree(condition[0]), where, 0);
+      return condition[1];
+    }
+
+    function makeBranchIfTrue(node, where) {
+      if (node[0] === 'unary-prefix' && node[1] === '!') {
+        return makeBranchIfFalse(node[2], where);
+      }
+      return makeBranchIfFalse(['unary-prefix', '!', node], where);
+    }
+
+    function makeDo(node, label) {
+      var oneTime = node[1][0] === 'num' && node[1][1] === 0; // trivial one-time loops do {..} while(0) do not need condition handling
+      // TODO: more testing assert(!oneTime);
+      var exit = getMarker('do-exit');
+      var top, cond;
+      if (!oneTime) {
+        top = getMarker('do-top');
+        cond = getMarker('do-cond');
+      } else {
+        top = -1; // no need to even mark the top
+        cond = exit; // when we reach the condition, we just exit
+      }
+      breakStack.push(exit);
+      continueStack.push(cond);
+      if (label) {
+        assert(!(label in breakLabels));
+        breakLabels[label] = exit;
+        assert(!(label in continueLabels));
+        continueLabels[label] = cond;
+      }
+      var body = walkStatements(node[2]);
+      breakStack.pop();
+      continueStack.pop();
+      if (label) {
+        delete breakLabels[label];
+        delete continueLabels[label];
+      }
+      var condition;
+      if (!oneTime) {
+        condition = makeBranchIfTrue(node[1], top);
+      }
+      var ret = [];
+      if (!oneTime) {
+        ret.push('marker', top, 0, 0);
+      }
+      ret = ret.concat(body);
+      if (!oneTime) {
+        ret.push('marker', cond, 0, 0);
+        ret = ret.concat(condition);
+      }
+      ret.push('marker', exit, 0, 0);
+      return [-1, ret];
+    }
+
+    function makeWhile(node, label) {
+      var infinite = node[1][0] === 'num' && node[1][1] === 1; // trivial infinite loops while(1) {..} do not need condition handling
+      var top = getMarker('while-top'), exit = getMarker('while-exit');
+      var cond = !infinite ? getMarker('while-cond') : top;
+      breakStack.push(exit);
+      continueStack.push(cond);
+      if (label) {
+        assert(!(label in breakLabels));
+        breakLabels[label] = exit;
+        assert(!(label in continueLabels));
+        continueLabels[label] = cond;
+      }
+      var ret = [];
+      if (!infinite) {
+        ret.push('marker', cond, 0, 0);
+        ret = ret.concat(makeBranchIfFalse(node[1], exit));
+      }
+      ret = ret.concat(['marker', top, 0, 0]).concat(walkStatements(node[2]));
+      ret.push('BR', 0, cond, 0);
+      breakStack.pop();
+      continueStack.pop();
+      if (label) {
+        delete breakLabels[label];
+        delete continueLabels[label];
+      }
+      ret.push('marker', exit, 0, 0);
+      return [-1, ret];
+    }
+
+    function makeSwitch(node, label) {
+      var cases = node[2];
+      // there must be one non-default case, otherwise we add a fake one
+      var normals = 0;
+      for (var i = 0; i < cases.length; i++) {
+        var c = cases[i];
+        var id = getId(c[0]);
+        if (id !== 'default') normals++;
+      }
+      if (normals === 0) {
+        // ignore the condition, we must always reach the default
+        node[1] = ['seq', node[1], ['num', 0]]; // always 0
+        cases.unshift([['num', 1], ['block', []]]); // a block for 1, which is never hit
+      }
+      // now the switch is normalized and has one non-default case, proceed
+      var condition = getReg(node[1]);
+      var exit = getMarker('switch-exit');
+      // parse cases and emit code
+      breakStack.push(exit);
+      if (label) {
+        assert(!(label in breakLabels));
+        breakLabels[label] = exit;
+      }
+      var data = {};
+      var minn = Infinity, maxx = -Infinity;
+      function getId(raw) {
+        if (raw === null) return 'default';
+        else if (raw[0] === 'num') return raw[1];
+        else if (raw[0] === 'unary-prefix' && raw[2][0] === 'num') return -raw[2][1];
+        else throw 'bad case';
+      }
+      for (var i = 0; i < cases.length; i++) {
+        var c = cases[i];
+        var id = getId(c[0]);
+        if (id === 'default') assert(i === cases.length-1, 'if there is a default, it must be last');
+        data[id] = {
+          i: i, // original index
+          id: id,
+          code: walkStatements(c[1]),
+          marker: getMarker('switch-case'),
+          next: -1 // will be the fall through target
+        };
+        if (typeof id === 'number') {
+          minn = Math.min(id, minn);
+          maxx = Math.max(id, maxx);
+        }
+      }
+      breakStack.pop();
+      if (label) {
+        delete breakLabels[label];
+      }
+      // finalize nexts
+      for (var id in data) {
+        var info = data[id];
+        var i = info.i + 1;
+        while (1) {
+          if (i >= cases.length) {
+            info.next = exit;
+            break;
+          }
+          var nextId = getId(cases[i][0]);
+          assert(nextId in data);
+          info.next = data[nextId].marker;
+          break;
+          // TODO: optimize all this, we don't need a fallthrough branch if we branch anyhow; recurse multiple fallthroughs; etc.
+        }
+      }
+      // calculate values
+      var range = maxx - minn + 1;
+      assert(minn === (minn | 0) && range === (range | 0));
+      var defaultMarker = data['default'] ? data['default'].marker : getMarker('switch-default');
+      // emit the switch instruction itself
+      var tempMin = getFree(), tempRange = getFree();
+      var ret = condition[1].concat(makeNum(minn, ASM_INT, tempMin)[1]).concat(makeNum(range, ASM_INT, tempRange)[1]);
+      ret.push('SWITCH', condition[0], tempMin, tempRange);
+      releaseFree(tempRange);
+      releaseFree(tempMin);
+      releaseIfFree(condition[0]);
+      // emit the jump table
+      for (var i = 0; i < range; i++) {
+        var j = minn + i;
+        var info = data[j];
+        if (info) {
+          ret.push('absolute-value', info.marker, 0, 0);
+        } else {
+          ret.push('absolute-value', defaultMarker, 0, 0);
+        }
+      }
+      // emit the default TODO: optimize when there is no default
+      ret.push('marker', defaultMarker, 0, 0);
+      if (data['default']) {
+        ret = ret.concat(data['default'].code);
+      }
+      ret.push('BR', 0, exit, 0);
+      // emit the jump table targets
+      for (var i = 0; i < range; i++) {
+        var j = minn + i;
+        var info = data[j];
+        if (info) {
+          ret.push('marker', info.marker, 0, 0);
+          ret = ret.concat(info.code);
+          ret.push('BR', 0, info.next, 0);
+        }
+      }
+      ret.push('marker', exit, 0, 0);
+      return [-1, ret];
+    }
+
+    function makeCall(lx, node, type) {
+      // TODO: specialize calls like imul
+      assert(node[0] === 'call');
+      var ret = [];
+      var target;
+      var functionPointer = null;
+      var internal = false;
+      if (node[1][0] === 'name') {
+        // normal direct call
+        target = node[1][1];
+        // special-case some call targets
+        switch (target) {
+          case 'Math_imul': {
+            assert(node[2].length === 2);
+            var mul = makeBinary(['binary', '*', node[2][0], node[2][1]], ASM_INT, ASM_SIGNED, lx);
+            assert(mul[0] === lx);
+            return mul[1];
+          }
+          case 'Math_fround': {
+            assert(node[2].length === 1);
+            var child = getReg(node[2][0], undefined, ASM_DOUBLE, ASM_NONSIGNED, lx);
+            child[1].push('FROUND', lx, child[0], 0);
+            releaseIfFree(child[0], lx);
+            return child[1];
+          }
+        }
+        if ((target in EMTERPRETED_FUNCS) && !PROFILING) internal = true;
+      } else {
+        // function pointer call through function table
+        assert(node[1][0] === 'sub' && node[1][1][0] === 'name');
+        target = node[1][1][1];
+        assert(isFunctionTable(target));
+        functionPointer = getReg(node[1][2]);
+        ret = ret.concat(functionPointer[1]);
+      }
+      var actuals = [];
+      var sig = ASM_SIG[type];
+      node[2].forEach(function(param) {
+        var reg = getReg(param);
+        ret = ret.concat(reg[1]);
+        actuals.push(reg[0]);
+        var curr = ASM_SIG[detectType(param, asmData)];
+        if (curr === 'v') curr = 'i'; // if we can't detect it, it must be an asm global. the only possibilities are int. TODO: add globals to detectType
+        sig += curr;
+      });
+      ret.push(internal ? 'INTCALL' : 'EXTCALL');
+      ret.push(lx);
+      if (!internal) {
+        ret.push(target);
+        assert(sig.indexOf('u') < 0); // no undefined
+        ret.push(sig);
+      } else {
+        ret.push(0, 0);
+      }
+      actuals.forEach(function(actual) { releaseIfFree(actual) });
+      if (functionPointer) {
+        ret.push(releaseIfFree(functionPointer[0]));
+      }
+      if (internal) {
+        ret.push('absolute-funcaddr', target, 0, 0);
+      }
+      ret = ret.concat(actuals);
+      while (ret.length % 4 !== 0) ret.push(0);
+      return ret;
+    }
+
+    function walkStatements(stats) {
+      if (!stats) return [];
+      if (stats[0] === 'block') return walkStatements(stats[1]);
+      if (typeof stats[0] === 'string') stats = [stats];
+      var ret = [];
+      stats.forEach(function(stat) {
+        var before = freeLocals.length;
+        var raw = getReg(stat, true);
+        //printErr('raw: ' + JSON.stringify(stat));
+        releaseIfFree(raw[0]);
+        if (freeLocals.length !== before) assert(0, [before, freeLocals.length] + ' due to ' + astToSrc(stat)); // the statement is done - nothing should still be held on to
+        var curr = raw[1];
+        //printErr('stat: ' + JSON.stringify(curr));
+        verifyCode(curr, stat);
+        ret = ret.concat(curr);
+      });
+      return ret;
+    }
+
+    function finalizeJumps(code) {
+      function getI(obj) { // the target of a marker
+        var i = 0;
+        while (i < code.length) { // find the definition, ignoring uses
+          i = code.indexOf(obj, i);
+          if (i < 0) return -1;
+          if (code[i-1] === 'marker') return i-1;
+          i++;
+        }
+        return -1;
+      }
+      function sanityCheck() {
+        var seenMarkers = {}; // every absolute value must have a valid target
+        for (var i = 0; i < code.length; i += 4) {
+          if (code[i] === 'marker') {
+            seenMarkers[code[i+1].id] = 1;
+          }
+        }
+        for (var i = 0; i < code.length; i += 4) {
+          if (code[i] === 'absolute-value') {
+            assert(code[i+1].id in seenMarkers);
+          }
+        }
+      }
+      sanityCheck();
+      // first pass, collect markers and absolute targets, and their uses
+      for (var i = 0; i < code.length; i += 4) {
+        assert(!(code[i] in ABSOLUTE_BRANCHES));
+        if (code[i] in RELATIVE_BRANCHES) {
+          code[i+2].relativeUses++;
+        } else if (code[i] === 'absolute-value') {
+          code[i+1].absoluteUses++;
+        }
+      }
+      sanityCheck();
+      // optimization pass, skip over multiple jumps
+      function skipNOPs(i) {
+        while (code[i] === 'marker') i += 4; // jump over all NOPs here
+        return i;
+      }
+      for (var i = 0; i < code.length; i += 4) {
+        if (code[i] in RELATIVE_BRANCHES) {
+          while (1) {
+            var j = getI(code[i+2]);
+            assert(code[j] === 'marker');
+            j = skipNOPs(j);
+            if (code[j] === 'BR' && code[i+2] !== code[j+2]) {
+              code[i+2].relativeUses--;
+              assert(code[i+2].relativeUses >= 0);
+              code[j+2].relativeUses++;
+              code[i+2] = code[j+2];
+            } else {
+              break;
+            }
+          }
+        }
+      }
+      sanityCheck();
+      // optimization pass, remove unreachable code
+      function deleteCode(i, num) {
+        // drop uses for code we are removing
+        for (var j = i; j < i + num; j += 4) {
+          assert(!(code[j] in ABSOLUTE_BRANCHES));
+          if (code[j] in RELATIVE_BRANCHES) {
+            code[j+2].relativeUses--;
+            assert(code[j+2].relativeUses >= 0);
+          } else if (code[j] === 'absolute-value') {
+            code[j+1].absoluteUses--;
+            assert(code[j+1].absoluteUses >= 0);
+          }
+        }
+        code.splice(i, num);
+      }
+      for (var i = 0; i < code.length; i += 4) {
+        if (code[i] in UNCONDITIONAL_BRANCHES) {
+          var j = i + 4; // normal forward control flow cannot reach this position
+          while (j < code.length) {
+            if (code[j] === 'marker') {
+              var relativeUses = code[j+1].relativeUses;
+              assert(relativeUses >= 0);
+              if (relativeUses > 0) break; // this is reachable
+              var absoluteUses = code[j+1].absoluteUses;
+              assert(absoluteUses >= 0);
+              if (absoluteUses > 0) break; // this is reachable
+            }
+            j += 4; // this instr is unreachable
+          }
+          if (j > i + 4) {
+            deleteCode(i + 4, j - i - 4);
+          }
+        }
+      }
+      sanityCheck();
+      // second pass, find out which relative branches must be converted to absolutes, because they are too big
+      // and convert them
+      for (var i = 0; i < code.length; i += 4) {
+        if (code[i] in RELATIVE_BRANCHES) {
+          var obj = code[i+2];
+          var target = getI(obj);
+          var offset = target - i; // overestimate, since there are still 'marker's that will be cleaned up
+          var storedOffset = offset >> 2; // offsets are divisible by 4, so we ignore the lower bits
+          var maxOffset = storedOffset * 2; // when we convert relative to absolute, we double the size of a branch.
+                                            // so worst case, we may double offsets (TODO this could be optimized)
+          if ((maxOffset << 16 >> 16) !== maxOffset) {
+            code[i] += 'A'; // convert branch to absolute
+            code[i+2] = 0; // id is no longer needed, 4 extra bytes in the inst will contain the absolute value
+            code.splice(i+4, 0, 'absolute-value', obj, 0, 0); // add absolute value after first part of branch inst
+            obj.relativeUses--;
+            assert(obj.relativeUses >= 0);
+            obj.absoluteUses++;
+          }
+        }
+      }
+      sanityCheck();
+      // optimizations that can only reduce code size
+      for (var i = 0; i < code.length; i += 4) {
+        if (code[i] === 'BRF' && code[i+4] === 'BR') {
+          // if we have a branch-if-false and then a branch, and the BRF jumps to right after the branch, then we can just emit
+          // a BRT. this can happen at the end of while loops, if there is a condition that checks if we should break out
+          if (skipNOPs(i+8) === skipNOPs(getI(code[i+2]))) {
+            code[i] = 'BRT';
+            code[i+2].relativeUses--;
+            code[i+2] = code[i+6];
+            code.splice(i+4, 4);
+          }
+        } else if (code[i] in CONDITION_BRFS && code[i+8] === 'BR') {
+          // similar optimization, with condition+BRF => condition+BRT
+          if (skipNOPs(i+12) === skipNOPs(getI(code[i+5]))) {
+            code[i] = code[i].substr(0, code[i].length-1) + 'T'; // same condition, swap BRF to BRT
+            code[i+5].absoluteUses--;
+            assert(code[i+5].absoluteUses >= 0);
+            code[i+5] = code[i+10];
+            code[i+5].relativeUses--;
+            assert(code[i+5].relativeUses >= 0);
+            code[i+5].absoluteUses++;
+            code.splice(i+8, 4);
+          }
+        }
+      }
+      // remove relative and absolute placeholders, after which every instruction is now in its absolute location, and we can write out absolutes 
+      for (var i = 0; i < code.length; i += 4) {
+        if (code[i] === 'marker') {
+          var obj = code[i+1];
+          obj.i = i;
+          assert(i == getI(obj));
+          if (obj.absoluteUses > 0) {
+            absoluteTargets[obj.id] = i;
+          }
+          code.splice(i, 4);
+          i -= 4;
+        } else if (code[i] === 'absolute-value') {
+          var obj = code[i+1];
+          assert(obj.absoluteUses > 0);
+          code[i+1] = obj.id;
+        }
+      }
+      // final pass, finalize relative jumps TODO: optimize jump->jump->x to jump->x
+      for (var i = 0; i < code.length; i += 4) {
+        if (code[i] in RELATIVE_BRANCHES) {
+          var obj = code[i+2];
+          var target = obj.i;
+          assert(target >= 0);
+          var offset = target - i;
+          assert(offset % 4 === 0);
+          offset >>= 2;
+          assert(Math.abs(offset) < 32768);
+          code[i+2] = offset & 255;
+          code[i+3] = (offset >> 8) & 255;
+        }
+      }
+    }
+
+    function hoistConstants(stats) {
+      // find constants that appear a lot or appear in loops, and hoist them to the top
+      var nums = {};
+      var depth = 0;
+      traverse(stats, function(node, type) {
+        if (type in LOOP && !(node[1] === 'num' && node[2] === 0)) depth++;
+        else if (type === 'unary-prefix' && node[1] === '+' && getNum(node[2]) !== null) return null; // we only care about ints
+        var num = getNum(node);
+        if (num === null) return;
+        nums[num] = (nums[num] || 0) + Math.pow(5, depth);
+        return null; // do not traverse into this node
+      }, function(node, type) {
+        if (type in LOOP && !(node[1] === 'num' && node[2] === 0)) depth--;
+      });
+      var ks = keys(nums);
+      ks.sort(function(x, y) { return nums[y] - nums[x] });
+      var ret = [];
+      var limit = Math.max(numLocals + 3, Math.min(1.1*numLocals, 120));
+      for (var i = 0; i < ks.length && numLocals < limit; i++) {
+        var n = ks[i];
+        if (n >= -127 && n < 128) continue; // constant like these are typically folded into ops anyhow
+        var weight = nums[n];
+        if (weight < 10) continue; // not heavy enough
+        // hoist this num
+        var reg = makeNum(n, ASM_INT);
+        //printErr('hoist ' + [n, weight, reg[0]]);
+        hoistedNums[n] = reg[0];
+        ret = ret.concat(reg[1]);
+        assert(reg[0] === numLocals);
+        numLocals++; // this will never be freed
+      }
+      return ret;
+    }
+
+    // walkFunction main
+
+    var ignore = !(func[1] in EMTERPRETED_FUNCS);
+
+    if (ignore) {
+      // we are not emterpreting this function
+      if (ASYNC && ASSERTIONS && !okToCallWhileAsync(func[1])) {
+        // we need to be careful to never enter non-emterpreted code while doing an async save/restore,
+        // which is what happens if non-emterpreted code is on the stack while we attempt to save.
+        // add asserts right after each call
+        var stack = [];
+        traverse(func, function(node, type) {
+          stack.push(node);
+        }, function(node, type) { // post-traversal
+          stack.pop();
+          if (type !== 'call') return;
+          if (node[1][0] === 'name' && isMathFunc(node[1][1])) return;
+          var callType = ASM_NONE;
+          var parent = stack[stack.length-1];
+          if (parent) {
+            var temp = null;
+            if (parent[0] === 'binary' && parent[1] === '|' && parent[3][0] === 'num' && parent[3][1] === 0 &&
+                parent[2] === node) {
+              // int-coerced call
+              callType = ASM_INT;
+              temp = 'tempInt';
+            } else if (parent[0] === 'unary-prefix' && parent[1] === '+' && parent[2] === node) {
+              // double-coerced call
+              callType = ASM_DOUBLE;
+              temp = 'tempDouble';
+            }
+            // XXX fails on other coercions of odd types, like float32, simd, etc!
+            if (temp) {
+              // assign to temp, assert, return proper value:     temp = call() , (asyncState ? abort() : temp)
+              trample(node, ['seq',
+                ['assign', null, ['name', temp], makeAsmCoercion(copy(node), callType)],
+                ['conditional', ['name', 'asyncState'], makeAsmCoercion(['call', ['name', 'abort'], [['num', '-12']]], callType), ['name', temp]]
+              ]);
+              return;
+            }
+          }
+          // no important parent
+          trample(node, ['seq',
+            copy(node),
+            ['conditional', ['name', 'asyncState'], makeAsmCoercion(['call', ['name', 'abort'], [['num', '-12']]], ASM_INT), ['num', 0]]
+          ]);
+        });
+        // add an assert in the prelude of the function
+        var stats = getStatements(func);
+        for (var i = 0; i < stats.length; i++) {
+          var node = stats[i];
+          if (node[0] == 'stat') node = node[1];
+          if (node[0] !== 'var' && node[0] !== 'assign') {
+            stats.splice(i, 0, ['stat', 
+              ['conditional', ['name', 'asyncState'], makeAsmCoercion(['call', ['name', 'abort'], [['num', '-12']]], ASM_INT), ['num', 0]]
+            ]);
+            break;
+          }
+        }
+        // perhaps also add at loop headers? TODO
+      }
+      print(astToSrc(func));
+    }
+
+    var asmData = normalizeAsm(func);
+    print('// return type: [' + func[1] + ',' + getSignature(func, asmData) + ']');
+
+    if (ignore) {
+      return;
+    }
+
+    //printErr('emterpretifying ' + func[1]);
+
+    // we implement floats as doubles, and just decrease precision when fround is called. flip floats to doubles, but we
+    // must restore this at the end when we emit the trampolines
+    var trueParams = asmData.params;
+    asmData.params = {};
+    for (var t in trueParams) {
+      if (trueParams[t] === ASM_FLOAT) {
+        asmData.params[t] = ASM_DOUBLE;
+      } else {
+        asmData.params[t] = trueParams[t];
+      }
+    }
+    var trueVars = asmData.vars;
+    asmData.vars = {};
+    for (var t in trueVars) {
+      if (trueVars[t] === ASM_FLOAT) {
+        asmData.vars[t] = ASM_DOUBLE;
+      } else {
+        asmData.vars[t] = trueVars[t];
+      }
+    }
+    traverse(func, function() {} , function(node, type) {
+      // Math_fround(x) => +Math_fround(+x), so that see no float types on temp values; types are double or int, and fround is just a function we emit
+      if (type === 'call' && node[1][0] === 'name' && node[1][1] === 'Math_fround') {
+        assert(node[2].length === 1);
+        old = ['call', node[1], [['unary-prefix', '+', node[2][0]]]];
+        node[0] = 'unary-prefix';
+        node[1] = '+';
+        node[2] = old;
+      }
+    });
+
+    // consider locals
+
+    var locals = {};
+    var numLocals = 0; // ignores slow locals, they are over 255 and not directly accessible
+    var numVars = 0;
+
+    function countLocals() {
+      numLocals = 0;
+      for (var i in asmData.params) {
+        numLocals++;
+      }
+      for (var i in asmData.vars) {
+        numLocals++;
+        numVars++;
+      }
+    }
+
+    countLocals();
+    if (numLocals >= FAST_LOCALS) {
+      //printErr('warning: ' + numLocals + ' locals in ' + func[1] + ', which is very high, trying to reduce');
+      aggressiveVariableEliminationInternal(func, asmData);
+      countLocals();
+      //printErr('...number of locals is now ' + numLocals);
+    }
+
+    // put the variables that need a zero-init at the beginning
+    locals = {};
+    numLocals = 0;
+    for (var i in asmData.params) {
+      locals[i] = numLocals++;
+    }
+    assert(numLocals < FAST_LOCALS, 'way too many params!');
+    assert(FAST_LOCALS < 256);
+    for (var i in asmData.vars) {
+      locals[i] = numLocals++; // TODO: sort by frequency of appearance, so common ones are fast, rare are slow
+      if (numLocals === FAST_LOCALS) numLocals = 256; // jump over the temps, remaining locals are slow locals
+    }
+    var withSlowLocals = numLocals;
+    numLocals = Math.min(numLocals, FAST_LOCALS); // ignore the slow locals
+    for (var i = 255; i >= numLocals; i--) {
+      freeLocals.push(i);
+    }
+
+    var stats = getStatements(func);
+    func[3] = [];
+
+    // do some pre-calculation and optimization
+    var constants = hoistConstants(stats);
+    assert(numLocals < 225); // leave plenty of room for temps
+
+    // walk all the function to emit bytecode, and add a final ret
+    var code = walkStatements(stats);
+    assert(code.length % 4 === 0);
+    if (code.length < 4 || code[code.length-4] != 'RET') {
+      code.push('RET', 0, 0, 0); // final ret for the function
+    }
+    // calculate final count of local variables, and emit func header
+    var finalLocals = Math.max(numLocals, maxLocal+1, withSlowLocals);
+    assert(finalLocals < 65535, 'too many locals ' + [maxLocal, numLocals, withSlowLocals]);
+    code = ['FUNC', func[2].length, finalLocals & 255, finalLocals >>> 8, 0, 0, 0, 0].concat(constants).concat(code);
+    verifyCode(code);
+
+    finalizeJumps(code);
+
+    // check if this is a leaf method (does no calls to other emterpreted code)
+    var DEFINITE_LEAVES = set('_memcpy', '_memmove', '_memset', '_strlen', '_strncpy', '_strcpy', '_strcat', '_printf', '_puts', '_malloc', '_free'); // things we know for sure are leaves XXX hackish, dangerous. To get more stuff in here, it must be either in a JS library, or blacklisted from the emterpreter, and be known to never reach emterpreted code.
+
+    var leaf = true;
+    for (var i = 0; i < code.length; i += 4) {
+      // if this is a call that can conceivably reach other emterpreted code, it isn't a leaf
+      if (code[i] === 'INTCALL' || (code[i] === 'EXTCALL' && !isMathFunc(code[i+2]) && !(code[i+2] in DEFINITE_LEAVES))) {
+        leaf = false;
+        //printErr('                   NOT leaf ' + func[1] + ' since ' + code[i+2]);
+        break;
+      }
+    }
+    //if (leaf) printErr(func[1]);
+
+    var zero = false; // leaf; // TODO: heuristics
+    var onlyLeavesAreZero = true; // if only leaves are zero, then we do not need to save and restore the stack XXX if this is not true, then setjmp and exceptions can fail, as cleanup is skipped!
+
+    if (zero) code[3] = 1;
+
+    if ((func[1] in EXTERNAL_EMTERPRETED_FUNCS) || PROFILING) {
+      // this is reachable from outside emterpreter code, set up a trampoline
+      asmData.params = trueParams; // restore them, we altered float=>double
+      asmData.vars = {};
+      if (zero && !onlyLeavesAreZero) {
+        // emterpreters run using the stack starting at 0. we must copy it so we can restore it later
+        asmData.vars['sp'] = ASM_INT;
+        func[3].push(srcToStat('sp = EMTSTACKTOP;'));
+        var stackBytes = finalLocals*8;
+        func[3].push(srcToStat('EMTSTACKTOP = EMTSTACKTOP + ' + stackBytes + ' | 0;'));
+        func[3].push(srcToStat('assert(((EMTSTACKTOP|0) <= (EMT_STACK_MAX|0))|0);'));
+        asmData.vars['x'] = ASM_INT;
+        func[3].push(srcToStat('while ((x | 0) < ' + stackBytes + ') { HEAP32[sp + x >> 2] = HEAP32[x >> 2] | 0; x = x + 4 | 0; }'));
+      }
+      // copy our arguments to our stack frame
+      var bump = ASYNC ? 8 : 0; // we will assert in the emterpreter itself that we did not overflow the emtstack
+      var argStats = [];
+      func[2].forEach(function(arg) {
+        var code;
+        switch (asmData.params[arg]) {
+          case ASM_INT:    code = 'HEAP32[' + (zero ? (bump >> 2) : ('EMTSTACKTOP + ' + bump + ' >> 2')) + '] = ' + arg + ';'; break;
+          case ASM_FLOAT:
+          case ASM_DOUBLE: code = 'HEAPF64[' + (zero ? (bump >> 3) : ('EMTSTACKTOP + ' + bump + ' >> 3')) + '] = ' + arg + ';'; break;
+          default: throw 'bad';
+        }
+        argStats.push(srcToStat(code));
+        bump += 8; // each local is a 64-bit value
+      });
+      if (ASYNC) {
+        argStats.push(['if', srcToExp('(asyncState|0) == 1'), srcToStat('asyncState = 3;')]); // we know we are during a sleep, mark the state
+        argStats = [['if', srcToExp('(asyncState|0) != 2'), ['block', argStats]]]; // 2 means restore, so do not trample the stack
+      }
+      func[3] = func[3].concat(argStats);
+      // prepare the call into the emterpreter
+      var theName = ['name', 'emterpret'];
+      var theCall = ['call', theName, [['name', 'EMTERPRETER_' + func[1]]]]; // EMTERPRETER_* will be replaced with the absolute bytecode offset later
+      // add the call
+      func[3].push(['stat', theCall]);
+      if (zero) {
+        theName[1] += '_z';
+        if (!onlyLeavesAreZero) {
+          // restore the stack
+          func[3].push(srcToStat('x = 0;'));
+          func[3].push(srcToStat('while ((x | 0) < ' + stackBytes + ') { HEAP32[x >> 2] = HEAP32[sp + x >> 2] | 0; x = x + 4 | 0; }'));
+          func[3].push(srcToStat('EMTSTACKTOP = sp;'));
+        }
+      }
+      // add the return, if necessary
+      if (asmData.ret !== undefined) {
+        var ret;
+        switch (asmData.ret) {
+          case ASM_INT: ret = srcToExp('HEAP32[EMTSTACKTOP >> 2]'); break;
+          case ASM_FLOAT:
+          case ASM_DOUBLE: ret = srcToExp('HEAPF64[EMTSTACKTOP >> 3]'); break;
+          default: throw 'bad';
+        }
+        func[3].push(['return', makeAsmCoercion(ret, asmData.ret)]);
+      }
+      // emit trampoline and bytecode
+      denormalizeAsm(func, asmData);
+      print(astToSrc(func));
+    }
+    print('// EMTERPRET_INFO ' + JSON.stringify([func[1], code, absoluteTargets]));
+  }
+  traverseGeneratedFunctions(ast, walkFunction);
+}
+
+// emits which functions are directly reachable from, except for some blacklist
+function findReachable(ast) {
+  var BLACKLIST = set(extraInfo.blacklist);
+  var reachable = {};
+  traverseGeneratedFunctions(ast, function(func) {
+    if (func[1] in BLACKLIST) return;
+    traverse(func, function(node, type) {
+      if (type === 'call' && node[1][0] === 'name') {
+        reachable[node[1][1]] = 1;
+      }
+    });
+  });
+  print('// REACHABLE ' + JSON.stringify(keys(reachable)));
+}
+
+// emits call graph information
+function dumpCallGraph(ast) {
+  traverseGeneratedFunctions(ast, function(func) {
+    var reachable = {};
+    traverse(func, function(node, type) {
+      if (type === 'call') {
+        if (node[1][0] === 'name') {
+          reachable[node[1][1]] = 1;
+        } else {
+          // (FUNCTION_TABLE[..])(..)
+          assert(node[1][0] === 'sub')
+          assert(node[1][1][0] === 'name');
+          reachable[node[1][1][1]] = 1;
+        }
+      }
+    });
+    print('// REACHABLE ' + JSON.stringify([func[1], ' => ', keys(reachable)]));
+  });
+}
+
 // Last pass utilities
 
 // Change +5 to DOT$ZERO(5). We then textually change 5 to 5.0 (uglify's ast cannot differentiate between 5 and 5.0 directly)
@@ -5563,7 +7572,8 @@ function prepDotZero(ast) {
   });
 }
 function fixDotZero(js) {
-  return js.replace(/DOT\$ZERO\(([-+]?(0x)?[0-9a-f]*\.?[0-9]+([eE][-+]?[0-9]+)?)\)/g, function(m, num) {
+  return js.replace(/-DOT\$ZERO\(-/g, '- DOT$ZERO(-') // avoid x - (-y.0) turning into x--y.0 when minified
+           .replace(/DOT\$ZERO\(([-+]?(0x)?[0-9a-f]*\.?[0-9]+([eE][-+]?[0-9]+)?)\)/g, function(m, num) {
     if (num.substr(0, 2) === '0x' || num.substr(0, 3) === '-0x') {
       var ret = eval(num).toString();
       if (ret.indexOf('.') < 0) return ret + '.0';
@@ -5582,6 +7592,9 @@ function asmLastOpts(ast) {
     traverse(fun, function(node, type) {
       var stats = getStatements(node);
       if (stats) statsStack.push(stats);
+      if (type in CONDITION_CHECKERS) {
+        node[1] = simplifyCondition(node[1]);
+      }
       if (type === 'while' && node[1][0] === 'num' && node[1][1] === 1 && node[2][0] === 'block' && node[2].length == 2) {
         // This is at the end of the pipeline, we can assume all other optimizations are done, and we modify loops
         // into shapes that might confuse other passes
@@ -5635,7 +7648,7 @@ function asmLastOpts(ast) {
           node[1] = simplifyNotCompsDirect(['unary-prefix', '!', conditionToBreak]);
           return node;
         }
-      } else if (type == 'binary') {
+      } else if (type === 'binary') {
         if (node[1] === '&') {
           if (node[3][0] === 'unary-prefix' && node[3][1] === '-' && node[3][2][0] === 'num' && node[3][2][1] === 1) {
             // Change &-1 into |0, at this point the hint is no longer needed
@@ -5645,7 +7658,7 @@ function asmLastOpts(ast) {
           }
         } else if (node[1] === '-' && node[3][0] === 'unary-prefix') {
           // avoid X - (-Y) because some minifiers buggily emit X--Y which is invalid as -- can be a unary. Transform to
-         //        X + Y
+          //        X + Y
           if (node[3][1] === '-') { // integer
             node[1] = '+';
             node[3] = node[3][2];
@@ -5661,12 +7674,194 @@ function asmLastOpts(ast) {
       var stats = getStatements(node);
       if (stats) statsStack.pop();
     });
+    if (!debug) { // dangerous in debug mode, as without braces things can end up on the same line, together with comments
+      // convert  { singleton }  into  singleton
+      traverse(fun, function(node, type) {
+        if (type === 'block' && node[1] && node[1].length === 1) {
+          return node[1][0];
+        }
+      });
+    }
+  });
+}
+
+// Contrary to the name this does not eliminate actual dead functions, only
+// those marked as such with DEAD_FUNCTIONS
+function eliminateDeadFuncs(ast) {
+  assert(asm);
+  assert(extraInfo && extraInfo.dead_functions);
+  var deadFunctions = set(extraInfo.dead_functions);
+  traverseGeneratedFunctions(ast, function (fun, type) {
+    if (!(fun[1] in deadFunctions)) {
+      return;
+    }
+    var asmData = normalizeAsm(fun);
+    fun[3] = [['stat', ['call', ['name', 'abort'], [['num', -1]]]]];
+    asmData.vars = {};
+    denormalizeAsm(fun, asmData);
+  });
+}
+
+// Cleans up globals in an asm.js module that are not used. Assumes it
+// receives a full asm.js module, as from the side file in --separate-asm
+function eliminateDeadGlobals(ast) {
+  traverse(ast, function(func, type) {
+    if (type !== 'function') return;
+    // find all symbols used by name that are not locals, so they must be globals
+    var stats = func[3];
+    var used = {};
+    for (var i = 0; i < stats.length; i++) {
+      var asmFunc = stats[i];
+      if (asmFunc[0] === 'defun') {
+        var asmData = normalizeAsm(asmFunc);
+        traverse(asmFunc, function(node, type) {
+          if (type == 'name') {
+            var name = node[1];
+            if (!(name in asmData.params || name in asmData.vars)) {
+              used[name] = 1;
+            }
+          }
+        });
+        denormalizeAsm(asmFunc, asmData);
+      } else {
+        traverse(asmFunc, function(node, type) {
+          if (type == 'name') {
+            var name = node[1];
+            used[name] = 1;
+          }
+        });
+      }
+    }
+    for (var i = 0; i < stats.length; i++) {
+      var node = stats[i];
+      if (node[0] === 'var') {
+        for (var j = 0; j < node[1].length; j++) {
+          var v = node[1][j];
+          var name = v[0];
+          var value = v[1];
+          if (!(name in used)) {
+            node[1].splice(j, 1);
+            j--;
+            if (node[1].length == 0) {
+              // remove the whole var
+              stats[i] = emptyNode();
+            }
+          }
+        }
+      } else if (node[0] === 'defun') {
+        if (!(node[1] in used)) {
+          stats[i] = emptyNode();
+        }
+      }
+    }
+    removeEmptySubNodes(func);
+  });
+}
+
+// Removes obviously-unused code. Similar to closure compiler in its rules -
+// export e.g. by Module['..'] = theThing; , or use it somewhere, otherwise
+// it goes away.
+function JSDCE(ast) {
+  var scopes = [{}]; // begin with empty toplevel scope
+  function DUMP() {
+    printErr('vvvvvvvvvvvvvv');
+    for (var i = 0; i < scopes.length; i++) {
+      printErr(i + ' : ' + JSON.stringify(scopes[i]));
+    }
+    printErr('^^^^^^^^^^^^^^');
+  }
+  function ensureData(scope, name) {
+    if (scope[name]) return scope[name];
+    scope[name] = {
+      def: 0,
+      use: 0,
+      param: 0 // true for function params, which cannot be eliminated
+    };
+    return scope[name];
+  }
+  function cleanUp(ast, names) {
+    traverse(ast, function(node, type) {
+      if (type === 'defun' && node[1] in names) return emptyNode();
+      if (type === 'defun' || type === 'function') return null; // do not enter other scopes
+      if (type === 'var') {
+        node[1] = node[1].filter(function(varItem, j) {
+          var curr = varItem[0];
+          var value = varItem[1];
+          return !(curr in names) || (value && hasSideEffects(value));
+        });
+        if (node[1].length === 0) return emptyNode();
+      }
+    });
+    return ast;
+  }
+  traverse(ast, function(node, type) {
+    if (type === 'var') {
+      node[1].forEach(function(varItem, j) {
+        var name = varItem[0];
+        ensureData(scopes[scopes.length-1], name).def = 1;
+      });
+      return;
+    }
+    if (type === 'defun' || type === 'function') {
+      if (node[1]) ensureData(scopes[scopes.length-1], node[1]).def = 1;
+      var scope = {};
+      node[2].forEach(function(param) {
+        ensureData(scope, param).def = 1;
+        scope[param].param = 1;
+      });
+      scopes.push(scope);
+      return;
+    }
+    if (type === 'name') {
+      ensureData(scopes[scopes.length-1], node[1]).use = 1;
+    }
+  }, function(node, type) {
+    if (type === 'defun' || type === 'function') {
+      var scope = scopes.pop();
+      var names = set();
+      for (name in scope) {
+        var data = scope[name];
+        if (data.use && !data.def) {
+          // this is used from a higher scope, propagate the use down 
+          ensureData(scopes[scopes.length-1], name).use = 1;
+          continue;
+        }
+        if (data.def && !data.use && !data.param) {
+          // this is eliminateable!
+          names[name] = 0;
+        }
+      }
+      cleanUp(node[3], names);
+    }
+  });
+  // toplevel
+  var scope = scopes.pop();
+  assert(scopes.length === 0);
+
+  var names = set();
+  for (var name in scope) {
+    var data = scope[name];
+    if (data.def && !data.use) {
+      assert(!data.param); // can't be
+      // this is eliminateable!
+      names[name] = 0;
+    }
+  }
+  cleanUp(ast, names);
+}
+
+function removeFuncs(ast) {
+  assert(ast[0] === 'toplevel');
+  var keep = set(extraInfo.keep);
+  ast[1] = ast[1].filter(function(node) {
+    assert(node[0] === 'defun');
+    return node[1] in keep;
   });
 }
 
 // Passes table
 
-var minifyWhitespace = false, printMetadata = true, asm = false, asmPreciseF32 = false, last = false;
+var minifyWhitespace = false, printMetadata = true, asm = false, asmPreciseF32 = false, emitJSON = false, last = false;
 
 var passes = {
   // passes
@@ -5675,13 +7870,15 @@ var passes = {
   removeAssignsToUndefined: removeAssignsToUndefined,
   //removeUnneededLabelSettings: removeUnneededLabelSettings,
   simplifyExpressions: simplifyExpressions,
-  optimizeShiftsConservative: optimizeShiftsConservative,
-  optimizeShiftsAggressive: optimizeShiftsAggressive,
+  localCSE: localCSE,
+  safeLabelSetting: safeLabelSetting,
   simplifyIfs: simplifyIfs,
   hoistMultiples: hoistMultiples,
   loopOptimizer: loopOptimizer,
   registerize: registerize,
   registerizeHarder: registerizeHarder,
+  eliminateDeadFuncs: eliminateDeadFuncs,
+  eliminateDeadGlobals: eliminateDeadGlobals,
   eliminate: eliminate,
   eliminateMemSafe: eliminateMemSafe,
   aggressiveVariableElimination: aggressiveVariableElimination,
@@ -5690,13 +7887,25 @@ var passes = {
   relocate: relocate,
   outline: outline,
   safeHeap: safeHeap,
+  splitMemory: splitMemory,
+  splitMemoryShell: splitMemoryShell,
   optimizeFrounds: optimizeFrounds,
+  ensureLabelSet: ensureLabelSet,
+  emterpretify: emterpretify,
+  findReachable: findReachable,
+  dumpCallGraph: dumpCallGraph,
+  asmLastOpts: asmLastOpts,
+  JSDCE: JSDCE,
+  removeFuncs: removeFuncs,
+  noop: function() {},
 
   // flags
   minifyWhitespace: function() { minifyWhitespace = true },
   noPrintMetadata: function() { printMetadata = false },
   asm: function() { asm = true },
   asmPreciseF32: function() { asmPreciseF32 = true },
+  emitJSON: function() { emitJSON = true },
+  receiveJSON: function() { }, // handled in a special way, before passes are run
   last: function() { last = true },
 };
 
@@ -5713,40 +7922,50 @@ arguments_ = arguments_.filter(function (arg) {
 
 
 var src = read(arguments_[0]);
-var ast = srcToAst(src);
-//printErr(JSON.stringify(ast)); throw 1;
 generatedFunctions = src.lastIndexOf(GENERATED_FUNCTIONS_MARKER) >= 0;
 var extraInfoStart = src.lastIndexOf('// EXTRA_INFO:')
 if (extraInfoStart > 0) extraInfo = JSON.parse(src.substr(extraInfoStart + 14));
 //printErr(JSON.stringify(extraInfo));
 
+var ast;
+if (arguments_.indexOf('receiveJSON') < 0) {
+  ast = srcToAst(src);
+} else {
+  var commentStart = src.indexOf('//');
+  if (commentStart >= 0) {
+    src = src.substr(0, commentStart); // JSON.parse will error on a trailing comment
+  }
+  ast = JSON.parse(src);
+}
+//printErr('ast: ' + JSON.stringify(ast));
+
+var emitAst = true;
 
 arguments_.slice(1).forEach(function(arg) {
-  //traverse(ast, function(node) {
-  //  if (node[0] === 'defun' && node[1] === 'copyTempFloat') printErr('pre ' + JSON.stringify(node, null, ' '));
-  //});
   passes[arg](ast);
-  //var func;
-  //traverse(ast, function(node) {
-  //  if (node[0] === 'defun') func = node;
-  //  if (isEmptyNode(node)) throw 'empty node after ' + arg + ', in ' + func[1];
-  //});
 });
 if (asm && last) {
-  asmLastOpts(ast); // TODO: move out of last, to make last faster when done later (as in side modules)
   prepDotZero(ast);
 }
-var js = astToSrc(ast, minifyWhitespace), old;
-if (asm && last) {
-  js = fixDotZero(js);
-}
 
-// remove unneeded newlines+spaces, and print
-do {
-  old = js;
-  js = js.replace(/\n *\n/g, '\n');
-} while (js != old);
-print(js);
-print('\n');
-print(suffix);
+if (emitAst) {
+  if (!emitJSON) {
+    var js = astToSrc(ast, minifyWhitespace), old;
+    if (asm && last) {
+      js = fixDotZero(js);
+    }
+    // remove unneeded newlines+spaces, and print
+    do {
+      old = js;
+      js = js.replace(/\n *\n/g, '\n');
+    } while (js != old);
+    print(js);
+    print('\n');
+    print(suffix);
+  } else {
+    print(JSON.stringify(ast));
+  }
+} else {
+  //print('/* not printing ast */');
+}
 

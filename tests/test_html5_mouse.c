@@ -62,19 +62,16 @@ void instruction()
 
 EM_BOOL mouse_callback(int eventType, const EmscriptenMouseEvent *e, void *userData)
 {
-  printf("%s, screen: (%ld,%ld), client: (%ld,%ld),%s%s%s%s button: %hu, buttons: %hu, movement: (%ld,%ld), canvas: (%ld,%ld)\n",
+  printf("%s, screen: (%ld,%ld), client: (%ld,%ld),%s%s%s%s button: %hu, buttons: %hu, movement: (%ld,%ld), canvas: (%ld,%ld), target: (%ld, %ld)\n",
     emscripten_event_type_to_string(eventType), e->screenX, e->screenY, e->clientX, e->clientY,
     e->ctrlKey ? " CTRL" : "", e->shiftKey ? " SHIFT" : "", e->altKey ? " ALT" : "", e->metaKey ? " META" : "", 
-    e->button, e->buttons, e->movementX, e->movementY, e->canvasX, e->canvasY);
+    e->button, e->buttons, e->movementX, e->movementY, e->canvasX, e->canvasY, e->targetX, e->targetY);
 
-  if (e->screenX != 0 && e->screenY != 0 && e->clientX != 0 && e->clientY != 0 && e->canvasX != 0 && e->canvasY != 0)
+  if (e->screenX != 0 && e->screenY != 0 && e->clientX != 0 && e->clientY != 0 && e->canvasX != 0 && e->canvasY != 0 && e->targetX != 0 && e->targetY != 0)
   {
-    if (e->buttons != 0)
-    {
-      if (eventType == EMSCRIPTEN_EVENT_CLICK) gotClick = 1;
-      if (eventType == EMSCRIPTEN_EVENT_MOUSEDOWN) gotMouseDown = 1;
-      if (eventType == EMSCRIPTEN_EVENT_DBLCLICK) gotDblClick = 1;
-    }
+    if (eventType == EMSCRIPTEN_EVENT_CLICK) gotClick = 1;
+    if (eventType == EMSCRIPTEN_EVENT_MOUSEDOWN && e->buttons != 0) gotMouseDown = 1;
+    if (eventType == EMSCRIPTEN_EVENT_DBLCLICK) gotDblClick = 1;
     if (eventType == EMSCRIPTEN_EVENT_MOUSEUP) gotMouseUp = 1;
     if (eventType == EMSCRIPTEN_EVENT_MOUSEMOVE && (e->movementX != 0 || e->movementY != 0)) gotMouseMove = 1;
   }
@@ -92,10 +89,10 @@ EM_BOOL mouse_callback(int eventType, const EmscriptenMouseEvent *e, void *userD
 
 EM_BOOL wheel_callback(int eventType, const EmscriptenWheelEvent *e, void *userData)
 {
-  printf("%s, screen: (%ld,%ld), client: (%ld,%ld),%s%s%s%s button: %hu, buttons: %hu, canvas: (%ld,%ld), delta:(%g,%g,%g), deltaMode:%lu\n",
+  printf("%s, screen: (%ld,%ld), client: (%ld,%ld),%s%s%s%s button: %hu, buttons: %hu, canvas: (%ld,%ld), target: (%ld, %ld), delta:(%g,%g,%g), deltaMode:%lu\n",
     emscripten_event_type_to_string(eventType), e->mouse.screenX, e->mouse.screenY, e->mouse.clientX, e->mouse.clientY,
     e->mouse.ctrlKey ? " CTRL" : "", e->mouse.shiftKey ? " SHIFT" : "", e->mouse.altKey ? " ALT" : "", e->mouse.metaKey ? " META" : "", 
-    e->mouse.button, e->mouse.buttons, e->mouse.canvasX, e->mouse.canvasY,
+    e->mouse.button, e->mouse.buttons, e->mouse.canvasX, e->mouse.canvasY, e->mouse.targetX, e->mouse.targetY,
     (float)e->deltaX, (float)e->deltaY, (float)e->deltaZ, e->deltaMode);
 
   if (e->deltaY > 0.f || e->deltaY < 0.f)
@@ -107,6 +104,10 @@ EM_BOOL wheel_callback(int eventType, const EmscriptenWheelEvent *e, void *userD
 
 int main()
 {
+  // Make the canvas area stand out from the background.
+  emscripten_set_canvas_size(400, 300);
+  EM_ASM(Module['canvas'].style.backgroundColor = 'black';);
+
   EMSCRIPTEN_RESULT ret = emscripten_set_click_callback(0, 0, 1, mouse_callback);
   TEST_RESULT(emscripten_set_click_callback);
   ret = emscripten_set_mousedown_callback(0, 0, 1, mouse_callback);
@@ -142,13 +143,13 @@ int main()
       for(var d in data) event[d] = data[d];
       window.dispatchEvent(event);
     }
-    sendEvent('click', { screenX: -500000, screenY: -500000, clientX: -500000, clientY: -500000, button: 0, buttons: 1 }); // Send a dummy event that should not be received.
+    sendEvent('click', { screenX: -500000, screenY: -500000, clientX: -500000, clientY: -500000, button: 0, buttons: 0 }); // Send a dummy event that should not be received.
     sendEvent('mousedown', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 1 });
     sendEvent('mouseup', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 0 });
-    sendEvent('dblclick', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 1 });
-    sendEvent('mousemove', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 0, movementX: 1, movementY: 1 });
-    sendEvent('wheel', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 0, deltaX: 1, deltaY: 1, deltaZ: 1, deltaMode: 1 });
-    sendEvent('mousewheel', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 0, wheelDeltaX: 1, wheelDeltaY: 1 });
+    sendEvent('dblclick', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 0 });
+    sendEvent('mousemove', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 0, 'movementX': 1, 'movementY': 1 });
+    sendEvent('wheel', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 0, 'deltaX': 1, 'deltaY': 1, 'deltaZ': 1, 'deltaMode': 1 });
+    sendEvent('mousewheel', { screenX: 1, screenY: 1, clientX: 1, clientY: 1, button: 0, buttons: 0, 'wheelDeltaX': 1, 'wheelDeltaY': 1 });
   );
 #endif
 

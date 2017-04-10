@@ -77,19 +77,23 @@ The JSON output format is based on the return value of Runtime.generateStructInf
 
 import sys, os, re, json, argparse, tempfile, subprocess
 import shared
+
+DEBUG = os.environ.get('EMCC_DEBUG')
+if DEBUG == "0":
+  DEBUG = None
+
 QUIET = (__name__ != '__main__')
 
 def show(msg):
-  global QUIET
-  if not QUIET:
-    sys.stderr.write(msg + '\n')
+  global QUIET, DEBUG
+  if DEBUG or not QUIET:
+    sys.stderr.write('gen_struct_info: ' + msg + '\n')
 
 # Try to load pycparser.
 try:
   import pycparser
 except ImportError:
-  # The import failed, warn the user.
-  show('WARN: pycparser isn\'t available. I won\'t be able to parse C files, only .json files.')
+  # The import failed
   
   def parse_header(path, cpp_opts):
     # Tell the user how to get pycparser, if he or she tries to parse a C file.
@@ -308,10 +312,10 @@ def gen_inspect_code(path, struct, code):
   c_descent(path[-1], code)
   
   if len(path) == 1:
-    c_set('__size__', 'i%u', 'sizeof (' + prefix + path[0] + ')', code)
+    c_set('__size__', 'i%zu', 'sizeof (' + prefix + path[0] + ')', code)
   else:
-    c_set('__size__', 'i%u', 'sizeof ((' + prefix + path[0] + ' *)0)->' + '.'.join(path[1:]), code)
-    #c_set('__offset__', 'i%u', 'offsetof(' + prefix + path[0] + ', ' + '.'.join(path[1:]) + ')', code)
+    c_set('__size__', 'i%zu', 'sizeof ((' + prefix + path[0] + ' *)0)->' + '.'.join(path[1:]), code)
+    #c_set('__offset__', 'i%zu', 'offsetof(' + prefix + path[0] + ', ' + '.'.join(path[1:]) + ')', code)
   
   for field in struct:
     if isinstance(field, dict):
@@ -319,7 +323,7 @@ def gen_inspect_code(path, struct, code):
       fname = field.keys()[0]
       gen_inspect_code(path + [fname], field[fname], code)
     else:
-      c_set(field, 'i%u', 'offsetof(' + prefix + path[0] + ', ' + '.'.join(path[1:] + [field]) + ')', code)
+      c_set(field, 'i%zu', 'offsetof(' + prefix + path[0] + ', ' + '.'.join(path[1:] + [field]) + ')', code)
   
   c_ascent(code)
 
@@ -358,39 +362,50 @@ def inspect_code(headers, cpp_opts, structs, defines):
   
   # Write the source code to a temporary file.
   src_file = tempfile.mkstemp('.c')
-  bin_file = tempfile.mkstemp('.ll')
+  js_file = tempfile.mkstemp('.js')
   
   os.write(src_file[0], '\n'.join(code))
   
   # Close all unneeded FDs.
   os.close(src_file[0])
-  os.close(bin_file[0])
-  
-  # NOTE: We can't generate an executable in the next step because it won't run on the current system without changing the target.
-  # If we change the target, some type sizes will change resulting in wrong data. As a workaround, we will be generating bitcode and
-  # run that with the LLVM interpreter. That way we can use the default target and still run the code.
+  os.close(js_file[0])
+
+  # Remove dangerous env modifications
+  safe_env = os.environ.copy()
+  for opt in ['EMCC_FORCE_STDLIBS', 'EMCC_ONLY_FORCED_STDLIBS']:
+    if opt in safe_env:
+      del safe_env[opt]
+
+  # Use binaryen, if necessary
+  binaryen = os.environ.get('EMCC_WASM_BACKEND_BINARYEN')
+  if binaryen:
+    cpp_opts += ['-s', 'BINARYEN=1']
+
   info = []
+
   try:
-    # Compile the program.
-    show('Compiling generated code...')
-    subprocess.check_call([shared.CLANG_CC, '-emit-llvm', '-S'] + cpp_opts + ['-o', bin_file[1], src_file[1]])
-    
+    try:
+      # Compile the program.
+      show('Compiling generated code...')
+      subprocess.check_call([shared.PYTHON, shared.EMCC] + cpp_opts + ['-o', js_file[1], src_file[1], '-s', 'BOOTSTRAPPING_STRUCT_INFO=1', '-s', 'WARN_ON_UNDEFINED_SYMBOLS=0', '-Oz', '--js-opts', '0', '--memory-init-file', '0'], env=safe_env) # -Oz optimizes enough to avoid warnings on code size/num locals
+    except:
+      sys.stderr.write('FAIL: Compilation failed!\n')
+      sys.exit(1)
+
     # Run the compiled program.
     show('Calling generated program...')
-    info = subprocess.check_output([shared.LLVM_INTERPRETER, bin_file[1]]).splitlines()
-  except subprocess.CalledProcessError:
-    if os.path.isfile(bin_file[1]):
+    try:
+      info = shared.run_js(js_file[1]).splitlines()
+    except subprocess.CalledProcessError:
       sys.stderr.write('FAIL: Running the generated program failed!\n')
-    else:
-      sys.stderr.write('FAIL: Compilation failed!\n')
-    
-    sys.exit(1)
+      sys.exit(1)
+
   finally:
     # Remove all temporary files.
     os.unlink(src_file[1])
     
-    if os.path.exists(bin_file[1]):
-      os.unlink(bin_file[1])
+    if os.path.exists(js_file[1]):
+      os.unlink(js_file[1])
   
   # Parse the output of the program into a dict.
   return parse_c_output(info)
@@ -461,7 +476,7 @@ def main(args):
   QUIET = args.quiet
   
   # Avoid parsing problems due to gcc specifc syntax.
-  cpp_opts = ['-D_GNU_SOURCE'] + shared.COMPILER_OPTS
+  cpp_opts = ['-D_GNU_SOURCE']
   
   # Add the user options to the list as well.
   for path in args.includes:

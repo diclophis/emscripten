@@ -1,6 +1,7 @@
 module({
     Emscripten: '../../../../build/embind_test.js',
 }, function(imports) {
+    /*jshint sub:true */
     var cm = imports.Emscripten;
 
     var CheckForLeaks = fixture("check for leaks", function() {
@@ -401,6 +402,11 @@ module({
             assert.equal('ABCD', e);
         });
 
+        test("can pass Uint8ClampedArray to std::string", function() {
+            var e = cm.emval_test_take_and_return_std_string(new Uint8ClampedArray([65, 66, 67, 68]));
+            assert.equal('ABCD', e);
+        });
+
         test("can pass Int8Array to std::string", function() {
             var e = cm.emval_test_take_and_return_std_string(new Int8Array([65, 66, 67, 68]));
             assert.equal('ABCD', e);
@@ -415,6 +421,12 @@ module({
             var e = cm.emval_test_take_and_return_std_basic_string_unsigned_char(new Uint8Array([65, 66, 67, 68]));
             assert.equal('ABCD', e);
         });
+
+        test("can pass Uint8ClampedArray to std::basic_string<unsigned char>", function() {
+            var e = cm.emval_test_take_and_return_std_basic_string_unsigned_char(new Uint8ClampedArray([65, 66, 67, 68]));
+            assert.equal('ABCD', e);
+        });
+
 
         test("can pass Int8Array to std::basic_string<unsigned char>", function() {
             var e = cm.emval_test_take_and_return_std_basic_string_unsigned_char(new Int8Array([65, 66, 67, 68]));
@@ -441,6 +453,14 @@ module({
                 String.fromCharCode(65535);
             assert.equal(expected, cm.take_and_return_std_wstring(expected));
         });
+
+        if (cm.isMemoryGrowthEnabled) {
+            test("can access a literal wstring after a memory growth", function() {
+                cm.force_memory_growth();
+                assert.equal("get_literal_wstring", cm.get_literal_wstring());
+            });
+        }
+
     });
 
     BaseFixture.extend("embind", function() {
@@ -474,6 +494,65 @@ module({
         test("booleans can be marshalled", function() {
             assert.equal(false, cm.emval_test_not(true));
             assert.equal(true, cm.emval_test_not(false));
+        });
+
+        test("val.is_undefined() is functional",function() {
+            assert.equal(true, cm.emval_test_is_undefined(undefined));
+            assert.equal(false, cm.emval_test_is_undefined(true));
+            assert.equal(false, cm.emval_test_is_undefined(false));
+            assert.equal(false, cm.emval_test_is_undefined(null));
+            assert.equal(false, cm.emval_test_is_undefined({}));
+        });
+
+        test("val.is_null() is functional",function() {
+            assert.equal(true, cm.emval_test_is_null(null));
+            assert.equal(false, cm.emval_test_is_null(true));
+            assert.equal(false, cm.emval_test_is_null(false));
+            assert.equal(false, cm.emval_test_is_null(undefined));
+            assert.equal(false, cm.emval_test_is_null({}));
+        });
+
+        test("val.is_true() is functional",function() {
+            assert.equal(true, cm.emval_test_is_true(true));
+            assert.equal(false, cm.emval_test_is_true(false));
+            assert.equal(false, cm.emval_test_is_true(null));
+            assert.equal(false, cm.emval_test_is_true(undefined));
+            assert.equal(false, cm.emval_test_is_true({}));
+        });
+
+        test("val.is_false() is functional",function() {
+            assert.equal(true, cm.emval_test_is_false(false));
+            assert.equal(false, cm.emval_test_is_false(true));
+            assert.equal(false, cm.emval_test_is_false(null));
+            assert.equal(false, cm.emval_test_is_false(undefined));
+            assert.equal(false, cm.emval_test_is_false({}));
+        });
+
+        test("val.equals() is functional",function() {
+            var values = [undefined, null, true, false, {}];
+
+            for(var i=0;i<values.length;++i){
+                var first = values[i];
+                for(var j=i;j<values.length;++j)
+                {
+                    var second = values[j];
+                    /*jshint eqeqeq:false*/
+                    assert.equal((first == second), cm.emval_test_equals(first, second));
+                }
+            }
+        });
+
+        test("val.strictlyEquals() is functional", function() {
+            var values = [undefined, null, true, false, {}];
+
+            for(var i=0;i<values.length;++i){
+                var first = values[i];
+                for(var j=i;j<values.length;++j)
+                {
+                    var second = values[j];
+                    assert.equal(first===second, cm.emval_test_strictly_equals(first, second));
+                }
+            }
         });
 
         test("can pass booleans as integers", function() {
@@ -520,6 +599,11 @@ module({
 
         test("no memory leak when passing strings in by const reference", function() {
             cm.emval_test_take_and_return_std_string_const_ref("foobar");
+        });
+
+        test("can get global", function(){
+            /*jshint evil:true*/
+            assert.equal((new Function("return this;"))(), cm.embind_test_getglobal());
         });
 
         test("can create new object", function() {
@@ -665,6 +749,27 @@ module({
             assert.throws(TypeError, function() { cm.long_to_string(2147483648); });
             assert.throws(TypeError, function() { cm.unsigned_long_to_string(-1); });
             assert.throws(TypeError, function() { cm.unsigned_long_to_string(4294967296); });
+        });
+
+        test("unsigned values are correctly returned when stored in memory", function() {
+            cm.store_unsigned_char(255);
+            assert.equal(255, cm.load_unsigned_char());
+
+            cm.store_unsigned_short(32768);
+            assert.equal(32768, cm.load_unsigned_short());
+
+            cm.store_unsigned_int(2147483648);
+            assert.equal(2147483648, cm.load_unsigned_int());
+
+            cm.store_unsigned_long(2147483648);
+            assert.equal(2147483648, cm.load_unsigned_long());
+        });
+
+        test("throws appropriate type error when attempting to coerce null to int", function() {
+            var e = assert.throws(TypeError, function() {
+                cm.int_to_string(null);
+            });
+            assert.equal('Cannot convert "null" to int', e.message);
         });
 
         test("access multiple class ctors", function() {
@@ -844,6 +949,29 @@ module({
             var str = vec.get(0);
             assert.equal('string #1', str.get());
             str.delete();
+            vec.delete();
+        });
+
+        test("resize appends the given value", function() {
+            var vec = cm.emval_test_return_vector();
+
+            vec.resize(5, 42);
+            assert.equal(5, vec.size());
+            assert.equal(10, vec.get(0));
+            assert.equal(20, vec.get(1));
+            assert.equal(30, vec.get(2));
+            assert.equal(42, vec.get(3));
+            assert.equal(42, vec.get(4));
+            vec.delete();
+        });
+
+        test("resize preserves content when shrinking", function() {
+            var vec = cm.emval_test_return_vector();
+
+            vec.resize(2, 42);
+            assert.equal(2, vec.size());
+            assert.equal(10, vec.get(0));
+            assert.equal(20, vec.get(1));
             vec.delete();
         });
     });
@@ -1118,6 +1246,23 @@ module({
             assert.deepEqual({field: [1, 2, 3, 4]}, d);
         });
 
+        test("can pass and return arrays in structs", function() {
+            var d = cm.emval_test_take_and_return_ArrayInStruct({
+              field1: [1, 2],
+              field2: [
+                { x: 1, y: 2 },
+                { x: 3, y: 4 }
+              ]
+            });
+            assert.deepEqual({
+              field1: [1, 2],
+              field2: [
+                { x: 1, y: 2 },
+                { x: 3, y: 4 }
+              ]
+            }, d);
+        });
+
         test("can clone handles", function() {
             var a = new cm.ValHolder({});
             assert.equal(1, cm.count_emval_handles());
@@ -1229,6 +1374,21 @@ module({
             assert.throws(cm.BindingError, function() {
                 a.delete();
             });
+        });
+
+        test("returned unique_ptr does not call destructor", function() {
+            var logged = "";
+            var c = new cm.emval_test_return_unique_ptr_lifetime(function (s) { logged += s; });
+            assert.equal("(constructor)", logged);
+            c.delete();
+        });
+
+        test("returned unique_ptr calls destructor on delete", function() {
+            var logged = "";
+            var c = new cm.emval_test_return_unique_ptr_lifetime(function (s) { logged += s; });
+            logged = "";
+            c.delete();
+            assert.equal("(destructor)", logged);
         });
 
         test("StringHolder", function() {
@@ -2169,6 +2329,13 @@ module({
             });
         });
 
+        test("can clone instances that have been scheduled for deletion", function() {
+            var v = new cm.ValHolder({});
+            v.deleteLater();
+            var v2 = v.clone();
+            v2.delete();
+        });
+
         test("deleteLater returns the object", function() {
             var v = (new cm.ValHolder({})).deleteLater();
             assert.deepEqual({}, v.getVal());
@@ -2395,6 +2562,15 @@ module({
             assert.equal("function", cm.getTypeOfVal(function(){}));
             assert.equal("number", cm.getTypeOfVal(1));
             assert.equal("string", cm.getTypeOfVal("hi"));
+        });
+    });
+
+    BaseFixture.extend("static member", function() {
+        test("static members", function() {
+            assert.equal(10, cm.HasStaticMember.c);
+            assert.equal(20, cm.HasStaticMember.v);
+            cm.HasStaticMember.v = 30;
+            assert.equal(30, cm.HasStaticMember.v);
         });
     });
 });

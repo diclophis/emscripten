@@ -53,8 +53,7 @@ static void *arg_n(va_list ap, unsigned int n)
 	return p;
 }
 
-//int vfscanf(FILE *restrict f, const char *restrict fmt, va_list ap)
-int MUSL_vfscanf(FILE *restrict f, const char *restrict fmt, va_list ap) // XXX Emscripten: Only use musl-specific vfscanf when called from within sscanf.
+int vfscanf(FILE *restrict f, const char *restrict fmt, va_list ap)
 {
 	int width;
 	int size;
