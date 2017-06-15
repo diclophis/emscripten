@@ -12,7 +12,7 @@
 #include <string.h>
 #include <assert.h>
 #include <emscripten.h>
-#include <html5.h>
+#include <emscripten/html5.h>
 
 std::vector<std::string> &split(const std::string &s, char delim, std::vector<std::string> &elems) {
     std::stringstream ss(s);
@@ -108,6 +108,14 @@ int main()
       EM_BOOL supported = emscripten_webgl_enable_extension(context, exts[i].c_str());
       assert(supported);
     }
+
+    int drawingBufferWidth = -1;
+    int drawingBufferHeight = -1;
+    res = emscripten_webgl_get_drawing_buffer_size(context, &drawingBufferWidth, &drawingBufferHeight);
+    assert(res == EMSCRIPTEN_RESULT_SUCCESS);
+    printf("drawingBufferWidth x Height: %dx%d\n", drawingBufferWidth, drawingBufferHeight);
+    assert(drawingBufferWidth == 300);
+    assert(drawingBufferHeight == 150);
 
     // Try with a simple glClear() that we got a context.
     glClearColor(1.f, 0.f, 0.f, 1.f);
